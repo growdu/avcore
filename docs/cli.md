@@ -31,9 +31,22 @@ list yu        > 列出所有    的 traits 改成
 
 > **入口路由**：`avc` 无参 + TTY → Shell；无参 + 非 TTY → help；首参是 `shell` → Shell；首参是 `ask` → ask 模式；其他 → CLI 模式。
 
----
+### 1.1 CLI 模式执行流（精确命令路径）
 
-## 2. 设计原则
+```mermaid
+flowchart TB
+    Start([avc <args>]) --> Clap[Clap 解析]
+    Clap --> Match{匹配?}
+    Match -->|原子| Atomic[单步执行器]
+    Match -->|集成| Integ{--dry-run?}
+    Integ -->|是| Dry[展开为原子列表<br/>打印 plan, exit 0]
+    Integ -->|否| Run[展开为原子序列<br/>BEGIN → 各原子 → COMMIT]
+    Match -->|未找到| NotFound[报错: unknown command<br/>exit 2]
+    Atomic --> Out[输出结果]
+    Run --> Out
+    Dry --> Out
+    NotFound --> ErrOut[exit 2]
+```
 
 ### 原则一：原子化（Atomic）
 

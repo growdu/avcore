@@ -29,6 +29,23 @@ flowchart LR
     C --> H[结果输出]
 ```
 
+### 1.1 入口路由（三模式分发）
+
+```mermaid
+flowchart TB
+    Start([avc 启动]) --> Empty{args.is_empty?}
+    Empty -->|是| TTY{isatty stdout}
+    TTY -->|是| Shell[Shell 模式<br/>持续循环]
+    TTY -->|否| Help[打印 help, exit 0]
+    Empty -->|否| First{args[0]?}
+    First -->|shell| Shell
+    First -->|ask| Ask[ask 模式<br/>一次性 NL → 原子]
+    First -->|其它| CLI[CLI 模式<br/>精确命令一次性执行]
+    Shell --> SameEx[(同一套原子执行器)]
+    Ask --> SameEx
+    CLI --> SameEx
+```
+
 ---
 
 ## 2. 入口
@@ -76,6 +93,35 @@ avc...> 把 Yu 的 traits 改成                          # 续行（未闭合�
 avc>
 ```
 
+### 3.2 Shell 内循环（一次输入的完整路径）
+
+```mermaid
+flowchart TB
+    Start([Shell 已启动]) --> Prompt[打印提示符 avc>]
+    Prompt --> Read[读入输入<br/>支持续行 avc...>]
+    Read --> Empty{空行?}
+    Empty -->|是| Prompt
+    Empty -->|否| Class{classify<br/>原子 / builtin / NL}
+    Class -->|exit / quit / Ctrl-D| End([退出])
+    Class -->|builtin| B[help / history / clear / set / state]
+    Class -->|原子精确| A[走 CLI 执行器]
+    Class -->|NL| LLM[LLM 解析 NL<br/>→ plan JSON]
+    LLM --> Confirm{确认策略}
+    Confirm -->|read_only| A
+    Confirm -->|write| Ask[询问 y/n]
+    Confirm -->|long_running| AskLong[询问 y/n<br/>+ watch 提示]
+    Ask -->|y| A
+    Ask -->|n| Skip[跳过]
+    AskLong -->|y| A
+    AskLong -->|n| Skip
+    A --> Out[输出结果]
+    B --> Out
+    Skip --> Out
+    Out --> UpdCtx[更新 ctx<br/>current_persona / last_topic]
+    UpdCtx --> Hist[写入 history]
+    Hist --> Prompt
+```
+
 ### 3.2 三类输入
 
 | 输入 | 来源 | 走法 |
@@ -88,26 +134,33 @@ avc>
 
 ### 3.3 NL 解析流水线
 
-```
-input "把 Yu 的 traits 改成严谨务实"
-   │
-   ▼  [1] classify(LLM)：原子 / builtin / NL
-   │
-   ▼  [2] NL → plan(LLM)
-        system: 你是 avc 命令规划器。给定自然语言 + 当前 shell 上下文，
-                输出 JSON: { intent, steps:[{cmd,args,reason}], read_only, long_running }
-        user:   "把 Yu 的 traits 改成严谨务实"
-                context: { current_persona: "yu", current_version: 3 }
-   │
-   ▼  [3] show plan + confirm policy
-        read_only     → execute
-        write         → [y/n]
-        long_running  → [y/n] + 提示 watch 命令
-   │
-   ▼  [4] execute each step
-        每步输出进度；失败停止后续步骤（默认 --no-rollback=off，自动回退）
-   │
-   ▼  [5] record to history
+```mermaid
+sequenceDiagram
+    participant U as 用户
+    participant SH as Shell
+    participant L as LLM Provider
+    participant EX as 原子执行器
+    participant DB as avc.db
+
+    U->>SH: "把 Yu 的 traits 改成严谨务实"
+    SH->>SH: classify(NL) — cheap 模型
+    SH->>L: chat(system=planner_prompt, user=input + ctx)
+    Note over SH,L: system: 原子清单 + 输出格式<br/>user: NL + {current_persona, current_version, ...}
+    L-->>SH: { intent, steps:[{cmd,args,reason}], read_only, long_running }
+    SH->>U: 展示 plan + y/n
+    alt read_only
+        U-->>SH: (auto)
+    else write
+        U-->>SH: y / n
+    else long_running
+        U-->>SH: y / n + watch hint
+    end
+    SH->>EX: 执行 steps[i].cmd(args)
+    EX->>DB: UPDATE persona_versions SET persona_descriptor_json=...
+    DB-->>EX: ok
+    EX-->>SH: 结果
+    SH->>SH: 写 history
+    SH-->>U: "✓ updated version=3"
 ```
 
 ### 3.4 确认策略
@@ -305,7 +358,20 @@ avc...> "我们直接看源码——buffer pool 没那么玄"
 | 脚本 | **首选**（原子 + JSON） | 不适合 | 可（`--json --yes`） |
 | CI | **首选** | 不适合 | 可（`--yes`） |
 
----
+### 11.1 决策图：什么时候走哪条路
+
+```mermaid
+flowchart LR
+    Q{你要做什么?}
+    Q -->|已知精确动作| CLI[CLI 模式<br/>avc <atom>]
+    Q -->|不知道完整路径| Shell[Shell 模式<br/>avc shell]
+    Q -->|管道 / 远程 / 一次性 NL| Ask[ask 模式<br/>avc ask]
+    Q -->|脚本 + 原子 + JSON| CLI
+    Q -->|人机协同 / 探索 / NL| Shell
+    CLI --> A[(同一套原子)]
+    Shell --> A
+    Ask --> A
+```
 
 ## 12. 关键指标
 
