@@ -27,35 +27,43 @@
 
 ---
 
-## 2. 落盘布局（与 storage.md §3 完全一致）
+## 2. 行结构（与 storage.md §2 完全一致）
+
+> AVCore 使用单一 SQLite。`persona_versions` 是**宽表**——一行 = 一个 `PersonaModelVersion`，所有资产 BLOB 在该行内。下面是该行涉及的列（详见 [`../storage.md`](../storage.md)）：
 
 ```
-~/.local/share/avc/personas/pm_01H.../
-└── v1/
-    ├── manifest.json
-    ├── avatar/
-    │   ├── primary.png
-    │   ├── views/*.png
-    │   ├── ref/*.png
-    │   ├── lora/{weights.safetensors,lora.json}   # 可选
-    │   ├── face.json
-    │   └── provider.json
-    ├── voice/
-    │   ├── sample.wav
-    │   ├── transcript.json
-    │   ├── embed.bin
-    │   └── provider.json
-    ├── persona.json
-    ├── knowledge/                                # 可选
-    │   ├── corpora/corpus_01/
-    │   │   ├── chunks.parquet
-    │   │   ├── embed.bin
-    │   │   └── index.faiss
-    │   └── binding.json
-    └── identity_anchor.json
+persona_versions (一行):
+  ├── 主键: (persona_model_id, version)
+  ├── 父版本: parent_version
+  ├── status: building / ready / deprecated
+  │
+  ├── avatar_* 列
+  │     avatar_primary BLOB          # 主形象 PNG
+  │     avatar_primary_mime TEXT
+  │     avatar_primary_sha256 TEXT
+  │     avatar_views_blobs BLOB      # 多视角（zip/拼接）
+  │     avatar_refs_blobs BLOB       # 用户上传参考图
+  │     avatar_lora_ref_json TEXT    # 远端 model_id 引用（无权重）
+  │     avatar_face_id, avatar_provider, ...
+  │
+  ├── voice_* 列
+  │     voice_sample BLOB            # 干净人声 WAV
+  │     voice_transcript TEXT
+  │     voice_embed BLOB             # speaker embedding
+  │     voice_id_remote TEXT         # 远端 voice_id
+  │
+  ├── persona_descriptor_json TEXT   # 人设 JSON
+  ├── knowledge_binding_json TEXT    # 可选绑定
+  │
+  ├── anchor_face_emb / voice_emb / style_emb BLOB
+  │     + 对应 sha256 + dim
+  │
+  ├── manifest_json TEXT             # 完整 manifest（导出用）
+  ├── metrics_json TEXT
+  └── created_at, training_job_id
 ```
 
-> v1 完成时**立即**计算并写入 `identity_anchor.json`，这是后续演进的基线。
+> v1 完成时**立即**抽取并写入 `anchor_*_emb` BLOB + sha256，构成后续演进的基线。
 
 ---
 

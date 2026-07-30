@@ -28,21 +28,24 @@
 
 ---
 
-## 3. 落盘布局（与 storage.md §3 一致）
+## 3. 存储布局（与 storage.md §2 一致）
+
+> 单一 SQLite。语料 = `corpus_chunks` 表 N 行；chunk 向量 = `corpus_chunks.embed_blob` BLOB；绑定 = `persona_versions.knowledge_binding_json` TEXT。
 
 ```
-personas/pm_xxx/vN/knowledge/
-├── corpora/
-│   └── corpus_01H.../
-│       ├── chunks.parquet       # 或 sqlite 表
-│       ├── embed.bin
-│       └── index.faiss          # 或 sqlite-vss
-└── binding.json                 # KnowledgeBinding 元数据
+knowledge_corpora (1 行 = 1 语料)
+  id, name, source_type, chunk_count, ...
+
+corpus_chunks (N 行 = chunks)
+  id, corpus_id, ordinal, content TEXT,
+  embed_blob BLOB,                # 远端 embed API 算的向量
+  embed_dim INTEGER, embed_sha256,
+  deprecated BOOL, ...
+
+persona_versions.knowledge_binding_json    # 与 persona 版本关联的绑定
 ```
 
-chunks 落地两种风格（按语料规模）：
-- 小语料（< 100 MB）：直接进 SQLite `corpus_chunks` 表
-- 大语料：parquet + FAISS 文件 + `knowledge_dir` 路径索引
+任何向量索引（FAISS / sqlite-vss 等）都是可选优化层，AVCore 默认依赖 SQLite 的 `embed_blob + 全表扫描 + WHERE` 即可——50 corpus × 平均 1000 chunk 完全够用。
 
 ---
 

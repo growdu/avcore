@@ -1,563 +1,582 @@
 # 人物形象资产存储格式（Persona Asset Storage）
 
-# 人物形象资产存储格式（Persona Asset Storage）
-
-> **核心关注**：AVCore 把"一个人物角色模型的某个版本"以**不可变目录**的形式落到本地文件系统中——这既是运行时的真相来源，也是版本可回滚的基础。本文件描述这个目录布局，以及每种资产的存储约定。
-
-> 这份规范有约束力。所有 Provider 实现必须按这个布局写入，反序列化时也按这个读取。
+> AVCore 的全部状态 — 元数据 + 二进制（形象图、声音样本、嵌入向量、视频产物） — 都落在**一个 SQLite 文件**里：`~/.local/share/avc/avc.db`。
+>
+> 这份规范有约束力。所有 Provider 实现都按此 schema 写入。
 
 ---
 
-## 0. 为什么这样存？—— 三种方案对比
+## 0. 为什么是单一 SQLite？——规模与权衡
 
-> 在动手前先把这条逻辑讲清楚：AVCore 不用对象存储，也**不**把数据全塞 SQLite，更**不**只放文件系统，而是 **SQLite 管元数据 + 本地 FS 管二进制**。这是经过权衡后对"CLI 优先、单用户 / 小团队、本地优先"最合适的方案。
+> **强约束**（用户给的）：persona ≤ 50 个，只在本机运行。
 
-### 0.1 候选方案
+### 0.1 规模账
+- 单 persona 单版本典型占用：**~35 MB**（详见 §1.1）
+- 50 persona × 5 版本 ≈ **8.75 GB**——单一 SQLite 完全撑得住
 
-| 方案 | 元数据 | 二进制 | 优点 | 缺点 |
-|------|--------|--------|------|------|
-| A. 全 SQLite | 库内 | BLOB 字段 | 单文件；强一致 | 单文件膨胀到 30~500 GB 后备份 / VACUUM / 锁都变痛；每读一次 BLOB 都拉整行；并发写遭锁 |
-| B. 全 FS（含 JSON） | JSON 文件 | 同目录 | 易 `tar`、易 `git diff`；不上 SQLite 也行 | 缺索引——"找版本 v3 那 6 个分镜"要 `find + grep` 全目录；缺事务；多表 join 难做 |
-| C. **SQLite + 本地 FS（采用）** | SQLite | 文件系统 | 元数据可索引可查询；二进制走 FS（原子替换、便宜备份）；符合"事实源 ↔ 索引库"模式 | 两边要同步（`avc verify` 自动校验） |
-| D. 对象存储（S3 / OSS） | 随你 | 远端 | 跨机共享；冷归档；理论上无限容量 | 每次访问多一跳网络；token 配置；**对单用户是过度设计** |
+### 0.2 候选方案
 
-### 0.2 为什么不用"全 SQLite"
+| 方案 | 描述 | 取舍 |
+|------|------|------|
+| **A. 单一 SQLite（含 BLOB）** ← 采用 | 全部状态进 `avc.db` | 单文件、可拷走；BLOB 在 KB 到几十 MB 范围性能良好；事务保证原子性 |
+| B. SQLite 元数据 + FS 二进制 | 旧设计 | 引入两套同步机制与 FS 目录协议；50 persona 没有性能收益 |
+| C. 对象存储（S3 / OSS） | 远端 | 单机单用户完全无必要，反而引入网络、token、bucket 配置负担 |
+| D. 多 SQLite 分库 | 元数据/产物/日志分文件 | 50 persona 不需要拆分；增加备份/恢复复杂度 |
 
-技术上 SQLite 支持大 BLOB，但工作量级一旦上去就**真的不行**。一个 Yu（数据库内核专家）的 v1 大致是：
+### 0.3 SQLite 完全够用的几条技术理由
 
-```
-avatar/primary.png       ~  2 MB
-avatar/views/ × 6        ~ 12 MB
-avatar/lora/ref.json     ~  1 KB
-voice/sample.wav 60s     ~ 10 MB
-voice/embed.bin          ~  1 KB
-persona.json + manifest  ~  1 KB
-identity_anchor.json     ~  1 KB
-knowledge/chunks/embed…  ~ 10 MB（仅 metadata, 真实向量可能更大）
-                       ──────────
-~ 35 MB / version
-```
+1. **BLOB 列对 KB~几十 MB 完全 OK**：SQLite 单个 BLOB 上限理论 ~1.4 EB，实测中 KB~GB 范围都顺畅
+2. **WAL 提供并发读 + 单写**：单用户单进程下，连写竞争都罕见
+3. **事务 = 原子性**：版本创建 / 漂移回退 都是一个事务，回滚 `ROLLBACK` 即可，无需 `tmp + rename`
+4. **单一文件 = 单一备份**：`cp avc.db backup.db` 或 `avc backup` 一条命令
+5. **跨机迁移极简**：`rsync avc.db` 或者 `avc export --persona yu` 即可
 
-20 个 persona × 5 版本 ≈ **3.5 GB**——还能撑；  
-100 个 persona × 10 版本 ≈ **35 GB**——SQLite 文件没大问题，但 `VACUUM` 重写整库要好几分钟；  
-**1000 个 persona × 10 版本 ≈ 350 GB**——`avc verify` 全表 SUM 一次 = 噩梦；备份一次 = 网络瓶颈。
+### 0.4 SQLite 的不可行边界（透明告知）
 
-更要命的是**写入语义**：BLOB 替换走 `UPDATE`，事务会持有整个 row 的锁；多人或并发任务下会互相等。把"原子替换 = tmp 文件 + rename"挪到 FS，几 GB 也不掉链子。
-
-### 0.3 为什么不全 FS（连元数据也 JSON）
-
-JSON + 文件树很美——`cat personas/pm_xxx/v1/manifest.json` 直接可读，`git diff` 友好。但缺一个东西：**索引**。
-
-- "列出所有 persona"
-- "找 v3 一致性 < 0.85 的训练任务"  
-- "按 `kind=audio` 列出某 persona 的样本"
-- "计算 `persona_samples` 总占用、做去重"
-
-全 FS 实现这些意味着每次 `walk_dir + parse_json`，5 个文件还好，5 万个时延秒级。SQLite 的索引就是为了替代这种 `walk` 模式。
-
-### 0.4 为什么**不**默认用对象存储
-
-对象存储（S3 / OSS / GCS）很有用，但**对本框架默认用户场景是过度设计**：
-
-- **目标场景**：单开发者 / 小团队在自己机或自己服务器上跑 persona
-- **痛点不在容量**：本地 1~2 TB 已经够；上 10 TB 才考虑迁移
-- **痛点不在跨机**：真有跨机需求，`avc export` 打 `tar.zst` 比挂对象存储便宜得多
-- **多一跳网络**：每次 `ls` 资产目录都用 HTTP 拿 presigned URL，根本不值得
-- **配置负担**：bucket / IAM / region / CORS / lifecycle——和"5 分钟跑出一个 Yu"的目标矛盾
-
-所以对象存储作为**可选插件**挂在 Phase 2 之后，而不是默认。下表是升级到对象存储的判断标准：
-
-| 信号 | 行为 |
+| 阈值 | 反应 |
 |------|------|
-| 本机可用 < 200 GB / 备份耗时长 / 团队 ≥ 3 人 | 考虑接对象存储 |
-| 单人 / 单机 / 总资产 < 200 GB | 继续本地 FS，不动 |
-| 需要跨 region 容灾 | 适合对象存储 + WAL |
+| ≤ 50 persona × 10 版本 ≈ 20 GB | 单一 SQLite 完全没问题 |
+| 100~200 persona | 开始考虑把视频产物拆到 side-file（详见 §11） |
+| > 500 persona / 多用户 / 多机 | 单机 + SQLite 不再适用，应改造为 SQLite 元数据 + S3 对象存储（这是另一个项目的事） |
 
-### 0.5 落地结论
-
-```
-            元数据（账本 / 索引 / 事务）                   二进制（图 / 音 / 上传样本）
-            ────────────────────────────                  ─────────────────────────────
-落点         SQLite（avc.db）                              本地文件系统（~.local/share/avc/...）
-引擎         rusqlite + bundled                           tokio fs / sync fs
-原子替换    单文件 SQLite 备份 / 热拷贝                        tmp file + rename
-可移植       整个 avc.db                                          整个目录树
-强制校验     avc verify（sha256 vs manifest）                avc verify
-
-二者关系：
-   · persona_versions.dir_path  ←─指向──→  ~/.local/share/avc/personas/<id>/v<N>/
-   · 写新版本 → 落新目录 + SQLite 增 row
-   · 删数据   → 改 SQLite + rm 目录（不可变原则下基本不删）
-   ·          avc verify 全量扫，sha256 不匹配即报 asset_corrupted
-```
-
-> 一句话：**"SQLite 提供索引，FS 提供容量，二者通过 dir_path + sha256 双向验证。"**
+> 当前规模我们做**单一 SQLite**，心里清楚到哪一步该升级即可。
 
 ---
 
-## 1. 总原则
+## 1. 顶层文件布局
 
-- **一个 PersonaModelVersion = 一个不可变目录**
-- **本框架仅存元数据 + 产物引用 + 用户上传的原始素材**；**不下载、不缓存模型权重**
-- 所有"模型"在 Provider 端（远端 API），本框架只持有 `model_id / voice_id / face_id / knowledge_corpus_id` 等引用
-- 文件写入采用**原子替换**（先写临时文件，再 `rename`）
-- 元数据同时存 JSON（人类可读 / 调试友好）和 SQLite（索引 / 查询友好）
-- 大文件（图、音、上传样本）作为原始 blob 落盘；小配置走 JSON
-- 任何 Provider 返回的"模型权重 / LoRA 文件 / checkpoint"只存**引用**（URL / model_id），**不下载到本机**
+```
+$HOME/.config/avc/avc.toml           # 唯一配置文件（含 token，写入 0600）
+$HOME/.local/share/avc/avc.db        # 唯一数据库文件（含全部资产 + 元数据 + 产物）
+$HOME/.local/share/avc/avc.db.wal    # WAL 日志（运行时存在，checkpoint 后回收）
+$HOME/.local/share/avc/avc.db-shm    # 共享内存文件（运行时存在）
+```
 
----
-
-## 1.1 目录结构图
+> 只有两个稳定文件：`avc.toml` + `avc.db`。其余都是 WAL / 临时，关闭后会清理。
 
 ```mermaid
-graph TD
-    ROOT["~/.local/share/avc/"]
-    ROOT --> DB[("avc.db<br/>(SQLite)")]
-    ROOT --> CFG["avc.toml<br/>(token 加密)"]
-    ROOT --> PD["personas/"]
-    ROOT --> MD["media/"]
-    ROOT --> CD["cache/"]
-    ROOT --> LD["logs/"]
-
-    PD --> PM["pm_01HXXX/"]
-    PM --> V1["v1/<br/>(不可变快照)"]
-    PM --> V2["v2/<br/>(不可变快照)"]
-    PM --> V3["v3/<br/>(当前)"]
-
-    V1 --> AV1["avatar/"]
-    V1 --> VO1["voice/"]
-    V1 --> PD1["persona.json"]
-    V1 --> KA1["knowledge/"]
-    V1 --> IA1["identity_anchor.json"]
-    V1 --> MF1["manifest.json"]
-
-    V2 --> MF2["manifest.json"]
-    V2 --> AV2["avatar/"]
-    V2 --> VO2["voice/"]
-    V2 --> IA2["identity_anchor.json"]
-
-    MD --> MJ["jobs/"]
-    MJ --> J1["job_01A/<br/>final.mp4 + cover.jpg<br/>+ subtitle.srt + meta.json"]
-    MJ --> J2["job_01B/..."]
-
-    CD --> CCJ["jobs/ (中间产物缓存)"]
-    LD --> LA["audit.log"]
-
-    classDef imm fill:#e3f2fd,stroke:#1976d2
-    class V1,V2,V3,AV1,AV2,VO1,VO2,MF1,MF2,IA1,IA2,KA1 imm
+graph LR
+    HOME[$HOME/.config/avc/]
+    SHARE[$HOME/.local/share/avc/]
+    HOME --> TOML[avc.toml]
+    SHARE --> DB[avc.db]
+    SHARE --> WAL[avc.db-wal]
+    SHARE --> SHM[avc.db-shm]
+    classDef stable fill:#e8f5e9,stroke:#2e7d32
+    class TOML,DB stable
 ```
 
-> 蓝色节点是**不可变快照**，写新版本时另开目录。
+### 1.1 单 persona 单版本大小估算（KB~几十 MB 全在 BLOB）
+
+| 资产 | 典型大小 | 存储位置 |
+|------|----------|----------|
+| 主形象 PNG（1024px） | ~2 MB | `persona_versions.avatar_primary` BLOB |
+| 视角图 × 6 | ~12 MB | `persona_versions.avatar_views_blobs` BLOB（zip/合并） |
+| 参考图（用户上传） | KB~MB | `persona_versions.avatar_refs_blobs` BLOB |
+| LoRA 引用 | <1 KB | `persona_versions.avatar_lora_ref_json` TEXT（JSON） |
+| Voice 样本（60s WAV） | ~10 MB | `persona_versions.voice_sample` BLOB |
+| 声音 transcript | KB | `persona_versions.voice_transcript` TEXT |
+| Speaker embedding | ~2 KB | `persona_versions.voice_embed` BLOB |
+| Persona descriptor | KB | `persona_versions.persona_descriptor_json` TEXT |
+| Knowledge binding | KB | `persona_versions.knowledge_binding_json` TEXT |
+| Identity anchor × 3 | ~12 KB | `persona_versions.anchor_*_emb` BLOB |
+| Manifest + metrics | KB | `persona_versions.manifest_json` TEXT |
+| **单版本合计** | **~25 MB** | |
+
+50 persona × 5 版本 ≈ **6 GB**（实际比账小，因为不是每版都挂知识）。
 
 ---
 
-## 2. 默认根目录
+## 2. 完整 schema
 
-| 平台 | 默认路径 |
-|------|----------|
-| Linux / macOS | `~/.local/share/avc/`（`XDG_DATA_HOME` 优先） |
-| Windows | `%LOCALAPPDATA%\avc\` |
-
-子目录：
-```
-~/.local/share/avc/
-├── personas/                  # 人物角色模型资产（关键）
-│   └── {persona_model_id}/
-│       └── v{N}/
-│           ├── manifest.json          # 版本元数据（强 schema）
-│           ├── avatar/
-│           ├── voice/
-│           ├── persona.json
-│           ├── knowledge/             # 可选
-│           └── identity_anchor.json
-├── media/                     # 视频/封面/字幕等输出
-│   └── jobs/{job_id}/
-├── cache/                     # 临时缓存（Provider 下载 / 切分中间产物）
-├── logs/                      # 任务日志（按日滚动）
-├── avc.db                     # SQLite 主库（元数据 + 索引）
-└── avc.toml                   # 用户级配置（provider keys 等，权限 0600）
-```
-
-> 上层可通过 `AVC_HOME` 环境变量指向别处。Provider 子目录里的资源是**只读快照**——任何写入都意味着一个**新版本**。
-
----
-
-## 3. 版本目录布局（以 `v3` 为例）
-
-```
-~/.local/share/avc/personas/pm_01H..._v3/
-├── manifest.json
-├── avatar/
-│   ├── primary.png            # 主形象图（1024px 长边，PNG）
-│   ├── views/                 # 多视角（4~8 张）
-│   │   ├── view_front.png
-│   │   ├── view_side_l.png
-│   │   ├── view_side_r.png
-│   │   └── ...
-│   ├── ref/                   # 上传的参考图原图（仅用于审计与重训）
-│   │   └── ref_001.png
-│   ├── lora/                  # 可选；远端 avatar LoRA 引用
-│   │   └── ref.json           # { model_id, provider, trained_at, base_model, ... }
-│   ├── face.json              # 通用 face_id / instantid / ip-adapter 锚点
-│   └── provider.json          # 哪个 provider 生成的 + provider 版本
-├── voice/
-│   ├── sample.wav             # 用户上传的高质量样本（≥ 30s 干净人声），原始材料
-│   ├── transcript.json        # sample 对应文本（用于训练对齐）
-│   ├── embed.bin              # Provider 返回的 speaker embedding（一致性度量用，非本地模型权重）
-│   └── ref.json               # 远端 voice_id / provider / created_at
-├── persona.json               # 人设（详见 §5）
-├── knowledge/                 # 可选——只有该版本绑定了知识时存在
-│   ├── corpora/
-│   │   └── corpus_01/
-│   │       ├── chunks.parquet
-│   │       ├── embed.bin
-│   │       └── index.faiss    # 或 sqlite-vss / pgvector 文件
-│   └── binding.json           # KnowledgeBinding 元数据
-└── identity_anchor.json       # 跨版本一致性锚点
-```
-
----
-
-## 4. manifest.json（核心元数据）
-
-每个版本根目录都有一个 `manifest.json`。这是 persona version 的真实身份。
-
-```json
-{
-  "schema_version": 1,
-  "persona_model_id": "pm_01H...",
-  "persona_version": 3,
-  "parent_version": 2,
-  "created_at": "2026-07-30T08:12:00Z",
-  "training_job_id": "tj_01H...",
-  "status": "ready",
-  "assets": {
-    "avatar": {
-      "format": "png",
-      "sha256": "...",
-      "byte_size": 1842300
-    },
-    "voice": {
-      "sample_format": "wav",
-      "sha256": "...",
-      "byte_size": 9201000
-    },
-    "persona": { "schema_version": 1 },
-    "knowledge": null
-  },
-  "providers": {
-    "avatar": { "name": "sdxl_ip_adapter", "version": "v2.3" },
-    "voice":  { "name": "cosyvoice", "version": "v0.6" }
-  },
-  "metrics": {
-    "identity_consistency_vs_parent": 0.92,
-    "style_consistency_vs_parent": 0.88,
-    "quality_score": 0.84
-  },
-  "tags": ["neutral", "teach"],
-  "notes": ""
-}
-```
-
----
-
-## 5. persona.json
-
-```json
-{
-  "schema_version": 1,
-  "name": "Yu",
-  "archetype": "db_kernel_expert",
-  "description": "数据库内核专家，严谨务实、注重源码与性能数据",
-  "traits": ["耐心", "严谨", "幽默"],
-  "tone": "严谨",
-  "catchphrases": ["我们直接看源码"],
-  "taboos": ["绝对化表述", "医学诊断"],
-  "scenario_prompts": {
-    "teach": "请用通俗语言讲解，避免未定义术语",
-    "marketing": "请突出价值、节奏感，结尾给出明确 CTA"
-  },
-  "formality": 0.6,
-  "temperature": 0.7,
-  "response_length": "medium",
-  "language": "zh"
-}
-```
-
-> 这份文件同时被 LLM 调用读取（system prompt 组装）和训练读取（SFT 数据）。
-
----
-
-## 6. identity_anchor.json
-
-跨版本一致性是 persona 演进的命门，**锚点特征必须独立存**，方便后续比对：
-
-```json
-{
-  "schema_version": 1,
-  "computed_at": "2026-07-30T08:12:30Z",
-  "model_versions": {
-    "face_encoder": "arcface-r100",
-    "voice_encoder": "wespeaker"
-  },
-  "embeddings": {
-    "face":  { "dim": 512, "uri": "../avatar/face_emb.bin", "sha256": "..." },
-    "voice": { "dim": 512, "uri": "../voice/embed.bin",    "sha256": "..." },
-    "style": { "dim": 768, "uri": "style_emb.bin",         "sha256": "..." }
-  },
-  "anchor_samples": ["sample_canary_001.png", "sample_canary_002.wav"]
-}
-```
-
-演进评估逻辑：
-
-```
-new_anchor = extract(new_version)
-old_anchor = load(parent_version/identity_anchor.json)
-cos = cosine(new_anchor.face, old_anchor.face)
-if cos < threshold: drift_detected → rollback
-```
-
----
-
-## 7. 已知要点
-
-### 7.1 不可变性
-- 一旦 `vN` 完成，`./personas/pm_xxx_vN/` 内任何文件**禁止修改**
-- 重训只产出 `v(N+1)`，原版完整保留
-- 强制手段：CI / 校验脚本以 `sha256` 比对，发现变更就拒绝
-
-### 7.2 删除策略
-- **永不物理删除**历史版本
-- 仅"停用"：把 `manifest.status` 改为 `deprecated`
-- 整个 persona 归档：`avc persona archive yu`，整个目录树加 `.archive` 后缀，30 天后由 `avc prune` 物理清理
-
-### 7.3 大对象与加密
-- 形象参考图 / LoRA / 声音样本属于"敏感个人数据"
-- 默认**本地明文**，权限 `0600 / 0700`
-- 可选加密目录：把 `~/.local/share/avc/` 整体放到 `gocryptfs` / `eCryptfs` 卷
-- 框架**不**自实现加密（避免发明轮子）
-
-### 7.4 资产规模估算
-| 资产 | 单 persona 单版本 |
-|------|-----------------|
-| 主形象 PNG（1024px，由 Provider 生成 / 本地缓存） | ~2 MB |
-| 多视角 ×6 | ~12 MB |
-| LoRA 引用（**仅 JSON**，不下载权重） | < 1 KB |
-| 声音样本（30~60s wav 48k，用户上传的原始材料） | ~10 MB |
-| embed.bin × 数个（一致性度量用特征向量） | < 1 MB |
-| JSON 配置 | KB 级 |
-| **典型单版本总量** | **30–60 MB** |
-
-1000 个 persona × 5 版本典型空间占用 ~ 300 GB；用户上传素材可由对象存储 plugin 接管。
-> 由于 LoRA 权重**不下载到本机**，单版本体积从 80–250 MB 降至 30–60 MB。这是与"仅 API"对齐的直接好处。
-
----
-
-### 8.0 ER 图
+下面 12 张表覆盖 AVCore 全部状态。**主表 `persona_versions` 是宽表**，一个版本一行，把所有资产 BLOB 都放进去——避免频繁 JOIN 与跨表复制。
 
 ```mermaid
 erDiagram
     persona_models ||--o{ persona_versions : has
     persona_models ||--o{ persona_samples : collects
     persona_models ||--o{ training_jobs : trains
+    persona_versions ||--o{ training_jobs : produces
     persona_versions ||--o{ jobs : locked_by
+    persona_versions ||--o{ persona_samples : collected_at
     scripts ||--o{ jobs : executes
+    jobs ||--o{ artifacts : produces
+    jobs ||--o{ job_steps : broken_into
     knowledge_corpora ||--o{ corpus_chunks : contains
     knowledge_corpora ||--o{ persona_versions : bound_to
-    jobs ||--o{ job_steps : broken_into
-    persona_versions ||--|| identity_anchors : identified_by
-
-    persona_models {
-        TEXT id PK
-        TEXT name
-        INTEGER current_version
-    }
-    persona_versions {
-        TEXT persona_model_id PK
-        INTEGER version PK
-        TEXT dir_path
-        TEXT status
-    }
-    persona_samples {
-        TEXT id PK
-        TEXT persona_model_id FK
-        TEXT kind
-        INTEGER version_id_at_collection
-    }
-    training_jobs {
-        TEXT id PK
-        TEXT persona_model_id FK
-        INTEGER base_version
-        TEXT status
-    }
-    jobs {
-        TEXT id PK
-        TEXT script_id FK
-        INTEGER persona_version FK
-        TEXT status
-    }
-    scripts {
-        TEXT id PK
-        INTEGER persona_version FK
-    }
-    knowledge_corpora {
-        TEXT id PK
-        INTEGER chunk_count
-    }
-    corpus_chunks {
-        TEXT id PK
-        TEXT corpus_id FK
-        INTEGER ordinal
-        TEXT content
-    }
-    job_steps {
-        TEXT id PK
-        TEXT job_id FK
-        TEXT node_id
-    }
-    identity_anchors {
-        TEXT id PK
-        TEXT persona_version_id FK
-        BLOB face_emb
-        BLOB voice_emb
-    }
 ```
 
----
-## 8. SQLite 主库：`avc.db`
-
-> 元数据 + 索引存 SQLite；大文件走文件系统。两边通过 hash 关联。
-
-### 8.1 关键表（精简）
+### 2.1 `persona_models` — 顶层角色元数据
 
 ```sql
 CREATE TABLE persona_models (
-  id            TEXT PRIMARY KEY,
-  name          TEXT NOT NULL,
-  archetype     TEXT,
-  description   TEXT,
-  current_version INTEGER NOT NULL,
-  status        TEXT NOT NULL,        -- active / archived
-  created_at    TEXT NOT NULL,
-  updated_at    TEXT NOT NULL
-);
-
-CREATE TABLE persona_versions (
-  persona_model_id TEXT NOT NULL,
-  version          INTEGER NOT NULL,
-  parent_version   INTEGER,
-  dir_path         TEXT NOT NULL,    -- 相对 ~/.local/share/avc
-  status           TEXT NOT NULL,
-  created_at       TEXT NOT NULL,
-  training_job_id  TEXT,
-  metrics_json     TEXT,
-  PRIMARY KEY (persona_model_id, version),
-  FOREIGN KEY (persona_model_id) REFERENCES persona_models(id)
-);
-
-CREATE TABLE training_jobs (
-  id                   TEXT PRIMARY KEY,
-  persona_model_id     TEXT NOT NULL,
-  base_version         INTEGER NOT NULL,
-  scope_json           TEXT NOT NULL,
-  config_json          TEXT,
-  status               TEXT NOT NULL,
-  result_version       INTEGER,
-  drift_report_json    TEXT,
-  started_at           TEXT,
-  finished_at          TEXT
-);
-
-CREATE TABLE persona_samples (
-  id                       TEXT PRIMARY KEY,
-  persona_model_id         TEXT NOT NULL,
-  kind                     TEXT NOT NULL,  -- image / audio / behavior_text / feedback
-  uri_or_text              TEXT,
-  version_id_at_collection INTEGER,
-  consent_proof            TEXT,
-  tags_json                TEXT,
-  quality_score            REAL,
-  created_at               TEXT NOT NULL
-);
-
-CREATE TABLE jobs (                -- 渲染任务
-  id                  TEXT PRIMARY KEY,
-  script_id           TEXT,
-  persona_model_id    TEXT NOT NULL,
-  persona_version     INTEGER NOT NULL,    -- 锁定版本，永不漂移
-  status              TEXT NOT NULL,
-  options_json        TEXT,
-  artifacts_json      TEXT,
-  created_at          TEXT,
-  finished_at         TEXT
-);
-
-CREATE TABLE knowledge_corpora (
-  id                  TEXT PRIMARY KEY,
-  name                TEXT NOT NULL,
-  source_type         TEXT NOT NULL,
-  language            TEXT,
-  chunk_count         INTEGER,
-  index_version       INTEGER DEFAULT 0,
-  created_at          TEXT
-);
-
-CREATE TABLE corpus_chunks (
-  id           TEXT PRIMARY KEY,
-  corpus_id    TEXT NOT NULL,
-  ordinal      INTEGER NOT NULL,
-  content      TEXT NOT NULL,
-  token_count  INTEGER NOT NULL,
-  deprecated   INTEGER DEFAULT 0,  -- 0/1
-  meta_json    TEXT,
-  FOREIGN KEY (corpus_id) REFERENCES knowledge_corpora(id)
-);
-
-CREATE TABLE audit_log (
-  id            INTEGER PRIMARY KEY AUTOINCREMENT,
-  ts            TEXT NOT NULL,
-  actor         TEXT,           -- user / system
-  action        TEXT NOT NULL,
-  target_kind   TEXT,
-  target_id     TEXT,
-  detail_json   TEXT
+    id TEXT PRIMARY KEY,           -- pm_<ULID>
+    name TEXT NOT NULL,            -- "Yu"
+    archetype TEXT,                -- db_kernel_expert
+    description TEXT,
+    current_version INTEGER NOT NULL,  -- 当前默认版本号
+    status TEXT NOT NULL,          -- active / archived
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
 );
 ```
 
-> 知识语料内容（`content` / `embeddings`）也允许放文件系统，但默认**行存储** SQLite——小语料（< 100MB chunk）足够高效；超大再迁出去。
+### 2.2 `persona_versions` — 不可变版本快照（**宽表**）
 
-### 8.2 迁移
-- 单文件 `avc.db` + 版本号 `schema_version`（顶层 PRAGMA user_version）
-- 升级时跑 `avc migrate`，就地迁移 SQLite schema 与目录布局
+一行 = 一个 PersonaModelVersion。所有资产 BLOB 直接在此行内。
 
-### 8.3 备份
-- 整个 `~/.local/share/avc/` 就是一个完整的有状态 snapshot
-- 备份 = 拷目录 + 拷 SQLite
-- 可选 `avc export` 把整个 persona 打包成 `tar.zst`，便于跨机
+```sql
+CREATE TABLE persona_versions (
+    persona_model_id TEXT NOT NULL,
+    version INTEGER NOT NULL,
+    parent_version INTEGER,                       -- 训练时父版本
+    status TEXT NOT NULL,                          -- building / ready / deprecated
+
+    -- ============ avatar ============
+    avatar_provider TEXT,
+    avatar_provider_version TEXT,
+    avatar_primary BLOB,                          -- PNG / JPEG
+    avatar_primary_mime TEXT,
+    avatar_primary_sha256 TEXT,
+    avatar_views_blobs BLOB,                      -- zip-of-PNGs OR concatenation
+    avatar_views_mime TEXT,
+    avatar_views_sha256 TEXT,
+    avatar_refs_blobs BLOB,                       -- 用户上传的参考图（可空）
+    avatar_refs_mime TEXT,
+    avatar_refs_sha256 TEXT,
+    avatar_lora_ref_json TEXT,                    -- {model_id, provider, trained_at, base_model}
+    avatar_face_id TEXT,
+
+    -- ============ voice ============
+    voice_provider TEXT,
+    voice_provider_version TEXT,
+    voice_id_remote TEXT,                         -- 远端 voice_id
+    voice_sample BLOB,                            -- WAV 30~60s
+    voice_sample_mime TEXT,
+    voice_sample_sha256 TEXT,
+    voice_transcript TEXT,
+    voice_embed BLOB,                             -- speaker embedding (512-d float32)
+    voice_embed_dim INTEGER,
+    voice_embed_sha256 TEXT,
+
+    -- ============ persona descriptor ============
+    persona_descriptor_json TEXT,                 -- 完整 descriptor JSON
+
+    -- ============ knowledge (可选) ============
+    knowledge_binding_json TEXT,                  -- 完整 KnowledgeBinding JSON
+    knowledge_corpus_ids_json TEXT,               -- 用于 join 回 knowledge_corpora
+
+    -- ============ identity anchor ============
+    anchor_face_emb BLOB,                         -- 512-d
+    anchor_face_dim INTEGER,
+    anchor_face_sha256 TEXT,
+    anchor_voice_emb BLOB,                        -- 512-d
+    anchor_voice_dim INTEGER,
+    anchor_voice_sha256 TEXT,
+    anchor_style_emb BLOB,                        -- 768-d
+    anchor_style_dim INTEGER,
+    anchor_style_sha256 TEXT,
+    anchor_computed_at TEXT,
+    anchor_encoder_versions_json TEXT,            -- {face: "arcface-r100", voice: "wespeaker", style: "..."}
+
+    -- ============ manifest / metrics ============
+    manifest_json TEXT,                           -- 完整 manifest JSON（导出用）
+    metrics_json TEXT,                            -- {identity_consistency, style_consistency, quality_score, drift_alerts}
+    notes TEXT,
+
+    -- ============ traceability ============
+    training_job_id TEXT,
+    created_at TEXT NOT NULL,
+
+    PRIMARY KEY (persona_model_id, version)
+);
+
+CREATE INDEX idx_persona_versions_status ON persona_versions(status);
+```
+
+> **不可变原则**：`UPDATE persona_versions SET ...` 仅在 `building → ready` 这一窗口发生；`ready` 之后任何字段不再被 UPDATE，只能新增新行（v(N+1)）。
+
+### 2.3 `persona_samples` — 训练样本池
+
+```sql
+CREATE TABLE persona_samples (
+    id TEXT PRIMARY KEY,                          -- smp_<ULID>
+    persona_model_id TEXT NOT NULL,
+    version_id_at_collection INTEGER,             -- 收集时所在的 version
+    kind TEXT NOT NULL,                           -- image / audio / behavior_text / feedback
+    blob BLOB,                                    -- 二进制样本（image/audio）
+    blob_mime TEXT,
+    text TEXT,                                    -- 文本样本（behavior_text/feedback 可走文本）
+    source TEXT NOT NULL,                         -- user_upload / system_extracted / feedback_pool
+    consent_proof TEXT,                           -- 授权文件 ID 或 hash
+    consent_proof_sha256 TEXT,
+    tags_json TEXT,
+    quality_score REAL,
+    sha256 TEXT,
+    byte_size INTEGER,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX idx_samples_pm ON persona_samples(persona_model_id, kind, created_at);
+CREATE INDEX idx_samples_version ON persona_samples(version_id_at_collection);
+```
+
+### 2.4 `training_jobs` — 训练任务账本
+
+```sql
+CREATE TABLE training_jobs (
+    id TEXT PRIMARY KEY,                          -- tj_<ULID>
+    persona_model_id TEXT NOT NULL,
+    base_version INTEGER NOT NULL,
+    target_version INTEGER,                       -- 训练前预占，成功后即 result_version
+    scope_json TEXT NOT NULL,                     -- ["avatar","voice","persona","knowledge"]
+    config_json TEXT,
+    status TEXT NOT NULL,                         -- queued/running/succeeded/failed_drift/failed/cancelled
+    progress REAL,
+    result_version INTEGER,                       -- 成功时 = target_version
+    drift_report_json TEXT,                       -- 失败时详细报告
+    started_at TEXT,
+    finished_at TEXT
+);
+```
+
+### 2.5 `scripts` — 分镜
+
+```sql
+CREATE TABLE scripts (
+    id TEXT PRIMARY KEY,                          -- scr_<ULID>
+    persona_model_id TEXT NOT NULL,
+    persona_version INTEGER NOT NULL,             -- 锁定
+    topic TEXT,
+    template_id TEXT,
+    scenes_json TEXT NOT NULL,
+    style_overrides_json TEXT,
+    bgm_id TEXT,
+    duration_ms INTEGER,
+    created_at TEXT
+);
+```
+
+### 2.6 `jobs` — 渲染任务
+
+```sql
+CREATE TABLE jobs (
+    id TEXT PRIMARY KEY,                          -- job_<ULID>
+    script_id TEXT,
+    persona_model_id TEXT NOT NULL,
+    persona_version INTEGER NOT NULL,             -- 锁定，永不漂移
+    status TEXT NOT NULL,
+    options_json TEXT,
+    artifacts_json TEXT,
+    error_json TEXT,
+    progress REAL,
+    current_step TEXT,
+    step_progress_json TEXT,
+    eta_seconds INTEGER,
+    created_at TEXT,
+    finished_at TEXT
+);
+```
+
+### 2.7 `artifacts` — 视频产物（嵌入 DB，无 FS 路径）
+
+```sql
+CREATE TABLE artifacts (
+    id TEXT PRIMARY KEY,                          -- art_<ULID>
+    job_id TEXT NOT NULL,
+    kind TEXT NOT NULL,                           -- final_video / cover_image / subtitle / meta
+    name TEXT NOT NULL,                           -- final.mp4 / cover.jpg / subtitle.srt / meta.json
+    content BLOB,
+    mime TEXT,
+    byte_size INTEGER,
+    sha256 TEXT,
+    meta_json TEXT,
+    created_at TEXT
+);
+
+CREATE INDEX idx_artifacts_job ON artifacts(job_id, kind);
+```
+
+> **导出路径**：`avc job export job_xxx --out ./final.mp4` 把 BLOB 写到 FS，便于分享。
+
+### 2.8 `job_steps` — DAG 节点账本
+
+```sql
+CREATE TABLE job_steps (
+    id TEXT PRIMARY KEY,
+    job_id TEXT NOT NULL,
+    node_id TEXT NOT NULL,
+    status TEXT NOT NULL,                         -- pending/running/succeeded/failed/skipped
+    attempt INTEGER DEFAULT 1,
+    inputs_json TEXT,
+    outputs_json TEXT,
+    artifacts_json TEXT,
+    error_json TEXT,
+    started_at TEXT,
+    finished_at TEXT,
+    duration_ms INTEGER,
+    trace_id TEXT
+);
+CREATE INDEX idx_steps_job ON job_steps(job_id);
+```
+
+### 2.9 `knowledge_corpora` + `corpus_chunks` — 知识语料
+
+```sql
+CREATE TABLE knowledge_corpora (
+    id TEXT PRIMARY KEY,
+    name TEXT,
+    source_type TEXT,
+    language TEXT,
+    chunk_count INTEGER DEFAULT 0,
+    index_version INTEGER DEFAULT 0,
+    created_at TEXT
+);
+
+CREATE TABLE corpus_chunks (
+    id TEXT PRIMARY KEY,
+    corpus_id TEXT NOT NULL,
+    ordinal INTEGER NOT NULL,
+    content TEXT NOT NULL,
+    embed_blob BLOB,                              -- 远端 embed API 算出来的向量
+    embed_dim INTEGER,
+    embed_sha256 TEXT,
+    token_count INTEGER,
+    deprecated INTEGER DEFAULT 0,
+    meta_json TEXT
+);
+CREATE INDEX idx_chunks_corpus ON corpus_chunks(corpus_id, ordinal);
+```
+
+### 2.10 `config_entries` — 运行时配置（仅密钥/Provider 配置等少数项）
+
+```sql
+CREATE TABLE config_entries (
+    key TEXT PRIMARY KEY,
+    value TEXT,                                   -- JSON / 字符串
+    encrypted INTEGER DEFAULT 0,                  -- 0/1；加密条目仅 in-memory 解密落用
+    updated_at TEXT
+);
+```
+
+### 2.11 `audit_log` — 审计
+
+```sql
+CREATE TABLE audit_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts TEXT NOT NULL,
+    actor TEXT,                                   -- user / system
+    action TEXT NOT NULL,
+    target_kind TEXT,
+    target_id TEXT,
+    detail_json TEXT
+);
+CREATE INDEX idx_audit_target ON audit_log(target_kind, target_id, ts);
+```
 
 ---
 
-## 9. 不在框架内的存储
+## 3. 行级不可变快照：`persona_versions` 的事实语义
 
-- **远程对象存储**（S3 / OSS）：通过 trait 抽象成 Provider 即可
-- **Postgres / Milvus**：当前**不需要**；未来导入时只换 `avc.db` + Storage Provider
+一个版本 = `persona_versions` 表的一行。**所有事实数据 + BLOB 在该行内**。
+
+```mermaid
+graph TD
+    ROW["persona_versions<br/>一行 = 一个 PersonaModelVersion"]
+    ROW --> AV[avatar_*]
+    ROW --> VO[voice_*]
+    ROW --> PD[persona_descriptor_json]
+    ROW --> KB[knowledge_binding_json]
+    ROW --> IA[anchor_*_emb]
+    ROW --> MF[manifest_json]
+    ROW --> ST[status / created_at]
+
+    classDef blob fill:#fff3e0,stroke:#e65100
+    class AV,VO,IA blob
+```
+
+### 3.1 写一条新版本的全流程
+
+```
+BEGIN TRANSACTION;
+  -- 1. 预占版本号（避免冲突）
+  INSERT INTO training_jobs(target_version=N+1, status='running');
+  
+  -- 2. 写新版本行（status='building'）
+  INSERT INTO persona_versions(?, N+1, ..., status='building');
+  
+  -- 3. 写样本到 persona_samples（来自外部或回灌）
+  
+  -- 4. 节点完成时只 UPDATE outputs_json 在 job_steps
+  
+COMMIT;
+```
+
+### 3.2 漂移不达标时的一键回退
+
+```sql
+BEGIN TRANSACTION;
+  DELETE FROM persona_versions WHERE persona_model_id=? AND version=N+1;
+  UPDATE training_jobs SET status='failed_drift', drift_report_json=?, finished_at=?
+    WHERE target_version=N+1 AND persona_model_id=?;
+COMMIT;
+```
+
+> SQLite 事务原子性回退 = 一句话。没有"删除半个目录然后发现漏了一个 BLOB"的可能。
 
 ---
 
-## 10. 文件被破坏时怎么办
+## 4. 备份与迁移
 
-- 每次访问 `personas/pm_xxx_vN/avatar/primary.png` 时校验 `sha256`，比对 manifest
-- 不匹配 → 抛 `asset_corrupted`，禁止渲染（CI 必要时重新生成）
-- 提供 `avc verify` 命令以**只读**遍历所有版本与产物，校验 sha256
+> **整个 `avc.db` = 全部状态**。不需要分别备份 SQLite + 文件系统。
+
+### 4.1 在线热备份（推荐）
+
+```bash
+# 框架自带命令：先做 wal-checkpoint，再安全复制
+avc backup --out backup-2026-07-30.db
+```
+
+实现：
+```sql
+PRAGMA wal_checkpoint(FULL);   -- 把 WAL 落盘
+-- 然后由 Rust 层 atomic copy avc.db -> 备份
+```
+
+### 4.2 离线冷备份
+
+```bash
+# 服务停掉时直接拷贝
+cp ~/.local/share/avc/avc.db ./my_backup.db
+```
+
+### 4.3 单 persona 导出（跨机迁移友好）
+
+```bash
+avc export --persona yu --out yu-portable.tar.zst
+```
+
+实现：从 `persona_versions` 选一行（含所有 BLOB）+ 关联 `persona_samples` + 关联 `training_jobs` → tar.zst。
+
+### 4.4 恢复
+
+```bash
+avc restore --from backup-2026-07-30.db   # 直接替换 avc.db（自动停 wal + 重启）
+avc import yu-portable.tar.zst            # 增量导入单个 persona
+```
 
 ---
 
-## 11. 总结：为什么"目录即版本"
+## 5. 校验与修复
 
-| 做法 | 好处 |
-|------|------|
-| 目录即版本 | 拷目录 = 拷一个完整 persona；rsync / restic / object storage 都能直接用 |
-| 不放数据库的 blob | SQLite 只存元数据；崩溃后用文件系统可手动恢复 |
-| 全 JSON 配置 | 调试时 `cat persona.json` 即看懂；git friendly（除了二进制外） |
-| 不可变 | 误操作只可能出新版本，原版安全；运维风险最低 |
+### 5.1 全量校验
+
+```bash
+avc verify
+```
+
+实现：对每个 `persona_versions` 行 / `artifacts` 行重算 sha256，与表中存的 sha256 比对。不匹配 → 标 `corrupted=1`。
+
+```sql
+SELECT id FROM persona_versions
+ WHERE avatar_primary IS NOT NULL
+   AND avatar_primary_sha256 != hex(sha256(avatar_primary));
+```
+
+### 5.2 单 persona 校验
+
+```bash
+avc verify --persona yu
+```
+
+---
+
+## 6. 给人类的 inspect 入口
+
+虽然存储是 SQLite BLOB，但用户偶尔想"看一眼"。
+
+### 6.1 CLI inspect（推荐）
+
+```bash
+avc persona show yu                    # 概要
+avc persona versions yu                 # 所有版本
+avc persona show yu --version 2 --json # JSON 形式
+avc persona inspect yu --version 2     # 完整结构，格式化输出
+```
+
+### 6.2 临时盘 dump（可选，便于调试）
+
+```bash
+avc persona dump yu --version 2 --out ./dump_dir/   # 一次性导出为可读目录
+# 产生：
+# ./dump_dir/manifest.json
+# ./dump_dir/avatar/primary.png
+# ./dump_dir/voice/sample.wav
+# ...
+```
+
+> `dump` 是**只读视图**——不写回 DB；下次再 dump 又是同一份。
+
+### 6.3 直接用 sqlite3 命令
+
+```bash
+sqlite3 ~/.local/share/avc/avc.db "SELECT id, name FROM persona_models"
+sqlite3 ~/.local/share/avc/avc.db ".schema persona_versions"
+```
+
+---
+
+## 7. 配置与 token 存储
+
+**只写文件 `avc.toml`（不在 SQLite 中）**：
+- 路径：`~/.config/avc/avc.toml`（XDG_CONFIG_HOME）
+- 权限：0600
+- 用途：Provider token、开关（真实人物复刻、隐私模式…）
+
+```toml
+[provider.avatar.kling]
+api_key = "klg_..."
+
+[provider.voice.elevenlabs]
+api_key = "el_..."
+
+[provider.llm.openai]
+api_key = "sk-..."
+
+[provider.video.kling]
+api_key = "klg_..."
+
+[safety]
+real_person_enabled = false
+auto_consume_feedback = true
+```
+
+> SQLite 不存 token，原因：备份库 / `avc dump` 时不泄漏密钥；同时 `avc.toml` 是稳定单文件，git / dotfile 工具可直接管理。
+
+---
+
+## 8. 迁移到更大规模（透明升级路径）
+
+| 当前规模 | 推荐方案 |
+|----------|----------|
+| ≤ 50 persona × 10 版本 ≈ 20 GB | 单 SQLite（本方案） |
+| 100~200 persona | 视频产物 → side-file（其他仍 SQLite） |
+| > 200 persona / 多用户 / 跨机 | SQLite 元数据 + S3 对象存储产物（独立项目，本框架仍负责格式规范） |
+| 集群级 | 与本框架无关 |
+
+升级时**不需要破坏 schema**：`artifacts.content` BLOB 列允许为 `NULL` 表示 "BLOB 已迁出到 `<uri>`"，`avc job export` 仍可读。
+
+---
+
+## 9. 总结
+
+> **一切都在一个文件里**：`~/.local/share/avc/avc.db`。
+> 
+> - 元数据 / 嵌入向量 / 视频产物 → 表的 BLOB 列
+> - 50 persona × 5 版本 ≈ 几 GB，单文件 SQLite 完全够
+> - 备份 = 拷一个文件；迁移 = `rsync` 一个文件；恢复 = `cp` 一下
+> - `avc verify` 用 sha256 自动校验，`avc inspect / dump` 给人类看
+> - token 单独走 `~/.config/avc/avc.toml`，不进 DB
+> - 跨到更大规模时只需把 `artifacts.content` 拆出 side-file，schema 不破
+
+`avc.db` 是本框架的**唯一事实源**。

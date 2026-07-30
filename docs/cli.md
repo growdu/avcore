@@ -115,7 +115,8 @@ avc persona show yu                          # 概要
 avc persona show yu --version 2              # 特定版本
 avc persona list                               # 所有 persona
 avc persona versions yu                      # 历史版本
-avc persona open yu --version 2              # 打开该版本目录
+avc persona inspect yu --version 2           # 详细结构 (从 avc.db 读)
+avc persona dump yu --version 2 --out ./dump/# 一次性导出可读目录（只读视图，不写回 DB）
 ```
 
 ### 2.3 切默认版本

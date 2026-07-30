@@ -503,52 +503,26 @@ flowchart LR
 
 ## 6. 信息存储（重点：本框架怎么存）
 
-> **一句话**：元数据进 SQLite（avc.db），二进制进本地文件系统（`~/.local/share/avc/`）。  
-> 默认**不**接对象存储——除非容量 / 跨机需求到了临界点（参见 [`storage.md §0`](./storage.md)）。
+> **一句话**：全部状态进单一 SQLite 文件 `~/.local/share/avc/avc.db`，配置 / token 走 `~/.config/avc/avc.toml`。
+>
+> 用户给定的规模约束：≤ 50 persona，单机运行。在这个量级，**单一 SQLite + BLOB 列**比"FS + SQLite"和"对象存储"都简单。详见 [`storage.md`](./storage.md)。
 
 
-### 6.1 文件系统布局（graph）
+
+### 6.1 顶层文件布局（graph）
 
 ```mermaid
-graph TD
-    ROOT["~/.local/share/avc/"]
-    ROOT --> DB[("avc.db (SQLite)")]
-    ROOT --> CFG["avc.toml (token 加密)"]
-    ROOT --> P_DIR["personas/"]
-    ROOT --> M_DIR["media/"]
-    ROOT --> C_DIR["cache/"]
-    ROOT --> L_DIR["logs/"]
+graph LR
+    CFG_DIR["$HOME/.config/avc/"] --> TOML[("avc.toml<br/>provider token<br/>+ 开关")]
+    DATA_DIR["$HOME/.local/share/avc/"] --> DB[("avc.db<br/>所有元数据 + BLOB")]
+    DATA_DIR --> WAL[avc.db-wal]
+    DATA_DIR --> SHM[avc.db-shm]
 
-    P_DIR --> PM["pm_01HXXX/"]
-    PM --> V1["v1/<br/>(不可变快照)"]
-    PM --> V2["v2/<br/>(不可变快照)"]
-    PM --> V3["v3/<br/>(current)"]
-    PM --> ARC["archive/ (归档,<br/>不再被引用)"]
-
-    V1 --> MF1["manifest.json"]
-    V1 --> AV1["avatar/<br/>primary.png + views/ + ref/ + lora/ref.json"]
-    V1 --> VO1["voice/<br/>sample.wav + transcript.json + embed.bin + ref.json"]
-    V1 --> PD1["persona.json"]
-    V1 --> KA1["knowledge/ (可选)<br/>corpora/ + binding.json"]
-    V1 --> IA1["identity_anchor.json"]
-
-    V2 --> MF2["manifest.json"]
-    V2 --> AV2["avatar/ (新引用)"]
-    V2 --> VO2["voice/ (新引用)"]
-    V2 --> IA2["identity_anchor.json"]
-
-    M_DIR --> MJ["jobs/"]
-    MJ --> J1["job_01A/<br/>final.mp4 + cover.jpg<br/>subtitle.srt + meta.json"]
-    MJ --> J2["job_01B/..."]
-
-    C_DIR --> CJ["jobs/ (中间产物缓存)"]
-    L_DIR --> LA["audit.log (滚动)"]
-
-    classDef immutable fill:#e3f2fd,stroke:#1976d2
-    class V1,V2,V3,MF1,MF2,AV1,AV2,VO1,VO2,IA1,IA2,PD1,KA1 immutable
+    classDef stable fill:#e8f5e9,stroke:#2e7d32
+    class TOML,DB stable
 ```
 
-> **写 v(N+1) 即可；不修改 vN 中任何文件。** 详见 [`storage.md`](./storage.md)。
+> **唯一两个稳定文件：avc.toml（配置）+ avc.db（数据）**。其余 WAL/SHM 是 SQLite 运行时临时，关闭后回收。详见 [`storage.md`](./storage.md)。
 
 ### 6.2 SQLite Schema（erDiagram）
 
@@ -675,43 +649,41 @@ erDiagram
     }
 ```
 
-### 6.3 双层关系："事实目录 ↔ 索引数据库"
+### 6.3 不可变行的语义
+
+每个 `PersonaModelVersion` = `persona_versions` 表的一行，包含所有元数据与 BLOB 资产。版本永远以新增行的方式产生，旧行不被 UPDATE。
 
 ```mermaid
-flowchart LR
-    subgraph FS["文件系统（事实源）"]
-        direction TB
-        D["personas/pm_xxx/vN/<br/>avatar/ · voice/ · persona.json<br/>identity_anchor.json · manifest.json"]
-    end
+graph TD
+    ROW["persona_versions 一行<br/>＝ 一个 PersonaModelVersion"]
+    ROW --> AV["avatar_* (BLOB)"]
+    ROW --> VO["voice_* (BLOB)"]
+    ROW --> PD[persona_descriptor_json]
+    ROW --> KB[knowledge_binding_json]
+    ROW --> IA["anchor_*_emb (BLOB)"]
+    ROW --> MF[manifest_json]
+    ROW --> META["status + created_at + sha256"]
 
-    subgraph DB["SQLite（索引 + 账本）"]
-        direction TB
-        T1[persona_models]
-        T2[persona_versions<br/>dir_path 指向 FS]
-        T3[persona_samples]
-        T4[training_jobs]
-        T5[jobs / job_steps]
-    end
+    AV -.sha256.-> VERIFY[avc verify]
+    VO -.sha256.-> VERIFY
+    IA -.sha256.-> VERIFY
 
-    FS -->|"sha256 + dir_path<br/>(DB 索引 FS)"| DB
-    DB -->|"avc verify<br/>校验 sha + 列出孤儿"| FS
-    D -.->|"auditor 脚本"| DB
+    classDef blob fill:#fff3e0,stroke:#e65100
+    class AV,VO,IA blob
 ```
 
-> 两者通过 `persona_versions.dir_path`（相对 `~/.local/share/avc/`）和文件 sha256 双向校验。`avc verify` 全量扫。
-
----
+> 漂移不达标 → `DELETE FROM persona_versions WHERE version=N+1` 在事务内回退 = 整个版本消失。详见 [`storage.md §3`](./storage.md)。
 
 ## 7. 跨场景对照
 
 | 场景 | 服务链 | 落盘位置 | 关键事件 |
 |------|--------|----------|----------|
-| 首次创建 persona | persona-svc → pipeline-svc → 3~4 Provider | `personas/pm_xxx/v1/` | `task_succeeded` / `persona_version=1` |
-| 持续训练 | evolution-svc → pipeline-svc → 1~3 Provider | `personas/pm_xxx/vN+1/` or rollback | `training_jobs.status` |
-| 出片 | render-svc → pipeline-svc → LLM/TTS/i2v Provider | `media/jobs/job_xxx/` | `jobs.status` |
-| 反馈回灌 | render-svc → SQLite (samples) → 下次 evolve | `persona_samples` | `sample(kind=feedback)` |
-| 跨机迁移 | tar.zst export/import | 整个 `~/.local/share/avc/` | `avc export` / `import` |
-| 紧急回滚 | persona-svc 改 current_version 指针 | 无新文件 | persona_models.current_version=vPrev |
+| 首次创建 persona | persona-svc → pipeline-svc → 3~4 Provider | `persona_versions` 新行 | `task_succeeded` / version=1 |
+| 持续训练 | evolution-svc → pipeline-svc → 1~3 Provider | 预占 v(N+1)；成功 → INSERT；失败 → DELETE 事务回退 | `training_jobs.status` |
+| 出片 | render-svc → pipeline-svc → LLM/TTS/i2v Provider | `jobs` + `artifacts.content BLOB` | `jobs.status` |
+| 反馈回灌 | render-svc → `persona_samples` | SQLite 即可 | `sample(kind=feedback)` |
+| 跨机迁移 | export / import | 整个 `avc.db` (or tar.zst 单 persona) | `avc export` / `import` |
+| 紧急回滚 | persona-svc 改 current_version 指针 | UPDATE `persona_models` | `persona_models.current_version=vPrev` |
 
 ---
 

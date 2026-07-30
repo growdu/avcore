@@ -143,6 +143,8 @@ struct TrainingConfig {
 
 训练耗时的实际来源是 Provider 端的排队与计算；AVCore 通过 `task_xxx --watch` 长轮询 Provider 任务状态。
 
+> **新版本一旦 INSERT 成功即生效；漂移不达标则在事务内 `DELETE` 整行回退**——SQLite 事务保证无半成品。详见 [storage.md §3](../storage.md)。
+
 每个节点是 DAG 中的独立步，节点结果**全部落 v(N+1) 目录**。这就是为什么 v(N+1) 必须是新目录——任何中间产物都能定位。
 
 ---

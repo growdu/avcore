@@ -292,12 +292,14 @@ trait KnowledgeProvider { ... } // chunk / embed / search
 
 ## 8. 数据持久化（高层）
 
-参考 [`storage.md`](./storage.md) 全文。这里只点约束：
+> **单一 SQLite 文件 `~/.local/share/avc/avc.db` = 全部状态**。配置 / token 单独走 `~/.config/avc/avc.toml`。
 
-- **目录即版本**：每个版本 = 一个固定布局的目录树，拷目录 = 拷 persona
-- **大文件落盘**：图 / 音 / LoRA / 嵌入向量直接落盘；元数据走 SQLite 索引
-- **不可变**：老版本只可停用（deprecated），永不物理删除（除非显式 `prune` 过期归档）
-- **原子替换**：写文件先临时再 `rename`，避免半成品
+约束（详见 [`storage.md`](./storage.md)）：
+
+- **行即版本**：`persona_versions` 一行 = 一个 PersonaModelVersion；BLOB 列存图 / 音 / 嵌入向量 / 视频产物
+- **不可变**：版本通过 INSERT 新行产生；旧行不被 UPDATE；漂移不达标时 `DELETE` 事务回退整行
+- **token 单文件**：`avc.toml` 0600，不入 DB，便于备份库不泄漏、便于 dotfiles 管理
+- **50 persona 上限 + 单机**：够用且性能无忧；升级阈值在 [`storage.md §0.4 / §8`](./storage.md)
 
 ---
 

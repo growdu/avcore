@@ -10,11 +10,13 @@
 - `persona_model_id` + `version_id`（不指定 = 当前默认版本）
 - `Script`（含分镜）+ 渲染选项
 
-**输出**（落 `~/.local/share/avc/media/jobs/{job_id}/`）：
-- `final.mp4`
-- `cover.jpg`
-- `subtitle.srt`
-- `meta.json` —— **包含 `persona_version_id` 与所有 provider 快照参数**
+**输出**（落 `artifacts` 表，每条一行 BLOB）：
+- `final.mp4` BLOB
+- `cover.jpg` BLOB
+- `subtitle.srt` BLOB
+- `meta.json` BLOB —— **含 `persona_version` 与所有 provider 快照参数**
+
+> 视频产物存在 `artifacts.content` BLOB 列；`avc job export` 把 BLOB 拷到本地 FS 便于分享。
 
 **边界**：复用 persona 资产；视频生成过程不污染 persona 模型。
 
