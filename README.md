@@ -34,7 +34,6 @@ avc persona new yu --from ./yu.toml            # 建 persona v1
 avc render video --persona yu --topic "InnoDB Buffer Pool"   # 出片
 ```
 
-进入 REPL：`avc repl`
 
 ---
 

@@ -153,7 +153,6 @@ avc backup --out backup.db
 avc restore --from backup.db
 avc export --persona yu --out yu.tar.zst
 avc import yu.tar.zst
-avc repl
 ```
 
 ---
@@ -181,27 +180,3 @@ error[E0501]: provider_unauthenticated
 ```
 
 ---
-
-## 9. REPL
-
-```bash
-avc repl
-```
-
-```
-avc> persona list
-  pm_01... (yu)        current=v3   versions=3
-
-avc> persona evolve yu --scope voice --add ./new.wav
-  tj_xxx  watching...
-  ✓ drift_eval passed (0.92)
-  ✓ published v3
-
-avc> render video --persona yu --topic "..."
-  job_xxx  watching...
-  ✓ succeeded  → use `avc job export job_xxx --out ./final.mp4`
-
-avc> exit
-```
-
-上下文：`$LAST` 引用上一条结果；上箭头历史；Tab 补全。

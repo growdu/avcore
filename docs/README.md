@@ -12,7 +12,7 @@ docs/
 ├── design.md                  设计
 ├── architecture.md            架构
 ├── storage.md                 单一 SQLite schema
-├── cli.md                     CLI / REPL
+├── cli.md                     CLI
 ├── modules/                   子模块
 │   ├── persona-modeling.md
 │   ├── persona-evolution.md

@@ -8,10 +8,8 @@
 
 ```mermaid
 flowchart TB
-    CLI["avc CLI / REPL"]
-    REPL["Rust crate"]
+    CLI["avc CLI"]
     CLI --> CORE
-    REPL --> CORE
     CORE["core (in-process tokio)"]
     CORE --> PS[persona-svc]
     CORE --> ES[evolution-svc]
@@ -60,7 +58,6 @@ flowchart LR
 | DB | SQLite (rusqlite, bundled) | 单文件，零运维 |
 | 日志 | tracing | 结构化 JSON，OTel 可选 |
 | CLI | clap (derive) | 自动生成文档 |
-| REPL | rustyline | 多行 + 历史 |
 
 > **不引入**：Postgres、Redis、Kafka、对象存储 SDK。
 
