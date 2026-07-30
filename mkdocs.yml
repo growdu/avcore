@@ -1,5 +1,5 @@
 site_name: AVCore
-site_description: 开源、纯后端的 AI 数字人核心框架（Rust 单二进制 CLI）
+site_description: 极简内核——AI 数字人角色模型生成、持续训练、出片
 site_author: AVCore Team
 
 repo_name: growdu/avcore
@@ -17,7 +17,6 @@ theme:
   language: zh
   features:
     - navigation.instant
-    - navigation.tracking
     - navigation.tabs
     - navigation.sections
     - navigation.indexes
@@ -28,24 +27,15 @@ theme:
     - content.code.copy
     - content.code.annotate
     - content.tabs.link
-    - content.action.edit
   palette:
     - media: "(prefers-color-scheme: light)"
       scheme: default
       primary: indigo
       accent: indigo
-      toggle:
-        icon: material/brightness-7
-        name: 切换到深色模式
     - media: "(prefers-color-scheme: dark)"
       scheme: slate
       primary: indigo
       accent: indigo
-      toggle:
-        icon: material/brightness-4
-        name: 切换到浅色模式
-  icon:
-    repo: fontawesome/brands/github
 
 markdown_extensions:
   - admonition
@@ -84,20 +74,14 @@ plugins:
 
 nav:
   - 首页: README.md
-  - 设计文档: design.md
-  - 架构文档: architecture.md
-  - 资产存储（重点）: storage.md
-  - CLI / REPL 用法: cli.md
-  - 子模块设计:
+  - 设计: design.md
+  - 架构: architecture.md
+  - 存储: storage.md
+  - CLI: cli.md
+  - 子模块:
       - 模块索引: modules/README.md
       - 人物角色模型生成: modules/persona-modeling.md
       - 人物角色模型完善演进: modules/persona-evolution.md
       - 视频生成: modules/video-generation.md
       - 工作流编排: modules/pipeline.md
-      - 知识能力（可选）: modules/knowledge-aspect.md
-  - Provider / API 参考: api/README.md
-
-extra:
-  social:
-    - icon: fontawesome/brands/github
-      link: https://github.com/growdu/avcore
+  - Provider: api/README.md

@@ -1,301 +1,120 @@
-# 模块设计：工作流编排（Pipeline）
+# 模块：工作流编排（Pipeline）
 
-> 把"训练 PersonaModel"与"用 PersonaModel 出视频"两条链路都拆成可编排、可重试、可观测的 DAG 节点。Pipeline 不只服务于渲染，也服务于**持续演进**。
-
----
-
-## 1. 目标
-
-- **可编排**：训练 / 脚本 / 音频 / 画面 / 合成按 DAG 描述
-- **可重试**：节点级失败重试 + 自动回退
-- **可恢复**：节点结果落盘到版本目录，断点续跑
-- **可观测**：每节点有 trace / log / metric
-- **可扩展**：新增节点零侵入
+> 训练与渲染共用一套 DAG 引擎。最少节点类型、最小调度复杂度。
 
 ---
 
-## 2. 两条主要 DAG
+## 节点类型
 
-### 2.1 视频渲染 DAG（`video.render.v1`）
+| 类型 | 用途 |
+|------|------|
+| `avatar` | 形象 create / finetune |
+| `voice` | 声音 clone / synth / finetune |
+| `llm` | LLM chat（脚本生成 / 人设抽取） |
+| `video` | i2v |
+| `embed` | 远端 embed API |
+| `compose` | FFmpeg 拼接 / 转码（**唯一本地工具**，非 ML 模型） |
+| `gate` | 人机协同门 |
+| `branch` | 条件分支 |
+
+每个节点结果落 `job_steps` 表：`(id, job_id, node_id, status, attempt, outputs_json, error_json, duration_ms)`。
+
+---
+
+## 两条 DAG（共用同一引擎）
+
+### 5.1 `persona.create`
 
 ```yaml
-id: video.render.v1
 nodes:
-  - id: script_gen
-    type: llm
-    config:
-      prompt_template: script_gen_v3
-      persona_descriptor: ${job.persona_version.persona_descriptor}
-      knowledge: ${job.persona_version.knowledge}
-      topic: ${job.topic}
-
-  - id: script_review
-    type: gate
-    when: ${options.require_human_review}
-
-  - id: tts
+  - id: avatar_create
+    type: avatar
+  - id: voice_clone
     type: voice
-    fanout: scene
-    config:
-      voice_id: ${job.persona_version.voice.voice_id}
-
-  - id: bgm_select
-    type: asset_search
-    config:
-      match_by: scene_emotion
-
-  - id: img_gen
-    type: avatar_image
-    fanout: scene
-    config:
-      avatar_dir: ${job.persona_version.avatar_dir}
-
-  - id: i2v
-    type: video
-    fanout: scene
-    depends_on: [tts, img_gen]
-    config:
-      provider: kling
-
-  - id: lipsync
-    type: lipsync
-    depends_on: i2v
-
-  - id: compose
-    type: composer
-    input_from: [i2v, bgm_select]
-
+  - id: persona_extract
+    type: llm
+  - id: anchor_extract
+    type: embed
+    input_from: [avatar_create, voice_clone, persona_extract]
   - id: finalize
-    type: encode
-    output_to: ${job.media_dir}
+    type: branch
+    input_from: anchor_extract
+    config:
+      on_ok: INSERT persona_versions status=ready
+      on_fail: ABORT (整事务回退)
 ```
 
-> 关键：`job.persona_version` 是固化目录指针，避免渲染过程 persona 演进造成不一致。
-
-### 2.2 人物模型演进 DAG（`persona.train.v1`）
+### 5.2 `persona.train`（vN → v(N+1)）
 
 ```yaml
-id: persona.train.v1
 nodes:
   - id: sample_filter
-    type: sample_filter
-    config:
-      base_version: ${job.base_version}
-      min_quality: 0.6
-      dedup_threshold: 0.92
-
-  - id: avatar_train
-    type: persona_train_avatar
+    type: llm                      # quality + dedup
+  - id: avatar_sft
+    type: avatar
     when: ${job.scope contains avatar}
-    config:
-      base_avatar_dir: ${job.base_version.dir}/avatar
-      epochs: ${job.config.epochs}
-
-  - id: voice_train
-    type: persona_train_voice
+    input_from: sample_filter
+  - id: voice_sft
+    type: voice
     when: ${job.scope contains voice}
-    config:
-      base_voice_dir: ${job.base_version.dir}/voice
-
+    input_from: sample_filter
   - id: persona_sft
-    type: persona_train_style
+    type: llm
     when: ${job.scope contains persona}
-
-  - id: knowledge_reindex
-    type: persona_train_knowledge
-    when: ${job.scope contains knowledge}
-
+    input_from: sample_filter
   - id: anchor_extract
-    type: identity_anchor
-    input_from: [avatar_train, voice_train, persona_sft]
-
+    type: embed
+    input_from: [avatar_sft, voice_sft, persona_sft]
   - id: drift_eval
-    type: consistency_eval
-    input_from: [avatar_train, voice_train, persona_sft, anchor_extract]
-    config:
-      threshold: ${job.config.consistency_threshold}
-
-  - id: publish_or_rollback
+    type: gate                    # 实际是 branch，对比阈值
+  - id: publish
     type: branch
-    config:
-      on_pass: publish_new_version(${job.target_version})
-      on_fail: emit_drift_report + clear(${job.target_version}_dir)
+    on_pass: status=ready
+    on_fail: DELETE 整行事务回退 + drift_report
 ```
 
-> 训练跑完，产出 `personas/pm_xxx/v(N+1)/` 完整目录；不达标时整目录直接清掉（除非 `keep_partials=true`）。
+### 5.3 `video.render`
+
+```yaml
+nodes:
+  - script_gen   (llm)
+  - tts          (voice, fanout per scene)
+  - img_gen      (avatar, fanout per scene)
+  - i2v          (video, fanout per scene, depends_on=[tts, img_gen])
+  - compose      (compose, depends_on i2v)
+  - encode       (compose)
+  - write_meta   (写到 artifacts.meta)
+```
 
 ---
 
-## 3. 节点类型
-
-| 类型 | 描述 | 用于 |
-|------|------|------|
-| `llm` | LLM 调用（chat / SFT） | 脚本生成 |
-| `voice` | TTS 合成 | 渲染 |
-| `avatar_image` | 关键帧生成 | 渲染 |
-| `video` | 图生视频 | 渲染 |
-| `lipsync` | 口型同步 | 渲染 |
-| `asset_search` | 资产检索 | 渲染 |
-| `composer` | 后期合成 | 渲染 |
-| `encode` | 转封装 | 渲染 |
-| `gate` | 人机协同 | 渲染（可选） |
-| `branch` | 条件分支 | 通 |
-| `http` | 通用 HTTP | 通 |
-| `sample_filter` | 样本筛选 | 训练 |
-| `persona_train_avatar` | 视觉微调 | 训练 |
-| `persona_train_voice` | 声音微调 | 训练 |
-| `persona_train_style` | 人设 SFT | 训练 |
-| `persona_train_knowledge` | 知识索引重建 | 训练 |
-| `identity_anchor` | 锚点抽取 | 训练 |
-| `consistency_eval` | 漂移评估 | 训练 |
-| `publish_or_rollback` | 发布决策 | 训练 |
-
----
-
-## 4. 节点执行器
+## 调度器（最小实现）
 
 ```rust
-#[async_trait]
-trait NodeExecutor: Send + Sync {
-    fn kind(&self) -> &'static str;
-    async fn execute(&self, ctx: &NodeContext) -> Result<NodeResult>;
-    async fn resume(&self, ctx: &NodeContext, cached: &NodeResult) -> Result<NodeResult>;
-}
+loop {
+    let ready: Vec<Node> = dag
+        .nodes.iter()
+        .filter(|n| deps_done(n) && n.status == Pending)
+        .collect();
 
-struct NodeContext {
-    job_id: String,
-    node_id: String,
-    inputs: Value,
-    config: Value,
-    cancel: CancellationToken,
-}
+    for n in ready {
+        // 提交到 worker pool
+        tokio::spawn(execute(n, ctx));
+    }
 
-struct NodeResult {
-    outputs: Value,
-    artifacts: Vec<ArtifactRef>,     // 文件路径（相对 PersonaVersion.dir 或 media dir）
-    metrics: Value,
-    next_hint: Option<Vec<String>>,
+    // 落库节点状态
+    if let Some(ev) = event_rx.recv().await { persist(ev); }
 }
 ```
 
----
-
-## 5. 状态持久化
-
-每个 Job 落 SQLite `job_steps` 表：
-
-```sql
-CREATE TABLE job_steps (
-    id           TEXT PRIMARY KEY,
-    job_id       TEXT NOT NULL,
-    node_id      TEXT NOT NULL,
-    status       TEXT NOT NULL,    -- pending/running/succeeded/failed/skipped
-    attempt      INT DEFAULT 1,
-    inputs_json  TEXT,
-    outputs_json TEXT,
-    artifacts_json TEXT,
-    error_json   TEXT,
-    started_at   TEXT,
-    finished_at  TEXT,
-    duration_ms  INT,
-    trace_id     TEXT
-);
-```
-
-> 渲染的中间产物按惯例写到 `~/.local/share/avc/cache/jobs/{job_id}/`；最终成功才落到 `media/jobs/{job_id}/`。  
-> 训练中间产物直接写到**新版本目录**（`personas/pm_xxx/v(N+1)/...`）；不达标清掉整个目录。
+- 节点结果**先写 SQLite，再标记 ready**——保证崩溃可续
+- 重试：节点级 3 次指数退避
+- 单 PersonaModel **不并发训练**（防版本冲突）
 
 ---
 
-## 6. 重试与容错
+## 关键指标
 
-### 6.1 重试
-- 默认 3 次，指数退避 1s / 4s / 16s
-- 节点级可覆盖（如 i2v 限速可设 5 次）
-- 超过阈值标 `failed`，等待用户 `retry` 或自动回退（训练 DAG）
-
-### 6.2 降级
-- 主 Provider 失败 → 切备选（注册到 `Model Gateway`）
-- 例：`kling` 失败 → `cogvideox`
-
-### 6.3 续跑
-- 进程重启扫描 `job_steps`，把 `running → pending`，复用 `succeeded` 节点的 outputs
-- 渲染 DAG 中 `succeeded` 的中间产物已在 `cache/` 目录，路径写在 `artifacts_json`
-
----
-
-## 7. 调度器
-
-### 7.1 流程
-```
-enqueue
-  ▼
-ready 节点（依赖满足）
-  ▼
-提交 worker pool（按 kind 路由）
-  ▼
-完成 → 推进 / 失败重试 / 完成
-```
-
-### 7.2 策略
-- 内存优先；Phase 1 引入 Redis/Kafka 队列（如需多机）
-- 训练任务独占（同 persona 不并发）
-- 多 persona 并行；按用户公平
-
-### 7.3 资源池（Phase 1 引入）
-
-> AVCore 不持有本地计算资源（CPU/GPU 都不参与推理）。"资源池"指**对 Provider 的连接 / 限速管理**，而非本地 GPU 池。
-
-| 节点 | 对端资源 |
-|------|----------|
-| `llm`, `persona_train_style` | LLM API（OpenAI / Anthropic / DeepSeek / 豆包） |
-| `voice`, `persona_train_voice` | TTS / Voice Clone API（ElevenLabs / Azure / 豆包） |
-| `avatar_image`, `persona_train_avatar` | Avatar API（Kling / HeyGen / Doubao） |
-| `video` | i2v API（Kling / Seedance / 即梦 / Replicate） |
-| `lipsync` | Lipsync API（端到端由 i2v 提供商覆盖，无需独立节点） |
-| `consistency_eval`, `identity_anchor` | Embedding API（OpenAI / volcengine / cohere），用于特征对比 |
-| `compose`, `encode` | ffmpeg（**仅本机**运行的转码 / 拼接；不涉及 ML 模型） |
-
-注：`compose / encode` 是仅有的**本地**"模型"——FFmpeg 是工具，不算 ML 模型。  
-Phase 0 在主进程内用 tokio task 跑就够了；Phase 1 引入 Provider 限速路由表。
-
----
-
-## 8. 可观测性
-
-每个节点自动注入：
-- **结构化日志**：`tracing` JSON，字段含 `trace_id` / `tenant_id` / `persona_model_id` / `job_id`
-- **可选 OTel**：通过 `tracing-opentelemetry` 导出（不默认开）
-- **事件流**：`node.succeeded` / `node.failed` 写 SQLite 事件表，外部 collect
-
-> 不做 dashboard。日志由用户导到自己的 Loki / ES。
-
----
-
-## 9. 引擎实现
-
-### 9.1 起步（自研）
-- DAG：JSON / YAML 解析为内部 IR
-- 调度：tokio task + in-memory state
-- 估算：单用户千级并发内可行
-
-### 9.2 演进（可选）
-- 当并发 > 1 万或需要跨进程时，引 Temporal / 自研 Redis 队列
-- 替换只动调度层，DAG 描述不变
-
----
-
-## 10. 关键指标
-
-- 调度延迟：节点 ready → 提交 worker ≤ 500 ms（P95）
+- 调度延迟：节点 ready → worker ≤ 500ms (P95)
 - 节点成功率 ≥ 98%
 - 端到端成功率 ≥ 95%
-- 训练 DAG：单维度 P95 ≤ 30 min
-- 渲染 DAG：60s 成片 P95 ≤ 8 min
-
----
-
-## 11. 上下游
-
-- **被调用方**：[persona-modeling.md](./persona-modeling.md)、[persona-evolution.md](./persona-evolution.md)、[video-generation.md](./video-generation.md)
-- **基础设施**：SQLite、文件缓存、Provider HTTP 客户端
