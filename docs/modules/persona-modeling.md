@@ -93,7 +93,25 @@ grounding_mode = "loose"
 
 ---
 
-## 错误与边界
+## 命令
+
+### 原子（精细版）
+
+```bash
+avc persona create yu --archetype db_kernel_expert
+avc persona attach-avatar yu --version 1 --ref ./ref_*.png --style 写实
+avc persona attach-voice  yu --version 1 --ref ./sample.wav --lang zh
+avc persona attach-persona yu --version 1     --traits 严谨,务实 --catchphrase "我们直接看源码"
+avc persona commit yu --version 1                  # → status=ready
+```
+
+### 集成（典型 80% 路径）
+
+```bash
+avc persona onboard yu --from ./yu.toml           # 一次跑完 create + attach-* + commit
+```
+
+### 错误与边界
 
 | 场景 | 处理 |
 |------|------|

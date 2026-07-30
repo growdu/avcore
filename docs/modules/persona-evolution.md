@@ -86,13 +86,22 @@ async fn drift_eval(parent_anchor: &Anchor, new_anchor: &Anchor, cfg: &Cfg) -> D
 
 ---
 
-## CLI
+## 命令
+
+### 原子
 
 ```bash
-avc persona sample add yu --kind audio --uri ./new.wav --text "..." --consent ./auth.pdf
-avc persona evolve yu --scope voice --base-version 2 --threshold 0.85
-avc task show tj_xxx --watch
+avc sample add yu --kind audio --uri ./new.wav --text "..." --consent ./auth.pdf
+avc training list --persona yu
+avc training show tj_xxx
 avc training report tj_xxx --json
+```
+
+### 集成
+
+```bash
+avc persona evolve yu --scope voice --base-version 2 --threshold 0.85                        --with-feedback          # 自动把最近 feedback 样本纳入训练
+# 内部 = sample add (×N) + training start + drift_eval + promote-or-rollback
 ```
 
 ---

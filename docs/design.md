@@ -187,7 +187,18 @@ stateDiagram-v2
 
 ---
 
-## 7. 后续阅读
+## 7. CLI 设计原则（速读）
+
+CLI 分为 **原子** 与 **集成** 两类命令（详见 [`cli.md`](./cli.md)）：
+
+- **原子**：`<noun> <verb>`，单一资源单一操作；可被 shell 任意组合
+- **集成**：封装典型工作流（如 `persona onboard`、`persona evolve`、`render run`），内部走原子
+
+每个集成命令都接受 `--dry-run` 展开为原子清单——集成 = **原子 + 顺序 + 默认值**，可观察、可回放。
+
+---
+
+## 8. 后续阅读
 
 - [architecture.md](./architecture.md) · 技术栈、子模块依赖
 - [storage.md](./storage.md) · 完整 schema

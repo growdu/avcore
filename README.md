@@ -27,13 +27,14 @@ AVCore 是个开源的 Rust 单二进制 CLI：
 ## 安装 / 起步
 
 ```bash
-cargo install avc                              # 计划中
-avc init                                       # 初始化 avc.db + avc.toml
+cargo install avc                                                # 计划中
+avc init                                                         # 建 ~/.local/share/avc
 avc config set provider.llm.openai.api_key "sk-..."
-avc persona new yu --from ./yu.toml            # 建 persona v1
-avc render video --persona yu --topic "InnoDB Buffer Pool"   # 出片
+avc persona onboard yu --from ./yu.toml                          # [集成] 创建 + 上传资产
+avc render run --persona yu --version 1 --topic "InnoDB Buffer Pool"  # [集成] 出片
 ```
 
+> `avc` 提供两类命令：**原子**（`persona create` / `commit` / `render script` 等）和 **集成**（`persona onboard` / `persona evolve` / `render run`）。复杂工作流可用 shell 把原子串起来，详见 [`docs/cli.md`](docs/cli.md)。
 
 ---
 

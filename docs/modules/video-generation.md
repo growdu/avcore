@@ -67,16 +67,30 @@ INSERT INTO jobs(persona_model_id, persona_version, ...) VALUES (?, N, ...);
 
 ---
 
-## CLI
+## 命令
+
+### 原子
 
 ```bash
-avc render video --persona yu --version 2 --topic "InnoDB Buffer Pool" \
-                 --duration 60 --resolution 1080p
+avc render script  --persona yu --version 2 --topic "..." --out script.json
+avc render script edit script.json --patch '{"op":"replace","path":"/scenes/0/duration_ms","value":9000}'
+jid=$(avc render video --from-script script.json --quiet)
 
+avc job list --persona yu
 avc job show job_xxx --watch
-avc job inspect job_xxx
-avc job export job_xxx --out ./final.mp4
-avc job export job_xxx --all --out ./export/
+avc job wait job_xxx --until succeeded
+avc job export job_xxx --kind final_video --out ./final.mp4
+```
+
+### 集成
+
+```bash
+avc render run --persona yu --version 2 --topic "InnoDB Buffer Pool" \
+               --duration 60 --resolution 1080p
+# 内部 = render script + render video
+
+avc render pack --persona yu --topics-file ./daily_topics.txt
+# 对每行 topic 跑一次 render run
 ```
 
 ---
