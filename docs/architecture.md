@@ -8,8 +8,8 @@
 
 ### 1.1 一句话总结
 
-AVCore = **API 网关 + 业务服务 + AI Provider 适配层 + 工作流引擎 + 任务调度 + 资产存储**，
-由一条 **DAG Pipeline** 串起"造角 → 养成 → 拍戏"全流程。
+AVCore = **API 网关 + 业务服务（persona / training / script / render / notify / asset）+ AI Provider 适配层 + 统一 DAG 工作流引擎 + 任务调度 + 资产存储**，
+由一条 **DAG Pipeline** 同时支撑"模型生成 / 模型持续训练 / 视频渲染"三条链路。
 
 ### 1.2 逻辑视图
 
@@ -19,405 +19,247 @@ AVCore = **API 网关 + 业务服务 + AI Provider 适配层 + 工作流引擎 +
                         │  REST / gRPC / WebSocket / Webhook  │
                         └──────────────────┬───────────────────┘
                                            │
-        ┌─────────────┬────────────┬───────┴───────┬──────────────┐
-        ▼             ▼            ▼               ▼              ▼
-   ┌─────────┐  ┌──────────┐ ┌──────────┐  ┌──────────┐  ┌──────────────┐
-   │Character│  │ Knowledge│ │ Script   │  │ Pipeline │  │   Asset      │
-   │ Service │  │ Service  │ │ Service  │  │ Service  │  │   Service    │
-   └────┬────┘  └────┬─────┘ └────┬─────┘  └────┬─────┘  └──────┬───────┘
-        │            │            │             │               │
-        └────────────┴────────────┴──────┬──────┴───────────────┘
-                                        │
-                              ┌─────────▼─────────┐
-                              │   AI Provider 层  │  ←  抽象所有模型
-                              │ Avatar/Voice/LLM  │
-                              │    /Video/RAG     │
-                              └─────────┬─────────┘
-                                        │
-        ┌───────────────────────────────┼────────────────────────────────┐
-        │                               │                                │
-   ┌────▼─────┐  ┌───────────────┐ ┌────▼──────┐  ┌───────────────┐ ┌────▼────┐
-   │ Object   │  │ Vector DB     │ │  Task     │  │  Model        │ │ Cache/  │
-   │ Storage  │  │ (Milvus/      │ │  Queue    │  │  Gateway      │ │ Redis   │
-   │ (S3/OSS) │  │  pgvector)    │ │(Redis/Kafka)│ (内部 LLM 路由)│ │         │
-   └──────────┘  └───────────────┘ └───────────┘  └───────────────┘ └─────────┘
+        ┌─────────────┬────────────┬───────┴───────┬──────────────┬───────────┐
+        ▼             ▼            ▼               ▼              ▼           ▼
+   ┌─────────┐  ┌─────────────┐ ┌──────────┐ ┌──────────┐  ┌──────────┐ ┌──────────────┐
+   │ Persona │  │  Evolution  │ │ Script   │ │ Pipeline │  │   Asset  │ │   Notify     │
+   │ Service │  │   Service   │ │ Service  │ │ Service  │  │ Service  │ │   Service    │
+   │(v1 init)│  │(再训练)    │ │(分镜)   │ │(统一 DAG)│  │          │ │ (Webhook)    │
+   └────┬────┘  └────┬────────┘ └────┬─────┘ └────┬─────┘  └────┬─────┘ └──────┬───────┘
+        │            │               │             │             │              │
+        └────────────┴───────────────┴──────┬──────┴─────────────┴──────────────┘
+                                            │
+                                ┌───────────▼────────────┐
+                                │   AI Provider 层       │ ← 抽象所有模型
+                                │ Avatar/Voice/LLM       │
+                                │ /Video/RAG/Knowledge   │
+                                └────────────┬───────────┘
+                                             │
+        ┌────────────────────────┬───────────┼─────────────────────────┬──────────────────┐
+        │                        │           │                         │                  │
+   ┌────▼─────┐  ┌────────────────▼─┐ ┌───────▼────────┐  ┌──────────────┐  ┌──────▼──────┐
+   │ Object   │  │ Vector DB         │ │  Task          │ │ Model        │ │ Cache/      │
+   │ Storage  │  │ (pgvector/Milvus) │ │  Queue         │ │ Gateway      │ │ Redis       │
+   │ (S3/OSS) │  │ + 样本库          │ │ (Redis/Kafka)  │ │(内部 LLM 路由)│ │             │
+   └──────────┘  └───────────────────┘ └────────────────┘ └──────────────┘  └─────────────┘
 ```
+
+服务职责：
+
+| 服务 | 职责 |
+|------|------|
+| `persona-svc` | 创建 `PersonaModel + v1`（形象/声音/人设/知识） |
+| `evolution-svc` | 训练任务管理、样本治理、版本发布、漂移评估、一致性兜底 |
+| `script-svc` | 根据 persona + topic 生成分镜；支持编辑 |
+| `pipeline-svc` | 统一 DAG 调度（视频渲染 + 训练都跑这层） |
+| `asset-svc` | 形象 / 声音 / BGM / 模板 等资产的统一管理 |
+| `notify-svc` | Webhook / WebSocket 触达 |
 
 ### 1.3 物理部署视图
 
 ```
-                ┌────────────── 控制面 Control Plane ──────────────┐
-                │  API Gateway, Console/Admin, Auth, Metering     │
-                └───────────────────────┬──────────────────────────┘
-                                        │
-                ┌───────────────────────▼──────────────────────────┐
-                │             业务服务（Stateless）                │
-                │   character-svc, knowledge-svc, script-svc,     │
-                │   pipeline-svc, asset-svc                       │
-                └───────────────────────┬──────────────────────────┘
-                                        │
-        ┌───────────────────────────────┼────────────────────────────────┐
-        │                  任务执行面 Worker Plane                        │
-        │   ┌────────────┐ ┌────────────┐ ┌────────────┐ ┌────────────┐  │
-        │   │ TTS Worker │ │ Avatar/    │ │ Video      │ │  RAG /     │  │
-        │   │            │ │ Image Wrk  │ │ Worker     │ │  Embed Wrk  │  │
-        │   └────────────┘ └────────────┘ └────────────┘ └────────────┘  │
-        └─────────────────────────────────────────────────────────────────┘
-                                        │
-        ┌───────────────────────────────▼────────────────────────────────┐
-        │                数据面 Data Plane                                │
-        │  Postgres / Vector DB / Object Storage / Message Queue          │
-        └─────────────────────────────────────────────────────────────────┘
+              ┌──────────────── Control Plane ────────────────┐
+              │  API Gateway, Console/Admin, Auth, Metering  │
+              └───────────────────────┬──────────────────────┘
+                                      │
+              ┌───────────────────────▼──────────────────────────┐
+              │           业务服务（Stateless）                   │
+              │   persona-svc, evolution-svc, script-svc,        │
+              │   pipeline-svc, asset-svc, notify-svc           │
+              └───────────────────────┬──────────────────────────┘
+                                      │
+   ┌──────────────────────────────────┼──────────────────────────────────────┐
+   │                       Worker Plane（按 DAG 节点类型分池）                │
+   │   ┌───────────┐ ┌───────────┐ ┌────────────┐ ┌────────────┐ ┌───────┐  │
+   │   │ llm-pool  │ │ tts-pool  │ │ img-pool   │ │video-pool  │ │train- │  │
+   │   │ (CPU/GPU) │ │ (GPU)     │ │ (GPU)      │ │ (GPU)      │ │pool   │  │
+   │   │           │ │           │ │            │ │            │ │(GPU)  │  │
+   │   └───────────┘ └───────────┘ └────────────┘ └────────────┘ └───────┘  │
+   │   ┌───────────┐ ┌───────────┐ ┌────────────┐ ┌────────────┐             │
+   │   │ rag-pool  │ │ lipsync   │ │ compose    │ │ eval-pool  │             │
+   │   │ (CPU)     │ │ (GPU)     │ │ (CPU)      │ │ (GPU)      │             │
+   │   └───────────┘ └───────────┘ └────────────┘ └────────────┘             │
+   └─────────────────────────────────────────────────────────────────────────┘
+                                      │
+        ┌─────────────────────────────┼─────────────────────────────┐
+        │                             │                             │
+   ┌────▼─────┐  ┌───────────────┐ ┌───▼────────────┐  ┌──────────▼────────┐
+   │ Postgres │  │ Vector DB     │ │ Object Storage │  │ Redis / Kafka    │
+   │ 元数据/步骤│  │ (语料/记忆)   │ │ (资产/产物)    │  │ (队列/缓存/锁)    │
+   └──────────┘  └───────────────┘ └────────────────┘  └───────────────────┘
 ```
 
 ---
 
 ## 2. 技术选型
 
-| 层 | 选型 | 理由 |
-|----|------|------|
-| API 网关 | Kong / APISIX / 自研 Nginx+Lua | 限流、鉴权、租户路由 |
-| 业务服务 | **Python（FastAPI）** + 关键路径 Go/Rust | AI 生态丰富；性能瓶颈用 Go/Rust 单点优化 |
-| 异步任务 | **Celery + Redis**（小规模）/ **Temporal / Argo**（大规模） | 渐进式升级 |
-| 消息队列 | Redis Streams → Kafka | 后期吞吐扩展 |
-| 数据库 | PostgreSQL（元数据）+ pgvector（小规模向量）/ Milvus / Qdrant（大规模） | 一库多用起步 |
-| 对象存储 | S3 兼容（MinIO / 阿里 OSS / AWS S3） | 存形象 / 声音 / 视频 / 临时帧 |
-| 缓存 | Redis | 会话 / 限流 / 任务状态 |
-| 工作流 | **自研轻量 DAG**（前期）+ Temporal（后期） | 控制粒度 |
-| 监控 | Prometheus + Grafana + Loki + OpenTelemetry | 可观测 |
-| 部署 | Docker / Kubernetes + Helm | 标准 |
-| CI | GitHub Actions / GitLab CI | 标准 |
-| 鉴权 | OAuth2 / OIDC + API Key | 标准化 |
+| 维度 | 选型 | 理由 |
+|------|------|------|
+| 主语言 | Python（业务）+ Rust/Go（热路径） | AI 生态最丰富 |
+| Web 框架 | FastAPI | 异步、生态、自动 OpenAPI |
+| 任务队列 | Celery / Dramatiq → 可演进 Temporal | 起步轻、后期可换 |
+| 元数据库 | PostgreSQL | JSONB 支持好、单库起步后期再分 |
+| 向量检索 | pgvector → Milvus（>1 亿迁移） | 渐进式复杂度 |
+| 资产存储 | S3 / OSS | 标准 |
+| 训练框架 | Transformers / PEFT / LoRA + 自研编排 | SFT 与偏好对齐走业界方案 |
+| 模型路由 | 自研 Model Gateway，OpenAI-compatible | 让集成方零修改接入 |
+| GPU 调度 | K8s + Volcano / 简单标签选择 | 多租户公平 |
 
 ---
 
-## 3. 服务拆分
+## 3. 数据模型（精简版）
 
-> 建议采用 **模块化单体起步 → 按瓶颈拆微服务** 的演进路径。
+### 3.1 主表
+```
+persona_models(id, name, archetype, current_version_id, status, ...)
+persona_versions(id, persona_model_id, version, parent_version_id,
+                 avatar_id, voice_id, persona_id, knowledge_id,
+                 identity_anchor_id, metrics_id, status, ...)
+avatars(id, provider, primary_image, face_id, lora_uri, ...)
+voices(id, provider, voice_id, sample_uri, language, ...)
+personas(id, traits, tone, catchphrases, taboos, scenario_prompts, ...)
+knowledge_bindings(id, persona_version_id, corpus_ids, domain, grounding_mode, ...)
+identity_anchors(id, face_emb, voice_emb, style_emb, ...)
+persona_samples(id, persona_model_id, kind, uri/text, version_id_at_collection, ...)
+training_jobs(id, persona_model_id, base_version_id, target_version, scope[],
+              config, status, result_version_id, metrics, ...)
+scripts(id, persona_model_id, persona_version_id, topic, scenes[], ...)
+jobs(id, script_id, persona_version_id, status, options, artifacts, ...)
+job_steps(id, job_id, node_id, status, attempt, outputs, artifacts, error, ...)
+```
 
-| 服务 | 职责 | 关键接口 |
-|------|------|----------|
-| **character-svc** | 角色 CRUD、形象 / 声音绑定、版本化 | `/characters`, `/characters/{id}` |
-| **asset-svc** | 形象 / 声音 / BGM / 模板的元数据与引用 | `/assets`, `/assets/upload` |
-| **knowledge-svc** | 语料管理、切分、向量化、检索 | `/corpora`, `/corpora/{id}/search` |
-| **expert-svc** | 专家设定、绑定到角色、风格管理 | `/experts`, `/characters/{id}/expert` |
-| **script-svc** | 脚本模板、LLM 生成分镜、脚本编辑 | `/scripts`, `/scripts/{id}/render` |
-| **pipeline-svc** | 编排 DAG、任务编排与重试 | `/jobs`, `/jobs/{id}` |
-| **render-svc** | 视频渲染后期合成（ffmpeg、字幕、转场） | 内网 gRPC |
-| **meter-svc** | 计费、配额、审计 | 内网 |
-| **notify-svc** | Webhook / WebSocket 进度推送 | `/webhooks`, `/ws` |
-| **admin-svc** | 租户、Provider 配置、模型路由 | `/admin/*` |
+### 3.2 不可变性约束
+- `persona_versions` 中所有资产都是**不可变快照**：一旦写入，永不更新
+- 老资产可"标 deprecated" 不可删
+- 所有跨版本数据都用 `parent_version_id` 关联，构成多版本树
 
 ---
 
-## 4. 核心数据模型
+## 4. 模块边界再确认
 
-### 4.1 元数据表（PostgreSQL）
+| 模块 | 谁负责 | 不负责 |
+|------|--------|--------|
+| [persona-modeling](./modules/persona-modeling.md) | v1 创建 | v1 之后的事 |
+| [persona-evolution](./modules/persona-evolution.md) | 训练 / 版本 / 一致性兜底 | v1 创建、脚本、渲染 |
+| [video-generation](./modules/video-generation.md) | 用 PersonaModelVersion 出片 | 训练剧本、模型微调 |
+| [pipeline](./modules/pipeline.md) | 节点编排 / 调度 / 重试 | 具体模型调用 |
+| [knowledge-aspect](./modules/knowledge-aspect.md) | 语料 / 检索 | 形象 / 声音 / 人设 / 训练 |
 
-```sql
--- 角色
-CREATE TABLE characters (
-    id              UUID PRIMARY KEY,
-    tenant_id       UUID NOT NULL,
-    name            TEXT NOT NULL,
-    persona_id      UUID,
-    avatar_id       UUID,
-    voice_id        UUID,
-    expert_id       UUID,
-    status          TEXT NOT NULL,    -- draft/ready/failed
-    version         INT NOT NULL DEFAULT 1,
-    meta            JSONB,
-    created_at      TIMESTAMPTZ,
-    updated_at      TIMESTAMPTZ
-);
+---
 
--- 资产
-CREATE TABLE assets (
-    id              UUID PRIMARY KEY,
-    tenant_id       UUID NOT NULL,
-    type            TEXT NOT NULL,    -- avatar / voice / bgm / template / image
-    provider        TEXT NOT NULL,    -- sdxl / kling / cosyvoice ...
-    uri             TEXT NOT NULL,    -- 对象存储地址
-    ref_id          TEXT,             -- 厂商侧 ID
-    meta            JSONB,
-    created_at      TIMESTAMPTZ
-);
+## 5. 端到端调用链
 
--- 知识语料
-CREATE TABLE corpora (
-    id              UUID PRIMARY KEY,
-    tenant_id       UUID NOT NULL,
-    name            TEXT NOT NULL,
-    source          TEXT,             -- url/upload/api
-    chunk_count     INT,
-    index_version   INT,
-    created_at      TIMESTAMPTZ
-);
-
-CREATE TABLE corpus_chunks (
-    id              UUID PRIMARY KEY,
-    corpus_id       UUID REFERENCES corpora(id),
-    content         TEXT,
-    embedding       VECTOR(1536),     -- pgvector
-    meta            JSONB
-);
-
--- 脚本
-CREATE TABLE scripts (
-    id              UUID PRIMARY KEY,
-    tenant_id       UUID NOT NULL,
-    character_id    UUID,
-    template_id     UUID,
-    topic           TEXT,
-    scenes          JSONB,            -- Scene[]
-    duration_ms     INT,
-    created_at      TIMESTAMPTZ
-);
-
--- 任务
-CREATE TABLE jobs (
-    id              UUID PRIMARY KEY,
-    tenant_id       UUID NOT NULL,
-    script_id       UUID,
-    character_id    UUID,
-    status          TEXT NOT NULL,    -- queued/running/succeeded/failed
-    progress        INT DEFAULT 0,
-    artifacts       JSONB,            -- 视频 URL / 封面 / 字幕
-    error           JSONB,
-    cost_points     INT,
-    created_at      TIMESTAMPTZ,
-    finished_at     TIMESTAMPTZ
-);
-
--- 任务步骤（用于断点续跑 / 调试）
-CREATE TABLE job_steps (
-    id              UUID PRIMARY KEY,
-    job_id          UUID REFERENCES jobs(id),
-    name            TEXT,
-    status          TEXT,
-    input           JSONB,
-    output          JSONB,
-    started_at      TIMESTAMPTZ,
-    finished_at     TIMESTAMPTZ,
-    attempt         INT DEFAULT 1
-);
+### 5.1 视频生成
+```
+Client  →  API Gateway  →  script-svc  (build script)
+                          →  pipeline-svc (submit run)
+                              →  worker pools: llm / tts / img / video / compose
+                          →  notify-svc (webhook / ws)
+Client  ←  artifacts
 ```
 
-### 4.2 资产存储布局
-
+### 5.2 持续训练
 ```
-oss://{tenant_id}/
-├── characters/{character_id}/
-│   ├── avatar/{version}/
-│   │   ├── portrait.png
-│   │   ├── lora.safetensors
-│   │   └── meta.json
-│   ├── voice/{version}/
-│   │   ├── sample.wav
-│   │   ├── ref.pt
-│   │   └── meta.json
-│   └── jobs/{job_id}/
-│       ├── scenes/{idx}.mp4
-│       ├── audio/{idx}.wav
-│       └── final.mp4
-└── shared/
-    ├── bgm/{id}.mp3
-    └── templates/{id}.json
+Client  →  evolution-svc (submit training_job)
+                          →  pipeline-svc (persona.train.v1 DAG)
+                              →  worker pools: train / eval
+                          →  publish v(N+1) or rollback
+Client  ←  training_report
 ```
 
 ---
 
-## 5. AI Provider 适配层
+## 6. 多租户与版本配额
 
-### 5.1 抽象接口
+- 每个 `PersonaModel` 属于一个 tenant
+- tenant 可配置：同时训练任务数、最大月度训练时长、最大版本数
+- `train-pool` 按 tenant 配额调度（fair-share）
+
+---
+
+## 7. Provider 抽象
+
+每个能力点（形象 / 声音 / LLM / 视频 / 知识）以 `Provider` 协议暴露，新增模型只需实现：
 
 ```python
-# providers/base.py
-from typing import Protocol, runtime_checkable
-
-@runtime_checkable
-class AvatarProvider(Protocol):
-    name: str
-    def create_avatar(self, spec: "AvatarSpec") -> "Avatar": ...
-    def render_image(self, avatar: "Avatar", prompt: str, **kw) -> "Media": ...
-    def render_video(self, avatar: "Avatar", audio: "Audio", motion: "Motion") -> "Clip": ...
-
-@runtime_checkable
-class VoiceProvider(Protocol):
-    name: str
-    def clone_voice(self, samples: list["Audio"], name: str) -> "Voice": ...
-    def synthesize(self, voice: "Voice", text: str, ssml: "SSML"=None) -> "Audio": ...
-
-@runtime_checkable
-class LLMProvider(Protocol):
-    name: str
-    def chat(self, messages: list, tools: list = None, **kw) -> "LLMResponse": ...
-    def embed(self, texts: list[str]) -> list[list[float]]: ...
-
-@runtime_checkable
-class VideoProvider(Protocol):
-    name: str
-    def render(self, scene: "Scene", avatar: "Avatar", audio: "Audio") -> "Clip": ...
+class PersonaTrainAvatarProvider(Protocol):
+    def finetune(self, base_avatar: Avatar, samples: list[Sample], config: dict) -> Avatar: ...
+    def eval_consistency(self, base: Avatar, candidate: Avatar, anchors: list[Sample]) -> float: ...
 ```
 
-### 5.2 Provider 路由
-
-通过 **Model Gateway** 统一对外：
-
-- 路由策略：按租户配置 / 成本 / 延迟 / 质量分
-- 降级：A 厂商失败 → 自动切 B 厂商
-- 限速：每租户每 Provider 配额
-- 缓存：相同输入可命中语义缓存
-
-### 5.3 Provider 实现清单（示例）
-
-| 类型 | Provider | 用途 |
-|------|----------|------|
-| Avatar | SDXL + IP-Adapter / Flux | 文生图 + 形象一致性 |
-| Avatar | HunyuanDiT / Qwen-Image | 中文场景形象 |
-| Avatar | Kling Avatar / HeyGen / D-ID | 商用数字人 |
-| Voice | CosyVoice / GPT-SoVITS / F5-TTS | 声音克隆 |
-| Voice | 火山 / 阿里 / 微软 TTS | 商用音色 |
-| LLM | GPT-4o / Claude / Qwen / DeepSeek | 脚本生成 / RAG |
-| Video | Kling / 可灵 / CogVideoX / AnimateDiff | 镜头渲染 |
-| Video | Sora / Veo / Hailuo | 高级模型 |
-| Compose | ffmpeg + OpenCV | 拼接 / 转场 / 字幕 |
+注册到 `Model Gateway` 即可被 pipeline 发现与路由。
 
 ---
 
-## 6. 工作流引擎（Pipeline）
+## 8. 数据流
 
-### 6.1 DAG 描述
-
-一次视频生成任务被建模为 DAG：
-
+### 8.1 视频渲染
 ```
-                  ┌──────────┐
-                  │  script  │
-                  └─────┬────┘
-                        │ Script
-        ┌───────────────┼───────────────┐
-        ▼               ▼               ▼
-  ┌─────────┐     ┌─────────┐     ┌──────────┐
-  │ tts     │     │ bgm_sel │     │ img_gen  │
-  └────┬────┘     └────┬────┘     └─────┬────┘
-       │ Audio[]       │ BGM            │ Image[]
-       └───────┬───────┴───────┬────────┘
-               ▼               ▼
-          ┌──────────┐   ┌──────────┐
-          │  i2v     │   │  i2v     │  …per scene
-          └─────┬────┘   └─────┬────┘
-                │ Clip[]       │
-                └──────┬───────┘
-                       ▼
-                 ┌──────────┐
-                 │ compose  │
-                 └─────┬────┘
-                       ▼
-                 ┌──────────┐
-                 │ finalize │  → final.mp4
-                 └──────────┘
+topic + persona_version ──▶ LLM (build script, RAG-augmented) ──▶ Script
+                                                       │
+                                                       ▼
+                                 TTS（voice.synthesize）───┐
+                                                       ▼
+                                 KeyFrame（avatar.render）─┐
+                                                       ▼
+                                 i2v（video.render）      │
+                                                       ▼
+                                 Lipsync (optional)       │
+                                                       ▼
+                                 Compose（bgm/sub/wmark）──▶ final.mp4
+                                                            (meta 含 persona_version_id)
 ```
 
-### 6.2 引擎能力
-
-- **DAG 解析**：JSON / YAML 描述
-- **节点执行**：统一 Executor 接口
-- **失败重试**：节点级 + 任务级
-- **断点续跑**：每个节点执行前后持久化中间结果
-- **并发控制**：可标注节点 fanout / 串行
-- **可观测**：每节点产生 span / log / metric
-- **人机协同**：脚本节点支持"人工编辑后再继续"
-
-### 6.3 节点清单
-
-| 节点 | 描述 | 耗时（P50） | 可并发 |
-|------|------|------------|--------|
-| `script_gen` | LLM 生成分镜 | 2s | 否 |
-| `tts` | 旁白合成 | 3s/段 | 是 |
-| `bgm_select` | BGM 匹配 | 0.5s | 是 |
-| `img_gen` | 关键帧生成 | 5s/段 | 是 |
-| `i2v` | 图生视频 | 30s/段 | 是 |
-| `lipsync` | 口型同步 | 8s/段 | 是 |
-| `compose` | 多镜头拼接 | 5s | 否 |
-| `subtitle` | 字幕烧录 | 2s | 否 |
-| `finalize` | 转封装 / 封面 | 1s | 否 |
-
----
-
-## 7. 任务调度与并发
-
-### 7.1 队列分层
-
+### 8.2 训练流水线
 ```
-inbound (HTTP) ─▶ control queue ─▶ per-tenant queue ─▶ worker pool
-                                          │
-                                          ▼
-                                  GPU scheduler
-                                  (per model pool)
+samples + base_version ──▶ Filter (quality, dedup) ──▶ Train (per scope)
+                                                       │
+                                                       ▼
+                                          Identity Anchor (extract)
+                                                       │
+                                                       ▼
+                                          Drift Eval (vs base) ──▶ branch
+                                                       │
+                                          ┌────────────┴────────────┐
+                                          ▼                         ▼
+                                   publish v(N+1)             rollback + drift_report
 ```
-
-### 7.2 GPU 调度
-
-- 内部维护 **GPU 池**：按模型类型分组（SDXL 池 / Kling 池 / TTS 池 / 视频池）
-- 调度器：FIFO + 优先级 + 抢占（可中断的低优任务）
-- 弹性：K8s + 自定义 CRD，按队列积压自动扩缩
-
-### 7.3 限流与配额
-
-- 租户级：QPS / 并发任务数 / 月配额
-- Provider 级：每厂商限速（防厂商配额超限）
-- 用户级：API Key 维度
-
----
-
-## 8. 数据架构
-
-```
-                ┌──────────────┐
-                │ PostgreSQL   │  元数据 / 业务数据
-                └──────┬───────┘
-                       │
-       ┌───────────────┼───────────────┐
-       ▼               ▼               ▼
-  ┌─────────┐    ┌──────────┐    ┌──────────┐
-  │ pgvector│    │ Milvus / │    │ Object   │
-  │  (RAG)  │    │ Qdrant   │    │ Storage  │
-  └─────────┘    └──────────┘    └──────────┘
-```
-
-- **PostgreSQL**：业务主库，租户、角色、脚本、任务、计费
-- **pgvector**：早期 RAG，与主库同库降低复杂度
-- **Milvus / Qdrant**：向量规模 > 1 亿时迁移
-- **对象存储**：所有大文件（图片、声音、视频、模型权重）
-- **Redis**：会话、限流、Leaderboard、任务状态缓存
 
 ---
 
 ## 9. API 形态
 
-详细 API 见 [`api/README.md`](./api/README.md)。概览：
+完整 API 见 [`api/README.md`](./api/README.md)。概览：
 
 ```http
-POST   /v1/characters              创建角色
-GET    /v1/characters/{id}         查询角色
-POST   /v1/characters/{id}/avatar  创建 / 更新形象
-POST   /v1/characters/{id}/voice   创建 / 更新声音
+# PersonaModel 顶层
+POST   /v1/persona-models                       创建 (异步)
+GET    /v1/persona-models/{id}                  查询
+GET    /v1/persona-models/{id}/versions         版本列表
+PUT    /v1/persona-models/{id}/current-version  切换默认版本
 
-POST   /v1/corpora                 创建语料
-POST   /v1/corpora/{id}/chunks     追加 chunks
-POST   /v1/corpora/{id}/search     检索
+# 训练
+POST   /v1/persona-models/{id}/samples
+POST   /v1/persona-models/{id}/training-jobs
+GET    /v1/training-jobs/{jid}/report
 
-POST   /v1/scripts                 生成脚本
-PUT    /v1/scripts/{id}            编辑脚本
+# 视觉 / 声音 / 人设 / 知识
+POST   /v1/persona-models/{id}/avatars
+POST   /v1/persona-models/{id}/voices
+POST   /v1/persona-models/{id}/persona
+POST   /v1/corpora
+POST   /v1/persona-models/{id}/knowledge
 
-POST   /v1/jobs                    创建视频生成任务
-GET    /v1/jobs/{id}               查询任务
-GET    /v1/jobs/{id}/steps         任务步骤
-POST   /v1/jobs/{id}/retry         重试
+# 脚本与视频
+POST   /v1/scripts
+PUT    /v1/scripts/{id}
+POST   /v1/jobs
+POST   /v1/jobs/{id}/feedback
 
-POST   /v1/webhooks                注册回调
-WS     /v1/ws/jobs                 实时进度
+# Webhook / WS
+POST   /v1/webhooks
+WS     /v1/ws/jobs
+WS     /v1/ws/training-jobs
 ```
 
 ---
@@ -432,6 +274,7 @@ WS     /v1/ws/jobs                 实时进度
 - **审核**：文本前置审核 + 输出审核（命中策略 → 拦截 / 打码）
 - **反滥用**：行为风控、人机验证
 - **凭据管理**：HashiCorp Vault / 云厂商 KMS
+- **真实人物复刻**：默认禁止；开启需走额外合规审核
 
 ---
 
@@ -439,50 +282,52 @@ WS     /v1/ws/jobs                 实时进度
 
 | 维度 | 工具 | 关键指标 |
 |------|------|----------|
-| Trace | OpenTelemetry → Tempo / Jaeger | 全链路 DAG span |
-| Metric | Prometheus | QPS / 延迟 / 错误率 / GPU 利用率 / 队列积压 |
+| Trace | OpenTelemetry → Tempo / Jaeger | 全链路 DAG span（按 node_id 切分） |
+| Metric | Prometheus | QPS / 延迟 / 错误率 / GPU 利用率 / 队列积压 / 漂移分 |
 | Log | Loki / ELK | 结构化 JSON 日志 |
-| Event | 业务事件流 | 任务状态变更、计费事件 |
-| 告警 | Alertmanager | GPU 利用率、SLO 违反、Provider 错误率 |
+| Event | 业务事件流 | 任务状态变更、训练发布、版本停用、漂移告警 |
+| 告警 | Alertmanager | GPU 利用率、SLO 违反、Provider 错误率、漂移超阈值 |
 
-每个 Job 自动注入 `trace_id` / `tenant_id` / `character_id`，便于横向排查。
+每个 Job 自动注入 `trace_id` / `tenant_id` / `persona_model_id` / `persona_version_id`。
 
 ---
 
 ## 12. 部署架构
 
 ### 12.1 K8s 拓扑
-
 ```
 Namespace: avcore
-├── api-gateway          (Deployment × 3, HPA)
-├── character-svc        (Deployment × 2)
-├── knowledge-svc        (Deployment × 2)
-├── script-svc           (Deployment × 2)
-├── pipeline-svc         (Deployment × 3, Leader Election)
-├── render-svc           (Deployment × 2)
-├── notify-svc           (Deployment × 2)
+├── api-gateway              (Deployment × 3, HPA)
+├── persona-svc              (Deployment × 2)
+├── evolution-svc            (Deployment × 2)
+├── script-svc               (Deployment × 2)
+├── pipeline-svc             (Deployment × 3, Leader Election)
+├── notify-svc               (Deployment × 2)
 ├── workers/
-│   ├── tts-pool         (Deployment, GPU)
-│   ├── img-pool         (Deployment, GPU)
-│   ├── video-pool       (Deployment, GPU)
-│   └── rag-pool         (Deployment, CPU)
-├── postgres             (StatefulSet 或托管)
-├── redis                (StatefulSet 或托管)
-├── minio                (StatefulSet 或对接 OSS)
-└── milvus               (Helm, 独立集群)
+│   ├── llm-pool
+│   ├── tts-pool             (GPU)
+│   ├── img-pool             (GPU)
+│   ├── video-pool           (GPU)
+│   ├── train-pool           (GPU)         ← 持续训练
+│   ├── eval-pool            (GPU)         ← 漂移评估
+│   ├── rag-pool             (CPU)
+│   ├── lipsync-pool         (GPU)
+│   └── compose-pool         (CPU)
+├── postgres                 (StatefulSet 或托管)
+├── redis                    (StatefulSet 或托管)
+├── minio                    (StatefulSet 或对接 OSS)
+└── milvus / pgvector        (Helm 或内置)
 ```
 
 ### 12.2 多环境
-
 - `dev` / `staging` / `prod`，按 namespace 隔离
 - 模型版本通过 ConfigMap / Admin API 灰度
 
 ### 12.3 灰度与回滚
-
-- API 层：按租户灰度（Header 路由）
-- 模型层：按租户配置 Provider 优先级
-- 代码层：标准 K8s 滚动升级 / Argo Rollouts
+- **API 层**：按租户灰度（Header 路由）
+- **模型层**：按租户配置 Provider 优先级
+- **PersonaModel 版本**：切 `current_version` 即可让新任务走新版本；老任务仍绑老版本不受影响
+- **代码层**：标准 K8s 滚动升级 / Argo Rollouts
 
 ---
 
@@ -497,29 +342,37 @@ Namespace: avcore
 | ADR-005 | Provider 抽象通过 Protocol / Interface | 强耦合调用 | 多厂商 + 灰度 |
 | ADR-006 | 任务状态可由前端轮询 / WS / Webhook | 仅 Webhook | 适配不同集成方 |
 | ADR-007 | 渲染任务支持节点级断点续跑 | 任务级 | 长链路降本 |
+| ADR-008 | PersonaModelVersion 不可变 | 可变 + 软标记 | 历史视频必须锁定版本 |
+| ADR-009 | 训练任务独占（同一 persona 不并发） | 并行训练 | 防止版本错乱 |
 
 ---
 
 ## 14. 演进路线
 
-### Phase 0 — 验证（4 周）
+### Phase 0 — 最小闭环（4 周）
+- `persona-svc` + `evolution-svc` 雏形：1 个 persona → v1 → 1 条视频 → 手动反馈
 - 单体服务 + 单一视频 Provider
-- 1 个角色 → 1 条视频的最小闭环
+- 不做版本管理（先跑通）
 
-### Phase 1 — 多 Provider + 知识（8 周）
+### Phase 1 — 多 Provider + 版本机制（8 周）
+- 实现 v1 / v2 不可变快照 + 切版本
 - Provider 抽象落地 ≥ 3 个
-- 知识语料 + RAG 接入
+- 知识语料 + RAG 接入（knowledge-aspect）
+- 训练 DAG 跑通：含漂移评估
 - 任务系统、Webhook、可观测
 
-### Phase 2 — 高可用 + 性能（8 周）
+### Phase 2 — 高可用 + 持续运营（8 周）
 - 拆微服务、K8s 化
-- 队列分层、GPU 调度
+- 队列分层、GPU 调度、训练独立池
 - 模型路由、降级、缓存
+- A/B 流量分配、强制回滚
+- 反馈闭环自动化
 
 ### Phase 3 — 平台化（持续）
 - 模板市场、A/B 实验
 - 多租户 SaaS、计费 / 配额
 - 数字员工 / 直播等扩展场景
+- 实时交互数字人（可对话）
 
 ---
 
@@ -529,9 +382,12 @@ Namespace: avcore
 |------|------|------|
 | 模型厂商限速 / 涨价 | 吞吐 / 成本 | 多 Provider + 路由 |
 | 长链路失败 | 用户体验 | 节点级断点续跑 + 重试 |
-| 数字人 / 声音合规 | 法务 | 强制授权 + 审核 + 水印 |
-| GPU 成本失控 | 毛利 | 弹性 + 缓存 + 限速 |
+| 数字人 / 声音合规 | 法务 | 强制授权 + 审核 + 水印 + 真实人物复刻额外审核 |
+| 训练漂移 | 用户体验 | 漂移自动评估 + 回退 + 告警 |
+| 版本管理混乱 | 团队 | PersonaModelVersion 不可变 + 切版本原子化 |
+| 训练 GPU 成本失控 | 毛利 | 弹性 + 配额 + 限额 + 预估提示 |
 | 模型效果不稳 | 口碑 | 评测体系 + 人工抽检 + 反馈闭环 |
+| 历史视频与新版 persona 不一致 | 体感 | 历史视频固定 version_id，不跟随默认漂移 |
 
 ---
 

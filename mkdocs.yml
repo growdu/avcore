@@ -1,5 +1,5 @@
 site_name: AVCore
-site_description: 面向开发者的纯后端 AI 视频生成核心框架
+site_description: 面向开发者的纯后端 AI 数字人视频生成核心框架（人物角色模型生成、持续训练与视频消费）
 site_author: AVCore Team
 
 repo_name: growdu/avcore
@@ -88,11 +88,11 @@ nav:
   - 架构文档: architecture.md
   - 子模块设计:
       - 模块索引: modules/README.md
-      - 人物形象建模: modules/character-modeling.md
-      - 角色养成: modules/character-cultivation.md
-      - 专家养成: modules/expert-cultivation.md
+      - 人物角色模型生成: modules/persona-modeling.md
+      - 人物角色模型完善演进: modules/persona-evolution.md
       - 视频生成: modules/video-generation.md
       - 工作流编排: modules/pipeline.md
+      - 知识能力（可选）: modules/knowledge-aspect.md
   - API 概览: api/README.md
 
 extra:
