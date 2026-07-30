@@ -1,6 +1,8 @@
 # 模块设计：人物角色模型生成（Persona Modeling）
 
-> 创建一个**人物角色模型**（PersonaModel）的初始版本 v1。它既可能是一个技术专家，也可能是一个形象鲜明的虚构人物 / 真实人物复刻 / 虚拟员工——核心是"一个可被识别、可被驱动的角色"。
+> 创建一个**人物角色模型（PersonaModel）的初始版本 v1**——可能是一个技术专家、一个形象鲜明的虚构人物、一个真人数字孪生、一个虚拟员工。核心是"一个可被识别、可被驱动的角色"。
+>
+> 本文档回答：**怎么创建、必须输入什么、产出落在哪里**。与落盘格式的强约定见 [`../storage.md`](../storage.md)。
 
 ---
 
@@ -9,312 +11,274 @@
 **输入**：人物设定（自然语言）+ 可选参考素材
 - 视觉参考：1~N 张参考图（已获授权）
 - 声音样本：≥ 30s 干净人声（已获授权）
-- 行为样本：该人物的语气、文风、典型对话片段
-- 领域资料（可选）：技术专家 / 行业讲师 才需要；非必要不灌
-- 参考人物（可选）：链接到外部知名人物的描述，用于风格借鉴（非克隆）
+- 行为样本：该人物的典型语气 / 文风片段
+- 领域资料（可选）：技术专家才需要；非必要不灌
+- 参考人物（可选，仅用于风格借鉴）
 
-**输出**：`PersonaModel` 的首个版本（v1），包含
-- `avatar`：视觉形象资产
-- `voice`：声音资产
-- `persona`：人设 / 风格 / 语气 / 禁忌
-- `knowledge`（可选）：领域语料与检索配置
-- `identity_anchor`：跨版本可比的"锚点特征"
+**输出**：本地落盘的 `PersonaModel v1`，含
+- `avatar/` —— 主形象图、多视角、LoRA（若有）、face_id
+- `voice/` —— 干净样本 + speaker embedding
+- `persona.json` —— 人设结构化
+- `knowledge/`（可选）—— 语料索引
+- `identity_anchor.json` —— 跨版本一致性锚点
+- `manifest.json` —— 版本元数据（账本）
 
-**边界**：本模块只负责"**创建**"，不负责"**持续训练**"。后者见 [persona-evolution.md](./persona-evolution.md)。
-
----
-
-## 2. 为什么以"PersonaModel"为中心
-
-旧设计把"角色"和"专家"切成两条平行线，这强迫用户在做第一个角色时就要选择"它是普通人还是专家"。事实上：
-
-- 同一个模型可以**先塑形，再灌知识**——先生成 v1 视觉+声音，后期 v2 才接入领域资料
-- 同一个模型可以**完全不灌知识**——一个虚拟主播、一个播音主持、一个品牌虚拟代言人，根本不需要"专家"概念
-- 知识只是 persona 的一个**可选维度**，不是必须属性
-
-因此 AVCore 以 `PersonaModel` 为顶层聚合，把"形象、声音、人设、知识"作为可装可拆的能力维度。
+**边界**：本模块**只创建 v1**。再训练由 [`persona-evolution.md`](./persona-evolution.md) 负责。
 
 ---
 
-## 3. 领域模型
-
-```python
-@dataclass
-class PersonaModel:
-    id: str                          # 顶层 ID，跨版本不变
-    name: str                        # 角色名（"Lily" / "钱教授" / "Vlogger-A"）
-    archetype: str                   # mentor / vlogger / anchor / mascot / instructor ...
-    description: str                 # 一句话设定
-    current_version: str            # 当前默认 version_id，默认指 v1
-    version_ids: list[str]           # 历史版本列表（不可删，可停用）
-    status: str                      # active / archived
-    created_at: datetime
-    updated_at: datetime
-    meta: dict
-
-@dataclass
-class PersonaModelVersion:
-    id: str                          # pmod_{uuid}_v{N}
-    persona_model_id: str
-    version: int                     # 1, 2, 3, ...
-    parent_version_id: str | None    # 增量训练时记录父版本
-    avatar_id: str                   # 形象资产 ID
-    voice_id: str                    # 声音资产 ID
-    persona: PersonaDescriptor       # 人设
-    knowledge: KnowledgeBinding | None  # 可选
-    identity_anchor: IdentityAnchor  # 跨版本一致性锚点
-    training_job_id: str | None      # 产生此版本的训练任务
-    metrics: VersionMetrics          # 一致性 / 风格 / 知识得分
-    created_at: datetime
-    status: str                      # building / ready / deprecated
-    meta: dict
-
-@dataclass
-class PersonaDescriptor:
-    traits: list[str]                # 性格词：耐心 / 幽默 / 严谨 / 犀利
-    tone: str                        # 整体语气
-    catchphrases: list[str]          # 口头禅
-    taboos: list[str]                # 禁忌话题 / 措辞
-    scenario_prompts: dict[str, str] # 场景化 prompt：教学 / 营销 / 客服
-    response_length: str = "medium"
-    formality: float = 0.5
-    temperature: float = 0.7
-    meta: dict
-
-@dataclass
-class KnowledgeBinding:
-    corpus_ids: list[str]
-    domain: str | None               # "高中物理" / "保险产品" / 可空
-    grounding_mode: str = "loose"    # strict / loose / hybrid
-    retrieval: RetrievalConfig       # top_k / threshold / 混合检索
-    style: ExpertStyle               # 术语偏好 / 必含 / 禁用
-    meta: dict
-
-@dataclass
-class IdentityAnchor:
-    # 跨版本可比对的特征向量。视频生成时用作一致性兜底
-    face_embedding: list[float] | None
-    voice_embedding: list[float] | None
-    style_embedding: list[float] | None
-    created_at: datetime
-
-@dataclass
-class VersionMetrics:
-    identity_consistency: float      # 与上一版本的相似度
-    style_consistency: float         # 人设稳定性
-    quality_score: float             # 人工 / LLM-as-Judge 总分
-    notes: str
-```
-
-### 关系示意
+## 2. 落盘布局（与 storage.md §3 完全一致）
 
 ```
-PersonaModel ──┬─ PersonaModelVersion[] ──┬─ Avatar     (1..1, 不可变快照)
-               │                        ├─ Voice      (1..1, 不可变快照)
-               │                        ├─ PersonaDescriptor (1..1)
-               │                        ├─ KnowledgeBinding  (0..1, 可选)
-               │                        └─ IdentityAnchor    (1..1)
-               │
-               ├─ TrainingJob[]          (持续演进历史)
-               ├─ Sample[]              (训练样本：图 / 音 / 行为文本 / 反馈)
-               └─ VideoJob[]            (下游使用记录)
-
-VideoJob ──── PersonaModelVersion(指定版本)
+~/.local/share/avc/personas/pm_01H.../
+└── v1/
+    ├── manifest.json
+    ├── avatar/
+    │   ├── primary.png
+    │   ├── views/*.png
+    │   ├── ref/*.png
+    │   ├── lora/{weights.safetensors,lora.json}   # 可选
+    │   ├── face.json
+    │   └── provider.json
+    ├── voice/
+    │   ├── sample.wav
+    │   ├── transcript.json
+    │   ├── embed.bin
+    │   └── provider.json
+    ├── persona.json
+    ├── knowledge/                                # 可选
+    │   ├── corpora/corpus_01/
+    │   │   ├── chunks.parquet
+    │   │   ├── embed.bin
+    │   │   └── index.faiss
+    │   └── binding.json
+    └── identity_anchor.json
 ```
 
----
-
-## 4. 视觉形象生成
-
-### 4.1 输入
-- `description`：自然语言（外貌、年龄、气质、风格关键词）
-- `ref_images`：可选参考图，触发 IP-Adapter / InstantID / 风格参考
-- 风格词：`写实 / 二次元 / 国风 / 3D 卡通 / 皮克斯风`
-
-### 4.2 能力路径
-| 路径 | 输入 | 输出 | 适用场景 |
-|------|------|------|----------|
-| 文生图 | description | 1~N 张候选形象 | 没有参考图 |
-| 图生图 | 1 张参考图 + 风格 prompt | 多角度统一形象 | 有参考人像 |
-| 多视角 | 关键 seed | 4~8 视角图 | 后续 3D / 头部驱动 |
-| LoRA 微调 | ≥ 5 张高质量参考图 | LoRA 权重 + 一致性主形象 | 强一致性要求 |
-
-### 4.3 数据契约
-
-```python
-@dataclass
-class AvatarSpec:
-    name: str
-    description: str
-    style_tags: list[str]
-    ref_images: list[URI] = []
-    age_range: tuple[int, int] | None = None
-    gender: str | None = None
-    ethnicity_hint: str | None = None
-
-@dataclass
-class Avatar:
-    id: str
-    provider: str                   # sdxl / kling-avatar / heygen
-    primary_image: URI
-    ref_images: list[URI]
-    lora: URI | None
-    face_id: str | None
-    meta: dict
-```
-
-### 4.4 Provider 适配
-
-| 任务 | Provider | 备注 |
-|------|----------|------|
-| 形象 | `sdxl_ip_adapter` | 自托管，性价比高 |
-| 形象 | `kling_avatar` | 商用稳定 |
-| 形象 | `heygen_avatar` | 商用 |
-| 形象 | `flux_lora` | 高质量微调 |
+> v1 完成时**立即**计算并写入 `identity_anchor.json`，这是后续演进的基线。
 
 ---
 
-## 5. 声音生成
+## 3. 为什么以 PersonaModel 为中心
 
-### 5.1 输入
-- 声音样本（`samples`）：每条 `{uri, duration_ms, text, language}`
-- 样本要求：≥ 30s 干净人声、单说话人、无 BGM
-- 不提供样本 → 走商用音色，匹配声纹近似度排序推荐
+旧设计把"角色"与"专家"切成平行两条线。这有几个坏处：
 
-### 5.2 数据契约
+- 强迫用户在创建第一个角色时就选择"它是普通人还是专家"
+- 让"持续训练"看起来像是专家专属，而事实上所有角色都需要
+- 知识不能后期接入，因为被建模成另一个独立对象
 
-```python
-@dataclass
-class VoiceSample:
-    uri: URI
-    duration_ms: int
-    text: str                       # 该段对应文本（用于训练对齐）
-    language: str = "zh"
+**AVCore 的选择**：把"形象、声音、人设、知识"作为**同层可装可拆**的能力维度，PersonaModel 是它们的容器。
 
-@dataclass
-class VoiceSpec:
-    name: str
-    language: str = "zh"
-    samples: list[VoiceSample]
-    emotion_baseline: str = "neutral"
-
-@dataclass
-class Voice:
-    id: str
-    provider: str                   # cosyvoice / gpt-sovits / volc-tts / azure-tts
-    voice_id: str                   # 厂商侧 ID
-    sample_uri: URI
-    language: str
-    supported_emotions: list[str]
-    meta: dict
-```
-
-### 5.3 声音控制
-- SSML：情绪、停顿、重音、语速
-- 多情绪：同一 voice_id 切换情绪标签
-- 相似度：speaker embedding cosine ≥ 0.80
+- 同一个模型可以**先塑形，再灌知识**（v1 无知识、v2 加物理语料）
+- 同一个模型可以**完全不灌知识**（虚拟主播、品牌代言人、Vlogger）
+- 知识是可选维度，不是必须属性
 
 ---
 
-## 6. 人设建模
+## 4. 角色类型与最小输入
 
-输入：自然语言描述 + 可选行为样本（该角色典型语气示例片段）
+| 类型 | 视觉 | 声音 | 人设 | 知识 |
+|------|------|------|------|------|
+| 技术专家 | 必填 | 必填 | 必填 | 可选 |
+| 虚拟主播 / 品牌代言人 | 必填 | 必填 | 必填 | 否 |
+| 真人数字孪生 | 必填（本人授权） | 必填（本人授权） | 可推断 | 否 |
+| 虚拟员工 | 可选（可纯口播） | 必填 | 必填 | 可选 |
+| Vlogger / Storyteller | 必填 | 必填 | 必填 | 否 |
 
-输出：`PersonaDescriptor` 结构化字段（traits / tone / taboo / scenario_prompts ...）
-
-生成路径：LLM 抽取 + 人工确认，提供内置模板（讲师 / 主播 / 客服 / 主持人 / 虚拟员工 / 故事讲述者 / 行业专家）。
-
-更多约束与场景化 Prompt 设计见 [persona-evolution.md §4 人设训练](./persona-evolution.md#43)。
-
----
-
-## 7. 知识接入（可选）
-
-只有当 persona 真的代表"懂某个领域"时才接入。
-
-输入：领域语料（文档 / 网页 / FAQ）+ 术语偏好
-输出：`KnowledgeBinding`，挂载到当前版本
-
-语料接入与 RAG 细节见 [knowledge-aspect.md](./knowledge-aspect.md)。
-
-> 注意：不接入知识 ≠ 不能讲任何内容——一个形象鲜明的人设没有领域知识也能讲"段子"或"日常点评"。
+> "可选" = 不传也能跑（用商用音色 / 通用头像模板 / 无知识）。
 
 ---
 
-## 8. 创建流程
+## 5. 数据契约
 
-```
-Client                Persona Modeling Svc          Providers
-  │                          │                          │
-  │  create_persona_model()  │                          │
-  ├─────────────────────────▶│  入队 job (create v1)    │
-  │                          ├─────────────────────────▶│
-  │                          │  [1] 形象生成 (avatar)    │
-  │                          │  [2] 声音生成 (voice)    │
-  │                          │  [3] 人设结构化          │
-  │                          │  [4] 知识接入 (可选)     │
-  │                          │  [5] Identity Anchor 抽取 │
-  │                          │◀─────────────────────────┤
-  │                          │  写库 PersonaModel + v1   │
-  │◀──── 201 Created ────────│                          │
-  │     { persona_model_id, version_id: v1 }             │
-```
+```rust
+// 顶层 persona model
+struct PersonaModel {
+    id: String,                       // pm_xxx
+    name: String,
+    archetype: String,                // mentor/vlogger/anchor/mascot/...
+    description: String,
+    current_version: u32,             // 默认指 v1
+    version_ids: Vec<u32>,
+    status: Status,                   // active / archived
+    created_at: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
+}
 
-- 整段链路是**异步任务**，状态 `queued / running / succeeded / failed`
-- 任意环节可中断，已成功环节的中间产物会保留以支持续跑
+// 版本（不可变快照）
+struct PersonaVersion {
+    id: (String, u32),                // (persona_model_id, version)
+    parent_version: Option<u32>,
+    avatar: Avatar,
+    voice: Voice,
+    persona: PersonaDescriptor,
+    knowledge: Option<KnowledgeBinding>,
+    identity_anchor: IdentityAnchor,
+    metrics: VersionMetrics,
+    status: VersionStatus,            // building/ready/deprecated
+    training_job_id: Option<String>,
+    dir_path: PathBuf,                // ~/.local/share/avc/personas/pm_xxx/v1/
+    created_at: DateTime<Utc>,
+}
 
----
+struct Avatar {
+    provider: String,                 // sdxl_ip_adapter / kling_avatar / ...
+    primary_image: PathBuf,           // avatar/primary.png
+    views: Vec<PathBuf>,              // avatar/views/*.png
+    ref_images: Vec<PathBuf>,         // avatar/ref/*.png
+    lora: Option<PathBuf>,            // avatar/lora/weights.safetensors
+    face_id: Option<String>,
+}
 
-## 9. 接口
+struct Voice {
+    provider: String,
+    voice_id: String,
+    sample: PathBuf,                  // voice/sample.wav
+    language: String,
+    supported_emotions: Vec<String>,
+    embed: PathBuf,                   // voice/embed.bin
+}
 
-```http
-POST   /v1/persona-models                              创建 PersonaModel（异步）
-GET    /v1/persona-models/{id}                         查询
-GET    /v1/persona-models/{id}/versions                历史版本
-GET    /v1/persona-models/{id}/versions/{vid}         指定版本详情
-PUT    /v1/persona-models/{id}/current-version        设置默认版本（不改版本本身）
+struct PersonaDescriptor {
+    traits: Vec<String>,
+    tone: String,
+    catchphrases: Vec<String>,
+    taboos: Vec<String>,
+    scenario_prompts: BTreeMap<String, String>,
+    formality: f32,
+    temperature: f32,
+    response_length: String,
+    language: String,
+}
 
-POST   /v1/persona-models/{id}/avatars                创建 / 替换形象（异步）
-GET    /v1/avatars/{aid}                               查询
-DELETE /v1/avatars/{aid}                               删除（仅可删未绑定版本）
-
-POST   /v1/persona-models/{id}/voices                  创建 / 替换声音（异步）
-GET    /v1/voices/{vid}                                查询
-POST   /v1/voices/{vid}/synthesize                     TTS 试听
-DELETE /v1/voices/{vid}                                删除
-
-POST   /v1/persona-models/{id}/persona                 创建 / 更新人设
-GET    /v1/personas/{pid}                              查询
-POST   /v1/personas/{pid}/simulate                     试运行
-
-POST   /v1/persona-models/{id}/knowledge               绑定 / 替换知识语料（可选）
-DELETE /v1/persona-models/{id}/knowledge               解绑
-```
-
-> 注意：形象 / 声音 / 人设 / 知识 都是**版本快照**。一旦新版本诞生，老版本的资产保持原样，不会被覆盖。
-
----
-
-## 10. 异步任务状态
-
-```json
-{
-  "task_id": "uuid",
-  "type": "persona.create",
-  "status": "queued | running | succeeded | failed",
-  "progress": 0.0,
-  "current_step": "voice_clone",
-  "step_progress": { "avatar": 1.0, "voice": 0.4, "persona": 0.0 },
-  "result": { "persona_model_id": "...", "version_id": "..." },
-  "error": null
+struct IdentityAnchor {
+    face: EmbeddingRef,               // face/face_emb.bin
+    voice: EmbeddingRef,
+    style: EmbeddingRef,
+    computed_at: DateTime<Utc>,
 }
 ```
 
-前端通过 WebSocket / 轮询 / Webhook 获取完成事件。
+---
+
+## 6. 创建流程
+
+```
+$ avc persona new "Lily" --from ./persona.toml
+        │
+        ▼
+[1] 校验输入（consent、文件存在、维度齐全）
+        │
+        ▼
+[2] 建立版本目录 personas/pm_xxx/v1/（空 + manifest 状态=building）
+        │
+        ▼
+[3] 形象生成 ──▶ avatar/primary.png + views/ + face.json
+        │          （可选）LoRA 训练，写入 lora/
+        │
+        ▼
+[4] 声音生成 ──▶ voice/sample.wav + voice/embed.bin
+        │
+        ▼
+[5] 人设抽取 ──▶ persona.json
+        │
+        ▼
+[6] 知识索引（可选）──▶ knowledge/
+        │
+        ▼
+[7] Identity Anchor 抽取 ──▶ identity_anchor.json
+        │
+        ▼
+[8] 落 manifest.json，置 status=ready，写 SQLite
+        │
+        ▼
+[9] 任一步骤失败 → 标记 status=failed，清中间产物（除非显式 --keep-partials）
+```
+
+**异步任务**：Provider 调用（尤其是 LoRA 训练 / 大模型生图）耗时较长，统一为 `task_xxx` 异步对象。`avc task show task_xxx --watch` 跟进。
 
 ---
 
-## 11. 错误与边界
+## 7. 视觉子能力
+
+### 7.1 文生图
+- 调用 SDXL / Flux / HunyuanDiT，按 `description + style_tags` 渲染候选
+- 多角度同 seed 出 4~8 视图
+- 默认人脸一致性：InstantID / IP-Adapter / FaceID
+
+### 7.2 LoRA 微调（可选）
+- ≥ 5 张高质量参考图触发
+- 输出 `weights.safetensors + lora.json` 落 `avatar/lora/`
+- 异步 + 幂等（断点续跑）
+
+### 7.3 Provider 路由
+| Provider | 特点 |
+|----------|------|
+| `sdxl_ip_adapter` | 自托管性价比 |
+| `kling_avatar` | 商用稳定 |
+| `heygen_avatar` | 商用稳定 |
+| `flux_lora` | 高质量微调 |
+
+切换 = 改 `provider.json` 字段，不改业务代码。
+
+---
+
+## 8. 声音子能力
+
+### 8.1 声音克隆
+- 样本要求：≥ 30s 干净人声、单说话人、无 BGM
+- Provider：CosyVoice / GPT-SoVITS / F5-TTS
+- 输出：`voice/sample.wav`（永久留底）+ `voice/embed.bin`（speaker embedding）
+
+### 8.2 商用音色
+- 不提供样本时，走火山 / 阿里 / 微软 TTS 商用 ID
+- 仅写 `voice/sample.wav`（厂商试听音）+ `provider.json`
+
+### 8.3 控制
+- SSML：`<emotion>`、`<break>`、`<emphasis>`、语速
+- 多情绪：同一 voice_id 切换情绪标签
+
+---
+
+## 9. 人设建模
+
+输入自然语言 + 行为样本，输出 `persona.json`。  
+内置模板：mentor（讲师）/ vlogger / anchor / mascot / instructor（教练）/ entertainer（主持）/ support（客服）/ storyteller。  
+LLM 抽取 + 人工确认（CLI 上展示 diff 让用户接受）。
+
+LLM 调用走 `llm.openai_compat` Provider（兼容 OpenAI / 豆包 / DeepSeek / 智谱等），不绑定模型厂商。
+
+---
+
+## 10. 知识接入（可选）
+
+只有当角色真的"懂某个领域"才接入。详见 [`knowledge-aspect.md`](./knowledge-aspect.md)。
+
+不接入 ≠ 不能讲内容——一个没有知识但有人设的 persona 也可以做"段子手"、"日常点评"、"情感陪伴"。
+
+---
+
+## 11. CLI 接口
+
+```bash
+avc persona new "Lily" \
+  --description "30 岁东亚女性，温和笑容，教学型主播" \
+  --avatar-style 写实,教学 \
+  --avatar-refs ./samples/ref_*.png \
+  --voice-samples ./samples/voice_*.wav \
+  --persona-traits 耐心,严谨,幽默 \
+  --persona-catchphrase "来，我们一步步看" \
+  --from ./persona.toml         # 或显式参数
+
+# 任务查询
+avc task show task_01H... --watch
+```
+
+`samples.toml` 写法见 [`../cli.md §2.1`](../cli.md)。
+
+---
+
+## 12. 错误与边界
 
 | 场景 | 处理 |
 |------|------|
@@ -322,32 +286,33 @@ DELETE /v1/persona-models/{id}/knowledge               解绑
 | 声音样本含 BGM / 多说话人 | 拒绝，返回 `invalid_audio_sample` |
 | 未提供声音样本 | 走商用音色，自动匹配 |
 | LoRA 训练失败 | 重试 1 次 → 退回非微调路径 |
-| 厂商限速 | 切到备选 Provider，记录埋点 |
-| 形象 / 声音 / 人设 / 知识 不同时通过校验 | 创建失败，全链路回滚 |
+| Provider 限速 | 切到备选 Provider |
+| 任何子步骤失败 | 标记创建任务失败；非 `--keep-partials` 时清理中间产物；可重试整链路 |
 
 ---
 
-## 12. 合规
+## 13. 合规
 
-- **形象授权**：上传参考图必须勾选"已获授权"
-- **声音授权**：声音克隆必须上传"被克隆人授权书"（托管存证）
-- **不可见水印**：默认烧录不可见水印用于追溯
-- **真实人物复刻**：默认禁止；必须开启"真实人物"开关并通过更严格的合规审核
-
----
-
-## 13. 关键指标
-
-- 端到端创建 P50 ≤ 60s（不含知识），含知识 P95 ≤ 10min
-- 形象一致性评分（CLIP / face embedding）≥ 0.85
-- 声音相似度（speaker embedding cosine）≥ 0.80
-- 人设试运行对话 P50 ≤ 2s
+- **形象授权**：上传参考图必须附 `consent_proof`（PDF 路径 + hash）
+- **声音授权**：声音克隆必须上传"被克隆人授权书"
+- **真实人物复刻**：默认禁用；`avc config set safety.real_person.enabled true` 才能开
+- **不可见水印**：可选开启，写入 provider 产物阶段
 
 ---
 
-## 14. 上下游
+## 14. 关键指标
 
-- **上游**：集成方 API 调用；管理后台手动创建
+- 端到端 P50 ≤ 90s（不含 LoRA，不含知识）
+- 含 LoRA 训练 P95 ≤ 15 min
+- 含知识索引 P95 ≤ 5 min
+- 形象一致性 face embedding cosine ≥ 0.85（自检，与锚点同源）
+- 声音相似度 speaker embedding cosine ≥ 0.80
+
+---
+
+## 15. 上下游
+
+- **上游**：CLI 调用、集成方在 REPL 中手动创建
 - **下游**：
   - [persona-evolution.md](./persona-evolution.md)：在 v1 基础上持续训练
-  - [video-generation.md](./video-generation.md)：指定 PersonaModel + version 出视频
+  - [video-generation.md](./video-generation.md)：锁定某个版本出片

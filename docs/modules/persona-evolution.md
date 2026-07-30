@@ -1,8 +1,8 @@
 # 模块设计：人物角色模型完善演进（Persona Evolution）
 
-> 模型不是"造一次就定型"——它需要**持续训练**。本模块负责在 v1 之后追加样本、微调、产出新版本，并保证跨版本身份**不漂移**。
-
-> 这是 AVCore 与"一次性造角"框架最大的差别：把 persona 当成**会慢慢变好、但不能变得认不出来**的活模型。
+> **核心模块**。在 v1 之上，**追加样本 → 训练 → 出新版本（v2 / v3 / ...）→ 一致性兜底**。这是 AVCore 与"一次性造角"框架最大的差别。
+>
+> 本文档回答：**怎么补充角色、怎么演进、怎么保证不漂移**。落盘约定见 [`../storage.md`](../storage.md)。
 
 ---
 
@@ -10,306 +10,309 @@
 
 **输入**：已存在的 `PersonaModel` + 新的训练样本（图像 / 音频 / 行为文本 / 用户反馈）
 
-**输出**：`PersonaModel` 的新版本（v2 / v3 / ...），含：
-- 资产快照（avatar / voice / persona / knowledge）均**不可变**
-- 新的 `IdentityAnchor`（与上一版本对齐的锚点特征）
-- 新的 `VersionMetrics`（一致性 / 风格 / 质量分）
-- 与上一版本的关联（`parent_version_id`）
+**输出**：`PersonaModelVersion` v(N+1)——**新目录**，含：
+- 资产快照（avatar / voice / persona / knowledge）**全部从零拷贝生成**
+- 新的 `IdentityAnchor`（与父版本对齐的锚点特征）
+- 新的 `VersionMetrics`
+- 与父版本关联（`parent_version_id`）
 
 **边界**：
-- 本模块只做"训练态"的演进，不做"对话态"的短期记忆
-- 本模块独立于视频生成，可独立被调用（持续运营一个模型是常态）
+- 不做"对话态"短期记忆（那是对话产品的事）
+- 与视频渲染解耦——可以独立被调用
 
 ---
 
 ## 2. 为什么必须持续训练
 
-真实场景里没人会"一次性"就完美塑形一个角色：
+现实里没人会"一次性"就完美塑形一个角色：
+- 数据是慢慢累积的（一年后才有 10000 段口播、50 套照片）
+- 风格要进化（完播率高的口头禅要强化）
+- 场景在扩张（从"讲解"扩到"情感陪伴"）
+- 要修正过去的翻车点
+- 要留住观众熟悉的样子（同时又不能完全不变）
 
-- **数据是慢慢累积的**——视频号运营 1 年后才有 10000 段口播、50 套形象照
-- **风格要进化**——新人设发现"用某句口头禅完播率最高"，下次训练就要强化它
-- **场景在扩张**——从"知识讲解"扩到"情感陪伴"，就需要新风格微调
-- **要修正过去**——v1 翻车了（太严肃 / 不像本人），必须能修正
-- **要留住观众熟悉的样子**——同时又不能完全不变
-
-因此演进是默认动作，不是进阶玩法。平台要承担"如何不漂移"的责任，而不是让用户自己解决。
+平台必须承担"如何不漂移"的责任，而不是让用户自己解决。
 
 ---
 
-## 3. 训练样本体系
+## 3. 样本体系
 
-```python
-@dataclass
-class PersonaSample:
-    id: str
-    persona_model_id: str
-    kind: str                       # image / audio / behavior_text / feedback
-    uri: URI | None                 # 媒体类样本（image/audio）
-    text: str | None                # 文本类样本（行为 / 用户反馈）
-    source: str                     # user_upload / system_extracted / feedback_pool
-    version_id_at_collection: str | None
-    consent_proof: str | None       # 授权存证 ID
-    tags: list[str]                 # 训练用标签：neutral / angry / teach / ...
-    quality_score: float | None     # 质检分数（可选）
-    created_at: datetime
+样本分四类，落地后**全部进 SQLite 的 `persona_samples` 表**：
 
-@dataclass
-class SampleFeedback:               # 视频生成过程中收集
-    job_id: str
-    persona_model_id: str
-    version_id: str
-    signal: str                     # "wrong_voice" / "wrong_style" / "looks_unlike" / "thumbs_up"
-    note: str | None
-    weight: float = 1.0
-    created_at: datetime
-```
+| `kind` | 内容 | 形态 | 主要场景 |
+|--------|------|------|----------|
+| `image` | 参考图 / 形象照 | 文件 URI | 视觉微调 |
+| `audio` | 声音样本 | 文件 URI + 文本 + 时长 | 声音克隆 / 微调 |
+| `behavior_text` | 行为样例（语气 / 对白） | 纯文本 | 人设 SFT |
+| `feedback` | 反馈信号 | 文本 / label / weight | 反馈闭环 |
 
-### 3.1 样本来源
-| 来源 | 样本类型 | 说明 |
-|------|----------|------|
-| 用户主动上传 | image / audio / behavior_text | 平时添加训练素材 |
-| 视频生成回灌 | feedback | 用户对成片点"不像 / 不对"，转成可训练信号 |
-| 对话回灌 | behavior_text | 把多轮对话中被采纳的回答提炼成"角色风格样本" |
-| 运营手动标注 | image / audio | 标"这一张很标准"或"这一张很像本人"，用于筛选重训样本 |
-
-### 3.2 样本治理
-- 每个样本入库前必须通过：
-  - **授权存证**（形象 / 声音必须）
-  - **质量打分**（模糊 / 多脸 / 含 BGM 拒收）
-  - **去重**（embedding cosine < 0.92 直接丢弃）
-- 样本与 `version_id_at_collection` 绑定，便于追溯"哪个版本生成的内容又被喂回去了"
+每条样本必须：
+- 带 `consent_proof`（形象 / 声音必填）
+- 通过质量打分（模糊 / 多脸 / BGM 拒收）
+- 唯一 key：`version_id_at_collection`（指出自哪个版本；防止自我循环）
 
 ---
 
 ## 4. 演进维度
 
-一次训练任务可以同时改多维度，也可以只改一个：
+一次训练任务可同时改多维度，也可只改一个：
 
-### 4.1 视觉维度
-- 追加参考图 → 再 LoRA 微调 → 视觉一致性进一步收敛
-- 视觉漂移修正：发现某些角度不像 → 用新角度图专项训练
-- 风格微调：从"写实"换到"皮克斯风"需要重新训练视觉资产
+### 4.1 视觉（avatar）
+- 新参考图 → LoRA 增量训练 / InstantID 强化
+- 角度修正：发现"侧脸不像"→ 用新角度图专项训练
+- 风格切换："写实"换"皮克斯风"重新训练视觉资产
 
-### 4.2 声音维度
-- 追加声音样本 → TTS 模型增量训练 → 音质 / 情绪覆盖更全
-- 情绪校正：发现某情绪总翻车 → 补充该情绪样本专项训练
-- 多语扩展：从中文扩到英粤 → 加入多语种样本训练
+### 4.2 声音（voice）
+- 新声音样本 → TTS 增量训练
+- 情绪校正：发现某情绪总翻车 → 该情绪专项样本
+- 多语扩展：中文 → 加上英粤 → 多语种训练
 
-### 4.3 人设维度
-- 行为样本追加 → 微调对话风格 / system prompt
-- 口头禅强化：高频优质对话 → 萃取为 catchphrase
+### 4.3 人设（persona）
+- 行为样本追加 → SFT 对齐 / system prompt 强化
+- 口头禅萃取：高完播率回答 → 固化为 catchphrase
 - 禁忌收紧：出过几次错的话题 → 写入 taboo
 
-### 4.4 知识维度
-- 追加语料 → 重新索引 → 检索效果提升
-- 知识替换：发现旧语料错误 → 标记 `deprecated` 不删，但权重置零
-- 领域切换：v2 是"法律专家"、v3 是"医学助手"，可以彻底换 corpus
+### 4.4 知识（knowledge）
+- 追加语料 → 重建索引
+- 知识替换：错误语料标 `deprecated`（不删，权重视置零）
+- 领域切换：v2 法律 / v3 医学可整体换 corpus
 
 ---
 
-## 5. 训练任务
+## 5. 训练任务的数据契约
 
-### 5.1 数据契约
+```rust
+struct TrainingJob {
+    id: String,                       // tj_xxx
+    persona_model_id: String,
+    base_version: u32,                // 从哪个版本开始
+    target_version: u32,              // 默认 base+1（创建时分配，写入失败就释放）
+    scope: Vec<Scope>,                // [avatar, voice, persona, knowledge]
+    sample_ids: Vec<String>,
+    config: TrainingConfig,
+    status: Status,                   // queued/running/succeeded/failed_drift/cancelled
+    progress: f32,
+    result_version: Option<u32>,      // 成功时填入新版本号
+    drift_report: Option<DriftReport>,
+    created_at: DateTime<Utc>,
+    finished_at: Option<DateTime<Utc>>,
+}
 
-```python
-@dataclass
-class PersonaTrainingJob:
-    id: str
-    persona_model_id: str
-    base_version_id: str            # 基于哪个版本训练
-    target_version: int             # 默认 base+1
-    scope: list[str]                # ["avatar", "voice", "persona", "knowledge"]
-    sample_ids: list[str]
-    config: TrainingConfig
-    status: str                     # queued / running / succeeded / failed / cancelled
-    progress: float = 0.0
-    current_step: str | None
-    result_version_id: str | None
-    metrics: dict | None
-    created_at: datetime
-    finished_at: datetime | None
-
-@dataclass
-class TrainingConfig:
-    # 维度开关
-    train_avatar: bool = True
-    train_voice: bool = True
-    train_persona: bool = True
-    train_knowledge: bool = False
-    # 训练策略
-    full_retrain: bool = False      # True = 全量；False = 增量
-    learning_rate_scale: float = 0.1
-    epochs: int = 3
-    eval_set_ids: list[str] = []    # 评测样本集
-    # 一致性约束（与 base_version 对齐）
-    consistency_threshold: float = 0.85  # 低于此值视作漂移
-    anchors: list[str] = []         # 强制保留的样本（不允许漂移的"金丝雀"样本）
-    # 兜底
-    fallback_to_base: bool = True   # 漂移过大时自动回退到 base 版本
-```
-
-### 5.2 训练流水线（DAG 节点）
-
-```
-[1] 样本筛选 ─ 关联 base_version，质量过滤，去重
-        │
-        ▼
-[2] 视觉训练 (可选) ─ LoRA / InstantID 微调
-        │
-        ▼
-[3] 声音训练 (可选) ─ CosyVoice / SoVITS / F5 增量
-        │
-        ▼
-[4] 人设训练 (可选) ─ SFT + 偏好对齐
-        │
-        ▼
-[5] 知识重建 (可选) ─ embed + 索引重建
-        │
-        ▼
-[6] Identity Anchor 抽取 ─ 与 base 对齐
-        │
-        ▼
-[7] 漂移评估 ─ 仿冒度 / 风格度 / 知识度
-        │
-        ▼
-[8] 决策 ─ 达标 → 发布新版本；不达标 → 退回 base + 报告
-```
-
-### 5.3 与上游样本采集解耦
-- 训练任务只消费**已入库的样本**
-- 样本采集（视频反馈回灌 / 用户上传）独立运行，避免训练任务被杂数据污染
-
----
-
-## 6. 版本管理
-
-```python
-@dataclass
-class VersionMetrics:
-    identity_consistency: float      # vs 父版本：face / voice / style embedding cosine 均值
-    style_consistency: float         # LLM-as-Judge：风格保持
-    quality_score: float             # 人工 / 模型打分
-    drift_alerts: list[str]          # ["avatar_drift_angle=side", "voice_drift_emotion=sad"]
-    notes: str
-```
-
-### 6.1 版本策略
-- 版本号自增，不可跳号，不重用
-- 老版本保留：用户视频生成链接必须能定位到具体版本，因此版本是**不可变快照**
-- 默认版本（`PersonaModel.current_version`）可改，改了不影响下游已生成的视频
-
-### 6.2 版本选择
-- 视频生成请求可指定 `version_id`：不指定 = 当前默认版本
-- 支持 A/B：A/B 两版本并行可用租户，灰度比例按 config 控制
-
-### 6.3 回滚
-- 不达标的新版本标记 `deprecated`，不再被自动选中
-- 也可以**强制回滚**：把 `current_version` 指回旧版本，新任务走旧版本
-- 历史视频不受影响（它们绑定的是冻结的 version_id）
-
----
-
-## 7. 一致性与漂移检测
-
-### 7.1 Identity Anchor
-- 训练结束时抽取：face_embedding / voice_embedding / style_embedding
-- 存到 `PersonaModelVersion.identity_anchor`
-- 与父版本 anchor 算 cosine，作为 `identity_consistency` 主要指标
-
-### 7.2 漂移评估
-- 自动化：
-  - 把"金丝雀样例"（`config.anchors`）跑一遍新旧版本，按相同 prompt 出图 / 出音
-  - face / voice embedding 余弦相似度
-  - 风格相似度（用 LLM-as-Judge + 提示词模板）
-- 人工抽检：
-  - 自动评估通过后，人工抽检通过率需 ≥ 90%
-  - 不达标 → 走 `fallback_to_base`
-
-### 7.3 漂移告警
-- 漂移分项超阈值时单独告警，例如：
-  - `avatar_drift_angle=side`：侧脸最不像
-  - `voice_drift_emotion=sad`：悲伤情绪最不像
-- 告警进入事件流，运营可选择定向补样本再训练
-
----
-
-## 8. 接口
-
-```http
-# 样本
-POST   /v1/persona-models/{id}/samples                  提交样本
-GET    /v1/persona-models/{id}/samples                  列出样本
-DELETE /v1/persona-samples/{sid}                        移除样本
-POST   /v1/persona-samples/{sid}/consign                标记为"金丝雀样本"
-
-# 训练
-POST   /v1/persona-models/{id}/training-jobs            创建训练任务
-GET    /v1/training-jobs/{jid}                          查询
-POST   /v1/training-jobs/{jid}/cancel                   取消
-POST   /v1/training-jobs/{jid}/resume                   续跑
-GET    /v1/training-jobs/{jid}/report                   训练报告（含漂移 / 一致性）
-
-# 版本
-PUT    /v1/persona-models/{id}/current-version          设置默认版本
-POST   /v1/persona-models/{id}/versions/{vid}/deprecated 停用版本（不在新生成任务中默认使用）
-POST   /v1/persona-models/{id}/ab                        开启 A/B 流量分配
-
-# 反馈回灌（用于自动生成样本）
-POST   /v1/jobs/{jid}/feedback                          用户对成片反馈（产生 PersonaSample）
-GET    /v1/persona-models/{id}/feedback-pool            反馈聚合
+struct TrainingConfig {
+    full_retrain: bool,               // 默认 false（增量）
+    epochs: u32,
+    learning_rate_scale: f32,
+    eval_set_ids: Vec<String>,
+    consistency_threshold: f32,       // 默认 0.85
+    anchors: Vec<String>,             // 金丝雀样本 IDs
+    fallback_to_base: bool,           // 漂移过大自动回退
+    keep_partials: bool,              // 失败时是否保留中间产物供调试
+}
 ```
 
 ---
 
-## 9. Provider 适配
-
-| 维度 | Provider | 说明 |
-|------|----------|------|
-| 视觉 | `sdxl_lora_incremental` | 增量 LoRA |
-| 视觉 | `kling_avatar_finetune` | 商用微调 |
-| 声音 | `cosyvoice_incremental` | 自托管增量 |
-| 声音 | `gpt_sovits_incremental` | 少样本增量 |
-| 人设 | `llm_sft` | OpenAI / Anthropic / 国产大模型 SFT |
-| 知识 | `embed_reindex` | 重 embedding + 索引重建 |
-
-切换 Provider 不影响 PersonaModel 抽象。
-
----
-
-## 10. 调度与成本
-
-- 训练任务是 **GPU 重任务**，独立 worker pool：`train-pool`
-- 单 PersonaModel 不并发训练（防版本错乱），但多 PersonaModel 可并行
-- 估算代价（在 UI 上展示给用户）：
-  - 训练前给预估 GPU 时长、token 数、预计费用
-  - 失败也要计费（防止恶意刷训练）
-
----
-
-## 11. 与视频生成的关系
+## 6. 训练流水线（DAG 节点）
 
 ```
-PersonaModel (v3) ─── 锁定 version ───▶ Video Job
-   │  current_version = v3
-   │
-   └─ 历史视频仍绑定自己生成时的 v1 / v2，不会跟随 default 漂移到 v3
+[1] sample_filter       ─ 关联 base_version，质量过滤，去重（embedding cosine < 0.92 丢弃）
+        │
+        ▼
+[2] avatar_train (if)   ─ LoRA / InstantID 增量微调
+[3] voice_train (if)    ─ CosyVoice / SoVITS / F5 增量
+[4] persona_sft (if)    ─ LLM SFT + 偏好对齐
+[5] knowledge_reindex   ─ embed + 索引重建
+        │
+        ▼
+[6] identity_anchor_extract  ─ 与父版本同样的编码器重新抽取
+        │
+        ▼
+[7] drift_eval          ─ face/voice/style cosine vs 父版本
+        │
+        ├─ 达标 (≥ threshold) ─▶ publish v(N+1)
+        └─ 不达标            ─▶ fallback_to_base + drift_report
 ```
 
-这就是版本不变的意义：观众的旧视频永远长得一样，运营侧继续做 v4、v5 训练都不会破坏存量体验。
+每个节点是 DAG 中的独立步，节点结果**全部落 v(N+1) 目录**。这就是为什么 v(N+1) 必须是新目录——任何中间产物都能定位。
 
 ---
 
-## 12. 关键指标
+## 7. 版本管理（不可变性）
 
-- 训练耗时：单维度训练 P95 ≤ 30 min（视觉 / 声音），人设 P95 ≤ 2h
+```rust
+struct VersionMetrics {
+    identity_consistency: f32,        // 与父版本的 cos（face/voice/style 均值）
+    style_consistency: f32,
+    quality_score: f32,
+    drift_alerts: Vec<DriftAlert>,    // ["avatar_drift_angle=side", ...]
+    notes: String,
+}
+```
+
+### 7.1 不变性原则
+- **版本号自增、不可跳号、不重用**
+- 一旦创建，目录内任何文件**永不被修改**（sha256 校验）
+- 改版只能新建版本；停止只能用 deprecated 标记
+
+### 7.2 `current_version` 与历史
+- `PersonaModel.current_version` 是**指针**，可改
+- 改指针只影响"之后新任务默认用哪个版本"
+- 已渲染的视频绑的是**当时**的 version，不受影响
+
+### 7.3 切版本 / A/B / 回滚
+```bash
+avc persona current lily --set 3               # 单一默认
+avc persona ab lily --versions 2,3 --ratio 70/30   # A/B 灰度
+avc persona current lily --set 1               # 一行回滚
+```
+回滚 = 指针回拨，不删任何数据。
+
+---
+
+## 8. 一致性与漂移检测
+
+### 8.1 Identity Anchor
+- 训练结束时抽取 face / voice / style embedding，落 `identity_anchor.json`
+- 与父版本 anchor 算 cosine → `identity_consistency`
+- canary 样本：用户标记"必须不漂移"的样本，分布在 `samples/canary/`；评估时强制跑
+
+### 8.2 漂移评估
+- 自动：金丝雀样本 + 评测集；face/voice embedding 余弦相似度；style 由 LLM-as-Judge 评分
+- 人工抽检：自动通过后 90% 通过率才发布
+- 不达标 → fallback_to_base，训练任务 `status=failed_drift`
+
+### 8.3 漂移告警（不阻断发布）
+- 漂移分项超阈值（如侧脸 cos < 0.7）单独告警，入事件流
+- 运营可针对单维度再补样本、再训练
+- 这些告警会写入 `VersionMetrics.drift_alerts`
+
+---
+
+## 9. CLI 操作流程
+
+```bash
+# 1. 追加样本
+avc persona sample add lily \
+  --kind audio \
+  --uri ./new_voice.wav \
+  --duration-ms 60000 \
+  --text "..." \
+  --consent ./auth.pdf
+
+avc persona sample add lily \
+  --kind image \
+  --uri ./new_view.png \
+  --tags side,neutral \
+  --consent ./auth.pdf
+
+# 2. 启动训练
+avc persona evolve lily \
+  --scope avatar,voice,persona \
+  --base-version 2 \
+  --anchors ./samples/canary/ \
+  --consistency-threshold 0.85 \
+  --fallback-to-base
+
+# 3. 跟任务
+avc task show task_xxx --watch
+
+# 4. 看报告
+avc training report task_xxx --json
+```
+
+报告 JSON 例子：
+
+```json
+{
+  "persona_model_id": "pm_01H...",
+  "base_version": 2,
+  "candidate_version": 3,
+  "metrics": {
+    "identity_consistency": 0.92,
+    "style_consistency": 0.88,
+    "quality_score": 0.84
+  },
+  "per_dim_drift": {
+    "avatar": {"score": 0.92, "warning": null},
+    "voice":  {"score": 0.91, "warning": null},
+    "style":  {"score": 0.88, "warning": "tone_more_formal_than_parent"}
+  },
+  "samples_used": 120,
+  "duration_min": 38,
+  "decision": "publish"   // 或 "rollback"
+}
+```
+
+---
+
+## 10. 样本治理
+
+```bash
+avc persona sample list lily --kind audio
+avc persona sample rm sample_01H...
+avc persona sample consign sample_01H...    # 标金丝雀（必须不漂移）
+avc persona sample stats lily               # 数量 / 质量 / 标签分布
+```
+
+入库前必跑校验：
+1. `consent_proof` 文件存在 + hash 与声明一致
+2. 质检：image → CLIP 清晰度 + face detection；audio → SNR + VAD
+3. 与已有样本 embedding cosine ≥ 0.92 才保留（去重）
+
+---
+
+## 11. Provider 实现
+
+| 维度 | Provider（规划） |
+|------|----------------|
+| 视觉 | `sdxl_lora_incremental`, `kling_avatar_finetune` |
+| 声音 | `cosyvoice_incremental`, `gpt_sovits_incremental` |
+| 人设 | `llm_sft`（OpenAI / Anthropic / 国产大模型 SFT） |
+| 知识 | `embed_reindex` |
+
+切换 = 配置 `provider.json` + 替换 trait 实现，主仓不动。
+
+---
+
+## 12. 调度与资源
+
+- 训练任务是 **GPU 重任务**，独立 `train-pool`（Phase 1 引入）
+- Phase 0：直接在主进程用 tokio task；本地 CPU 训练（小模型/Lora）即可
+- 单 PersonaModel **不并发训练**（防版本冲突）
+- 多 PersonaModel 可并行；按 tenant/本地用户公平分享
+- 失败也记 GPU/CPU 工时（防止恶意刷训练）
+
+---
+
+## 13. 反馈回灌
+
+```
+$ avc job feedback job_xxx --signal looks_unlike --note "侧脸不像本人"
+        │
+        ▼
+转 PersonaSample(kind=feedback, weight=1.0) 写入 samples 表
+        │
+        ▼
+下次 evolve 自动消费（除非用户标记 ignore=false）
+```
+
+为什么是默认自动消费？
+- 反馈是角色演进的**主要燃料**
+- 手动开关 `avc config set evolution.auto_consume_feedback true|false`
+
+---
+
+## 14. 关键指标
+
+- 训练耗时：单维度 P95 ≤ 30 min（视觉 / 声音），人设 P95 ≤ 2h
 - 跨版本一致性 ≥ 0.85（与父版本）
 - 训练成功率 ≥ 95%
-- 反馈 → 样本 → 新版本闭环时延 ≤ 24h（P95）
-- 老版本可被继续调用 ≥ 24 个月（合规 / 复盘需要）
+- 反馈 → 样本 → 新版本闭环 P95 ≤ 24h
+- 老版本可继续被引用 ≥ 24 个月
 
 ---
 
-## 13. 上下游
+## 15. 上下游
 
 - **上游**：[persona-modeling.md](./persona-modeling.md)（v1 起点）、[video-generation.md](./video-generation.md)（反馈回灌）
 - **下游**：[video-generation.md](./video-generation.md)（锁定 version 渲染）

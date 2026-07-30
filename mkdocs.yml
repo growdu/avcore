@@ -1,5 +1,5 @@
 site_name: AVCore
-site_description: 面向开发者的纯后端 AI 数字人视频生成核心框架（人物角色模型生成、持续训练与视频消费）
+site_description: 开源、纯后端的 AI 数字人核心框架（Rust 单二进制 CLI）
 site_author: AVCore Team
 
 repo_name: growdu/avcore
@@ -86,6 +86,8 @@ nav:
   - 首页: README.md
   - 设计文档: design.md
   - 架构文档: architecture.md
+  - 资产存储（重点）: storage.md
+  - CLI / REPL 用法: cli.md
   - 子模块设计:
       - 模块索引: modules/README.md
       - 人物角色模型生成: modules/persona-modeling.md
@@ -93,7 +95,7 @@ nav:
       - 视频生成: modules/video-generation.md
       - 工作流编排: modules/pipeline.md
       - 知识能力（可选）: modules/knowledge-aspect.md
-  - API 概览: api/README.md
+  - Provider / API 参考: api/README.md
 
 extra:
   social:

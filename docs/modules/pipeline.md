@@ -1,14 +1,14 @@
 # 模块设计：工作流编排（Pipeline）
 
-> 把"训练人物角色模型"与"用模型出视频"两条链路都拆成可编排、可重试、可观测的 DAG 节点。Pipeline 不只服务于渲染，也服务于**持续演进**。
+> 把"训练 PersonaModel"与"用 PersonaModel 出视频"两条链路都拆成可编排、可重试、可观测的 DAG 节点。Pipeline 不只服务于渲染，也服务于**持续演进**。
 
 ---
 
 ## 1. 目标
 
 - **可编排**：训练 / 脚本 / 音频 / 画面 / 合成按 DAG 描述
-- **可重试**：节点级失败重试
-- **可恢复**：节点结果持久化，支持断点续跑
+- **可重试**：节点级失败重试 + 自动回退
+- **可恢复**：节点结果落盘到版本目录，断点续跑
 - **可观测**：每节点有 trace / log / metric
 - **可扩展**：新增节点零侵入
 
@@ -16,52 +16,42 @@
 
 ## 2. 两条主要 DAG
 
-### 2.1 视频生成 DAG（`video.generate.v1`）
+### 2.1 视频渲染 DAG（`video.render.v1`）
 
 ```yaml
-id: video.generate.v1
+id: video.render.v1
 nodes:
   - id: script_gen
     type: llm
-    input_from: job
     config:
       prompt_template: script_gen_v3
-      persona: ${job.persona_version.persona_descriptor}
-      knowledge: ${job.persona_version.knowledge}      # 可空
+      persona_descriptor: ${job.persona_version.persona_descriptor}
+      knowledge: ${job.persona_version.knowledge}
       topic: ${job.topic}
 
   - id: script_review
     type: gate
-    input_from: script_gen
     when: ${options.require_human_review}
-    on_approve: continue
-    on_reject: abort
 
   - id: tts
     type: voice
-    input_from: script_gen
     fanout: scene
     config:
-      voice_id: ${job.persona_version.voice_id}
-      ssml: true
+      voice_id: ${job.persona_version.voice.voice_id}
 
   - id: bgm_select
     type: asset_search
-    input_from: script_gen
     config:
-      asset_type: bgm
       match_by: scene_emotion
 
   - id: img_gen
     type: avatar_image
-    input_from: script_gen
     fanout: scene
     config:
-      avatar_id: ${job.persona_version.avatar_id}
+      avatar_dir: ${job.persona_version.avatar_dir}
 
   - id: i2v
     type: video
-    input_from: [tts, img_gen]
     fanout: scene
     depends_on: [tts, img_gen]
     config:
@@ -69,23 +59,18 @@ nodes:
 
   - id: lipsync
     type: lipsync
-    input_from: i2v
     depends_on: i2v
 
   - id: compose
     type: composer
     input_from: [i2v, bgm_select]
-    config:
-      subtitle: ${options.enable_subtitle}
-      watermark: ${options.enable_watermark}
 
   - id: finalize
     type: encode
-    input_from: compose
-    output: artifacts
+    output_to: ${job.media_dir}
 ```
 
-> 关键：`job.persona_version` 是固化快照，避免渲染过程中 persona 演进造成不一致。
+> 关键：`job.persona_version` 是固化目录指针，避免渲染过程 persona 演进造成不一致。
 
 ### 2.2 人物模型演进 DAG（`persona.train.v1`）
 
@@ -95,249 +80,218 @@ nodes:
   - id: sample_filter
     type: sample_filter
     config:
-      base_version_id: ${job.base_version_id}
-      sample_ids: ${job.sample_ids}
+      base_version: ${job.base_version}
       min_quality: 0.6
-      embedding_dedupe: 0.92
+      dedup_threshold: 0.92
 
   - id: avatar_train
     type: persona_train_avatar
-    when: ${job.scope contains "avatar"}
-    input_from: [sample_filter]
+    when: ${job.scope contains avatar}
     config:
-      base_avatar_id: ${job.base_version.avatar_id}
+      base_avatar_dir: ${job.base_version.dir}/avatar
       epochs: ${job.config.epochs}
-      anchors: ${job.config.anchors}
 
   - id: voice_train
     type: persona_train_voice
-    when: ${job.scope contains "voice"}
-    input_from: [sample_filter]
+    when: ${job.scope contains voice}
     config:
-      base_voice_id: ${job.base_version.voice_id}
-      epochs: ${job.config.epochs}
+      base_voice_dir: ${job.base_version.dir}/voice
 
   - id: persona_sft
     type: persona_train_style
-    when: ${job.scope contains "persona"}
-    input_from: [sample_filter]
-    config:
-      base_persona_id: ${job.base_version.persona_descriptor}
-      lr_scale: ${job.config.learning_rate_scale}
+    when: ${job.scope contains persona}
 
   - id: knowledge_reindex
     type: persona_train_knowledge
-    when: ${job.scope contains "knowledge"}
-    input_from: [sample_filter]
-    config:
-      corpus_ids: ${job.persona.knowledge.corpus_ids}
+    when: ${job.scope contains knowledge}
 
   - id: anchor_extract
     type: identity_anchor
     input_from: [avatar_train, voice_train, persona_sft]
-    config:
-      reference_version_id: ${job.base_version_id}
 
   - id: drift_eval
     type: consistency_eval
     input_from: [avatar_train, voice_train, persona_sft, anchor_extract]
     config:
       threshold: ${job.config.consistency_threshold}
-      fallback_to_base: ${job.config.fallback_to_base}
 
   - id: publish_or_rollback
     type: branch
-    input_from: drift_eval
     config:
-      when_succeeded: publish_new_version
-      when_failed: emit_drift_report + abort
+      on_pass: publish_new_version(${job.target_version})
+      on_fail: emit_drift_report + clear(${job.target_version}_dir)
 ```
 
-> 该 DAG 跑完一条 `PersonaTrainingJob`，产出候选 `PersonaModelVersion`。
+> 训练跑完，产出 `personas/pm_xxx/v(N+1)/` 完整目录；不达标时整目录直接清掉（除非 `keep_partials=true`）。
 
 ---
 
 ## 3. 节点类型
 
-| 类型 | 描述 | 输入 | 输出 |
-|------|------|------|------|
-| `llm` | LLM 调用 | msgs | llm_response |
-| `voice` | TTS 合成 | text, voice_id | audio + timestamps |
-| `avatar_image` | 关键帧生成 | prompt, avatar_id | image |
-| `video` | 图生视频 | image, audio, motion | clip |
-| `lipsync` | 口型同步 | clip, audio | clip_synced |
-| `asset_search` | 资产检索 | criteria | asset_ref |
-| `composer` | 后期合成 | clips, bgm, opts | video |
-| `encode` | 转码 | video | mp4 |
-| `gate` | 人机协同 | prev_output | approval |
-| `branch` | 条件分支 | prev_output | next_node_id |
-| `http` | 通用 HTTP | url, payload | response |
-| `persona_train_avatar` | 视觉微调 | samples, base_avatar_id | new_avatar |
-| `persona_train_voice` | 声音微调 | samples, base_voice_id | new_voice |
-| `persona_train_style` | 人设 SFT | samples, base_persona | new_persona |
-| `persona_train_knowledge` | 知识索引 | corpus_ids | new_knowledge |
-| `sample_filter` | 样本筛选 | samples, base_version | filtered_samples |
-| `identity_anchor` | 锚点抽取 | new_assets | embeddings |
-| `consistency_eval` | 漂移评估 | new_assets, base_version | consistency_report |
-| `publish_or_rollback` | 发布决策 | consistency_report | new_version_id \| drift_report |
+| 类型 | 描述 | 用于 |
+|------|------|------|
+| `llm` | LLM 调用（chat / SFT） | 脚本生成 |
+| `voice` | TTS 合成 | 渲染 |
+| `avatar_image` | 关键帧生成 | 渲染 |
+| `video` | 图生视频 | 渲染 |
+| `lipsync` | 口型同步 | 渲染 |
+| `asset_search` | 资产检索 | 渲染 |
+| `composer` | 后期合成 | 渲染 |
+| `encode` | 转封装 | 渲染 |
+| `gate` | 人机协同 | 渲染（可选） |
+| `branch` | 条件分支 | 通 |
+| `http` | 通用 HTTP | 通 |
+| `sample_filter` | 样本筛选 | 训练 |
+| `persona_train_avatar` | 视觉微调 | 训练 |
+| `persona_train_voice` | 声音微调 | 训练 |
+| `persona_train_style` | 人设 SFT | 训练 |
+| `persona_train_knowledge` | 知识索引重建 | 训练 |
+| `identity_anchor` | 锚点抽取 | 训练 |
+| `consistency_eval` | 漂移评估 | 训练 |
+| `publish_or_rollback` | 发布决策 | 训练 |
 
 ---
 
 ## 4. 节点执行器
 
-```python
-class NodeExecutor(Protocol):
-    def execute(self, ctx: NodeContext) -> NodeResult: ...
-    def resume(self, ctx: NodeContext, cached: NodeResult) -> NodeResult: ...
+```rust
+#[async_trait]
+trait NodeExecutor: Send + Sync {
+    fn kind(&self) -> &'static str;
+    async fn execute(&self, ctx: &NodeContext) -> Result<NodeResult>;
+    async fn resume(&self, ctx: &NodeContext, cached: &NodeResult) -> Result<NodeResult>;
+}
 
-@dataclass
-class NodeContext:
-    job_id: str
-    node_id: str
-    inputs: dict[str, Any]
-    config: dict
-    trace: TraceSpan
-    cancel_token: CancelToken
+struct NodeContext {
+    job_id: String,
+    node_id: String,
+    inputs: Value,
+    config: Value,
+    cancel: CancellationToken,
+}
 
-@dataclass
-class NodeResult:
-    outputs: dict[str, Any]
-    artifacts: list[Artifact]
-    metrics: dict
-    next_hint: list[str] | None
+struct NodeResult {
+    outputs: Value,
+    artifacts: Vec<ArtifactRef>,     // 文件路径（相对 PersonaVersion.dir 或 media dir）
+    metrics: Value,
+    next_hint: Option<Vec<String>>,
+}
 ```
 
 ---
 
 ## 5. 状态持久化
 
-每个 Job 在数据库持久化：
+每个 Job 落 SQLite `job_steps` 表：
 
 ```sql
 CREATE TABLE job_steps (
-    id           UUID PRIMARY KEY,
-    job_id       UUID NOT NULL,
+    id           TEXT PRIMARY KEY,
+    job_id       TEXT NOT NULL,
     node_id      TEXT NOT NULL,
-    status       TEXT NOT NULL,        -- pending/running/succeeded/failed/skipped
+    status       TEXT NOT NULL,    -- pending/running/succeeded/failed/skipped
     attempt      INT DEFAULT 1,
-    inputs       JSONB,
-    outputs      JSONB,
-    artifacts    JSONB,
-    error        JSONB,
-    started_at   TIMESTAMPTZ,
-    finished_at  TIMESTAMPTZ,
+    inputs_json  TEXT,
+    outputs_json TEXT,
+    artifacts_json TEXT,
+    error_json   TEXT,
+    started_at   TEXT,
+    finished_at  TEXT,
     duration_ms  INT,
     trace_id     TEXT
 );
 ```
 
-- 节点开始时：`status=running, started_at=now()`
-- 节点成功：`status=succeeded, outputs=..., finished_at=now()`
-- 节点失败：`status=failed, error=..., attempt++`
-- 节点恢复：检查上一 attempt 的 `outputs` 是否可用
+> 渲染的中间产物按惯例写到 `~/.local/share/avc/cache/jobs/{job_id}/`；最终成功才落到 `media/jobs/{job_id}/`。  
+> 训练中间产物直接写到**新版本目录**（`personas/pm_xxx/v(N+1)/...`）；不达标清掉整个目录。
 
 ---
 
 ## 6. 重试与容错
 
-### 6.1 重试策略
-- 默认：3 次，指数退避（1s / 4s / 16s）
-- 可针对节点类型覆盖（如 i2v 限速，重试 5 次）
-- 死信：超过重试上限 → 标记 `failed` 并触发告警
+### 6.1 重试
+- 默认 3 次，指数退避 1s / 4s / 16s
+- 节点级可覆盖（如 i2v 限速可设 5 次）
+- 超过阈值标 `failed`，等待用户 `retry` 或自动回退（训练 DAG）
 
 ### 6.2 降级
-- 主 Provider 失败 → 切备 Provider
-- 例如：`kling` 失败 → `cogvideox`
-- 通过 Provider 注册 + 路由表实现
+- 主 Provider 失败 → 切备选（注册到 `Model Gateway`）
+- 例：`kling` 失败 → `cogvideox`
 
-### 6.3 断点续跑
-- 重启后扫描 `job_steps` 中 `succeeded` 的节点 → 直接复用 `outputs`
-- 仅重跑 `pending / running / failed` 节点
+### 6.3 续跑
+- 进程重启扫描 `job_steps`，把 `running → pending`，复用 `succeeded` 节点的 outputs
+- 渲染 DAG 中 `succeeded` 的中间产物已在 `cache/` 目录，路径写在 `artifacts_json`
 
 ---
 
 ## 7. 调度器
 
-### 7.1 调度流程
-
+### 7.1 流程
 ```
-入队 (queued)
-   │
-   ▼
-资源检查 ──▶ 等待 GPU 配额 ──▶ 进入 running
-   │
-   ▼
-取下一个 ready 节点（依赖已满足）
-   │
-   ▼
-提交到 worker（按节点类型路由到 worker pool）
-   │
-   ▼
-监听结果 ──▶ 推进 / 失败重试 / 完成
+enqueue
+  ▼
+ready 节点（依赖满足）
+  ▼
+提交 worker pool（按 kind 路由）
+  ▼
+完成 → 推进 / 失败重试 / 完成
 ```
 
-### 7.2 调度策略
-- **FIFO**：默认
-- **优先级**：VIP 租户优先
-- **抢占**：高优任务可抢占低优 worker（K8s 配合）
-- **公平**：每租户最少 1 worker 槽位
-- **训练任务独占**：同一 persona 不并发训练
+### 7.2 策略
+- 内存优先；Phase 1 引入 Redis/Kafka 队列（如需多机）
+- 训练任务独占（同 persona 不并发）
+- 多 persona 并行；按用户公平
 
-### 7.3 Worker 路由
+### 7.3 资源池（Phase 1 引入）
+| 节点 | 池 |
+|------|----|
+| `llm`, `persona_train_style` | llm-pool |
+| `voice`, `persona_train_voice` | tts-pool |
+| `avatar_image`, `persona_train_avatar` | img-pool |
+| `video` | video-pool |
+| `lipsync` | lipsync-pool |
+| `consistency_eval`, `identity_anchor` | eval-pool |
+| `compose`, `encode` | compose-pool |
 
-| 节点类型 | Worker 池 |
-|----------|----------|
-| `llm` | llm-pool（CPU） |
-| `voice` | tts-pool（GPU/CPU） |
-| `avatar_image` | img-pool（GPU） |
-| `video` | video-pool（GPU） |
-| `lipsync` | lipsync-pool（GPU） |
-| `persona_train_avatar` | train-pool（GPU） |
-| `persona_train_voice` | train-pool（GPU） |
-| `persona_train_style` | llm-pool（CPU/GPU） |
-| `consistency_eval` | eval-pool（GPU） |
-| `compose / encode` | compose-pool（CPU） |
+> Phase 0 在主进程内用 tokio task 跑就够了。
 
 ---
 
 ## 8. 可观测性
 
 每个节点自动注入：
+- **结构化日志**：`tracing` JSON，字段含 `trace_id` / `tenant_id` / `persona_model_id` / `job_id`
+- **可选 OTel**：通过 `tracing-opentelemetry` 导出（不默认开）
+- **事件流**：`node.succeeded` / `node.failed` 写 SQLite 事件表，外部 collect
 
-- **Trace Span**：`job_id.node_id.attempt`
-- **Metrics**：`node_duration_seconds{node, status}`, `node_failure_total{node, reason}`
-- **Logs**：结构化 JSON，含 trace_id、tenant_id、job_id、persona_model_id
-- **事件**：`node.succeeded` / `node.failed` 入事件流
-
-集成 OpenTelemetry，可导出到 Jaeger / Tempo。
+> 不做 dashboard。日志由用户导到自己的 Loki / ES。
 
 ---
 
-## 9. 引擎实现建议
+## 9. 引擎实现
 
 ### 9.1 起步（自研）
-- DAG 解析：JSON Schema 校验
-- 调度器：基于 Redis 的轻量队列
-- 状态：PostgreSQL
-- 估算：千级并发任务内可承载
+- DAG：JSON / YAML 解析为内部 IR
+- 调度：tokio task + in-memory state
+- 估算：单用户千级并发内可行
 
-### 9.2 演进（Temporal / Argo）
-- 当并发 > 1 万或跨服务编排复杂时迁移
-- 迁移时仅替换引擎实现，DAG 描述保持兼容
+### 9.2 演进（可选）
+- 当并发 > 1 万或需要跨进程时，引 Temporal / 自研 Redis 队列
+- 替换只动调度层，DAG 描述不变
 
 ---
 
 ## 10. 关键指标
 
-- 调度延迟：节点 ready → 提交 worker ≤ 500ms（P95）
-- 节点成功率：≥ 98%
-- 端到端成功率：≥ 95%
-- 训练 DAG 单次 ≤ 30 min（P95，视觉 / 声音）
-- 渲染 DAG 单次 ≤ 8 min（P95，60s 成片）
+- 调度延迟：节点 ready → 提交 worker ≤ 500 ms（P95）
+- 节点成功率 ≥ 98%
+- 端到端成功率 ≥ 95%
+- 训练 DAG：单维度 P95 ≤ 30 min
+- 渲染 DAG：60s 成片 P95 ≤ 8 min
 
 ---
 
 ## 11. 上下游
 
 - **被调用方**：[persona-modeling.md](./persona-modeling.md)、[persona-evolution.md](./persona-evolution.md)、[video-generation.md](./video-generation.md)
-- **基础设施依赖**：对象存储、向量库、消息队列、PostgreSQL、Redis
+- **基础设施**：SQLite、文件缓存、Provider HTTP 客户端

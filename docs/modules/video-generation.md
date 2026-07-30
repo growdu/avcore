@@ -1,6 +1,6 @@
 # 模块设计：视频生成（Video Generation）
 
-> 用一个**人物角色模型（指定版本）** + 脚本 + 渲染选项，产出最终视频。它是演进的"消费者"——直接消费 `PersonaModelVersion` 的不可变快照，避免受后续训练影响。
+> 用一个**人物角色模型（指定版本）** + 脚本 + 渲染选项，产出最终视频。它是演进的"消费者"——直接消费 `PersonaModelVersion` 的不可变目录，避免受后续训练影响。
 
 ---
 
@@ -10,141 +10,135 @@
 - `persona_model_id` + `version_id`（不指定 = 当前默认版本）
 - `Script`（含分镜）+ 渲染选项
 
-**输出**：
-- 完整视频文件（mp4）
-- 封面图（cover.jpg）
-- 字幕（subtitle.srt）
-- 元数据（meta.json：所用 persona version、所有节点 trace_id、provider 版本、参数快照）
+**输出**（落 `~/.local/share/avc/media/jobs/{job_id}/`）：
+- `final.mp4`
+- `cover.jpg`
+- `subtitle.srt`
+- `meta.json` —— **包含 `persona_version_id` 与所有 provider 快照参数**
 
-**边界**：复用已有的 persona 资产快照；视频生成过程不会反向污染 persona 模型。
+**边界**：复用 persona 资产；视频生成过程不污染 persona 模型。
 
 ---
 
 ## 2. 数据契约
 
-```python
-@dataclass
-class Scene:
-    idx: int
-    narration: str                   # 旁白文本
-    visual_prompt: str               # 画面描述
-    avatar_action: str | None        # 表情 / 动作描述
-    duration_ms: int
-    emotion: str = "neutral"
-    motion_strength: float = 0.5
-    camera: str = "medium"
-    ref_image_hint: str | None = None
+```rust
+struct Scene {
+    idx: u32,
+    narration: String,
+    visual_prompt: String,
+    avatar_action: Option<String>,
+    duration_ms: u32,
+    emotion: String,
+    motion_strength: f32,
+    camera: String,
+    ref_image_hint: Option<String>,
+}
 
-@dataclass
-class Script:
-    id: str
-    persona_model_id: str
-    persona_version_id: str          # 锁定的版本，生成时不再变动
-    topic: str
-    template_id: str | None
-    scenes: list[Scene]
-    bgm_id: str | None
-    style_overrides: dict
-    duration_ms: int
-    created_at: datetime
+struct Script {
+    id: String,
+    persona_model_id: String,
+    persona_version_id: u32,         // 锁定，生成时不再变动
+    topic: String,
+    template_id: Option<String>,
+    scenes: Vec<Scene>,
+    bgm_id: Option<String>,
+    style_overrides: Value,
+    duration_ms: u32,
+    created_at: DateTime<Utc>,
+}
 
-@dataclass
-class VideoJob:
-    id: str
-    script_id: str
-    persona_model_id: str
-    persona_version_id: str          # 锁定，永不因 persona 后续训练而漂移
-    status: str                      # queued/running/succeeded/failed/cancelled
-    progress: float
-    options: JobRenderOptions
-    artifacts: dict                  # 产物 URL 集合
-    error: dict | None
-    created_at: datetime
-    finished_at: datetime | None
+struct VideoJob {
+    id: String,
+    script_id: String,
+    persona_model_id: String,
+    persona_version_id: u32,         // 锁定，永不漂移
+    status: JobStatus,
+    progress: f32,
+    options: JobRenderOptions,
+    artifacts: Artifacts,
+    error: Option<JobError>,
+    created_at: DateTime<Utc>,
+    finished_at: Option<DateTime<Utc>>,
+}
 
-@dataclass
-class JobRenderOptions:
-    resolution: str = "1080p"        # 720p / 1080p / 4k
-    aspect_ratio: str = "16:9"
-    fps: int = 30
-    enable_subtitle: bool = True
-    subtitle_style: dict | None = None
-    enable_bgm: bool = True
-    enable_watermark: bool = True
-    enable_intro: bool = False
-    enable_outro: bool = False
-    priority: int = 5                # 1~10
-    webhook_url: str | None = None
-    extra: dict
+struct JobRenderOptions {
+    resolution: String,              // 720p / 1080p / 4k
+    aspect_ratio: String,
+    fps: u32,
+    enable_subtitle: bool,
+    subtitle_style: Option<Value>,
+    enable_bgm: bool,
+    enable_watermark: bool,
+    priority: u8,                    // 1~10
+    webhook_url: Option<String>,
+    extra: Value,
+}
 ```
 
-> `persona_version_id` 必须显式记录在脚本与任务上。即使后续 persona 模型训练到 v5，已经渲染完成的视频也永远锁死在当时的 v1/v2/v3。
+> `persona_version_id` 必须显式记录。即使后续 persona 训练到 v5，已渲染视频永远锁死在当时的版本。
 
 ---
 
 ## 3. 端到端流水线
 
 ```
-Script（绑定 persona_version_id）
+Script（已绑定 persona_version_id）
   │
   ▼
-[1] 脚本预处理     —— 校验、合规审核、人机协同（可选编辑）
+[1] 脚本预处理     ── 校验、合规审核、人工编辑（可选）
   │
   ▼
-[2] 旁白 TTS       —— 逐 Scene 合成音轨；调用该 version 的 voice 快照
-  │                   并发
+[2] 旁白 TTS       ── 调用 vN.voice
+  │                  并发（按 Scene 分片）
   ▼
-[3] BGM 匹配       —— 按场景情绪推荐 / 选择 BGM
+[3] BGM 匹配       ── 按场景情绪选
   │
   ▼
-[4] 关键帧生成     —— 复用该 version 的 avatar 快照，IP-Adapter / lora
-  │                   并发
-  ▼
-[5] 图生视频       —— 每 Scene 出 5~10s 视频片段
-  │                   并发
-  ▼
-[6] 口型同步       —— 音视频对齐（可选；商用数字人可跳过）
+[4] 关键帧生成     ── 复用 vN.avatar
   │
   ▼
-[7] 后期合成       —— 拼接、转场、字幕烧录、BGM 混音
+[5] 图生视频 (i2v) ── Kling / CogVideoX / AnimateDiff
   │
   ▼
-[8] 封装输出       —— 转封装、生成封面、生成预览 GIF、写入 persona_version_id 印记
+[6] 口型同步       ── wav2lip / SadTalker（商用数字人可跳）
   │
   ▼
-final.mp4 + cover.jpg + subtitle.srt + meta.json
+[7] 后期合成       ── 拼接、字幕、BGM、水印
+  │
+  ▼
+[8] 封装输出       ── 写 media/jobs/{job_id}/ + meta.json（含 version）
 ```
 
-详细节点说明见 [pipeline.md](./pipeline.md)。
+详细节点 / 调度见 [`pipeline.md`](./pipeline.md)。
 
 ---
 
 ## 4. 脚本生成
 
 ### 4.1 输入
-- `persona_model_id` + `version_id`（决定人设 / 知识 / 风格 prompt）
-- `topic` + `key_points` + `target_duration` + `template_id`
-- 可选：参考脚本（让 LLM 模仿风格）
+- `persona_model_id` + `version_id`
+- `topic` + `key_points` + `target_duration` + 可选模板
 
 ### 4.2 Prompt 组装
 ```text
-[系统] 你是分镜师，根据"主题"和"知识点"生成分镜。
+[系统] 你是一名分镜师，根据"主题"与"知识点"生成分镜。
 [角色人设] {persona_descriptor.traits, .tone, .catchphrases, .taboos, .scenario_prompts}
-[领域知识] {retrieved_chunks}        # 仅当 knowledge 已绑定
+[领域知识] {retrieved_chunks}    # 仅当 knowledge 已绑定
 [主题] {topic}
 [关键点] {key_points}
-[时长] {target_duration} 秒
+[时长] {target_duration} s
 [景别偏好] {camera_pref}
 [输出 JSON Schema] {schema}
 ```
 
 ### 4.3 后处理
 - 校验：每 Scene 时长之和 = 总时长 ± 10%
-- 拆分：单 Scene > 15s 时强制拆分为多 Scene
-- 兜底：LLM 输出非法 → 用模板生成
+- 拆分：单 Scene > 15s 强制拆分
+- 兜底：LLM 输出非法 → 用模板
 
 ### 4.4 人机协同
-- 脚本生成后返回给开发者，可编辑后再触发渲染
+- 脚本生成后返回给开发者，可 `avc render script edit --patch ...` 编辑后再渲染
 - 编辑以 JSON Patch 提交，保留 diff
 - 编辑后调用渲染时仍使用同一 `persona_version_id`
 
@@ -152,108 +146,106 @@ final.mp4 + cover.jpg + subtitle.srt + meta.json
 
 ## 5. 音频生成（TTS）
 
-### 5.1 调用
-- `voice.synthesize(voice_id, text, ssml)` —— `voice_id` 取自 `PersonaModelVersion.voice_id`
-- SSML 标记：情绪、停顿、重音、语速
-
-### 5.2 并发
-- 每 Scene 一个 TTS 任务，并发执行
-- 单段最大长度 300 字符，超长自动切分
-
-### 5.3 时间戳
-- 输出 `word_timestamps` / `sentence_timestamps` 用于字幕
+- `voice.synth(voice_id, text, ssml)` —— `voice_id` 取自该版本的 voice 资产
+- SSML：情绪、停顿、重音、语速
+- 每 Scene 并发；> 300 字自动切分
+- 输出 `word_timestamps` 用于字幕对齐
 
 ---
 
 ## 6. 画面生成
 
 ### 6.1 关键帧
-- 文生图：`prompt = scene.visual_prompt + persona.style_prompt`
-- 一致性：复用 `PersonaModelVersion.avatar.face_id / lora / instantid`
-- **不再读 `PersonaModel` 的当前默认版本**：永远读锁定的快照
+- 复用 `personas/pm_xxx/vN/avatar/` 下所有资产
+- face_id / LoRA / InstantID 由 Provider 自动应用
+- **永远读快照**，绝不读"当前默认版本"
 
-### 6.2 图生视频（i2v）
+### 6.2 图生视频
 - 输入：关键帧 + 音频（驱动口型）
-- 模型：Kling / 可灵 / AnimateDiff / CogVideoX
-- 时长：5s 起步，可拼接至目标时长
+- 模型：Kling / CogVideoX / HunyuanVideo
+- 默认 5s 起步，可拼接
 
 ### 6.3 商用数字人替代
-- 当 `PersonaModelVersion` 标记 `mode=digital_human` 时，直接调用 HeyGen / D-ID / 商汤如影
-- 跳过关键帧 + i2v，只做 TTS + 厂商渲染
+- 当 `PersonaVersion.mode = digital_human` 时，直接调用 HeyGen / D-ID / 商汤如影
+- 跳过关键帧 + i2v
 
 ---
 
-## 7. 口型同步
+## 7. 后期合成
 
-- 工具：wav2lip / video-retalking / SadTalker
-- 适用：自托管视频路径
-- 不适用：商用数字人（厂商已自带）
-
----
-
-## 8. 后期合成
-
-```python
-def compose(scenes: list[SceneClip], bgm: Audio, options: JobRenderOptions) -> Video:
-    timeline = concat(scenes, transitions=auto_transition(scenes))
-    if options.enable_subtitle:
-        timeline = burn_subtitle(timeline, scenes, options.subtitle_style)
-    if options.enable_bgm:
-        timeline = mix_bgm(timeline, bgm, volume=0.15)
-    if options.enable_watermark:
-        timeline = overlay_watermark(timeline, options.tenant_watermark)
-    return encode(timeline, resolution=options.resolution, fps=options.fps)
-```
-
-转场策略：按 Scene 情绪自动选 fade / cut / slide。
-
----
-
-## 9. 接口
-
-```http
-POST   /v1/scripts                       生成分镜
-PUT    /v1/scripts/{id}                  编辑分镜
-GET    /v1/scripts/{id}                  查询
-
-POST   /v1/jobs                          创建渲染任务
-GET    /v1/jobs/{id}                     查询
-GET    /v1/jobs/{id}/steps               任务步骤
-GET    /v1/jobs/{id}/artifacts           产物列表
-POST   /v1/jobs/{id}/cancel              取消
-POST   /v1/jobs/{id}/retry               重试
-POST   /v1/jobs/{id}/rerender-scene      重渲染某个 Scene
-POST   /v1/jobs/{jid}/feedback           用户反馈（触发 persona 回灌，见 evolution）
-```
-
-### 9.1 创建 Job 样例
-
-```http
-POST /v1/jobs
-{
-  "script_id": "scr_xxx",
-  "options": {
-    "resolution": "1080p",
-    "aspect_ratio": "16:9",
-    "enable_subtitle": true,
-    "enable_bgm": true,
-    "webhook_url": "https://example.com/cb"
-  }
+```rust
+fn compose(scenes: Vec<SceneClip>, bgm: Audio, opts: &JobRenderOptions) -> Video {
+    let mut tl = concat(scenes, transitions=auto_transition(&scenes));
+    if opts.enable_subtitle { tl = burn_subtitle(tl, &scenes); }
+    if opts.enable_bgm      { tl = mix_bgm(tl, &bgm, vol=0.15); }
+    if opts.enable_watermark{ tl = overlay_wm(tl, &opts.tenant_wm); }
+    encode(tl, opts.resolution, opts.fps)
 }
 ```
 
-> version 来源：脚本已绑定 `persona_version_id`，渲染时无需再次指定。
+转场策略：按 Scene 情绪自动 fade / cut / slide。
 
-### 9.2 返回
+---
+
+## 8. CLI 用法
+
+```bash
+avc render video \
+  --persona lily \
+  --version 2 \
+  --topic "牛顿第一定律" \
+  --key-points "定义,示例,应用" \
+  --duration 60 \
+  --resolution 1080p \
+  --webhook https://example.com/cb
+
+avc job show job_xxx --watch
+
+# 产物
+avc job open job_xxx     # 用文件管理器打开产物目录
+cat media/jobs/job_xxx/meta.json | jq .
+```
+
+`meta.json` 例：
 
 ```json
 {
   "job_id": "job_xxx",
-  "status": "queued",
-  "persona_model_id": "...",
-  "persona_version_id": "pmod_xxx_v2",
-  "estimated_seconds": 240
+  "persona_model_id": "pm_01H...",
+  "persona_version_id": 2,
+  "topic": "牛顿第一定律",
+  "duration_ms": 60000,
+  "providers": {
+    "tts": { "name": "cosyvoice", "version": "v0.6" },
+    "video": { "name": "kling", "version": "v1.2" }
+  },
+  "render_options": { ... },
+  "created_at": "...",
+  "finished_at": "..."
 }
+```
+
+---
+
+## 9. 接口（程序化）
+
+虽然 AVCore 是 CLI 优先，但仍提供 Rust crate 给上层集成：
+
+```rust
+use avc::{Avc, Model, RenderOptions};
+
+let avc = Avc::open_default()?;                    // ~/.local/share/avc
+let model = avc.persona("lily")?.version(2)?;
+let job = avc.render().video(
+    &model,
+    &RenderOptions::default()
+        .topic("牛顿第一定律")
+        .key_points(["定义", "示例", "应用"])
+        .duration(Duration::from_secs(60))
+).await?;
+
+let result = job.wait().await?;
+println!("mp4: {}", result.video_path);
 ```
 
 ---
@@ -262,75 +254,38 @@ POST /v1/jobs
 
 ```
 queued ──▶ running ──┬──▶ succeeded
-                     ├──▶ failed ──▶ (retry) ──▶ queued
+                     ├──▶ failed ──▶ retry ──▶ queued
                      └──▶ cancelled
 ```
 
-- `queued`：等待资源
-- `running`：至少一个 step 在执行
-- `succeeded`：所有 step 成功
-- `failed`：任一关键 step 失败且重试耗尽
-- `cancelled`：用户主动取消
+- `succeeded` / `failed` / `cancelled` 都写 `meta.json`（含 reason）
 
 ---
 
-## 11. 进度与回调
+## 11. 与持续演进的关系
 
-### 11.1 进度数据
-```json
-{
-  "job_id": "job_xxx",
-  "persona_version_id": "pmod_xxx_v2",
-  "progress": 0.45,
-  "current_step": "i2v",
-  "step_progress": {
-    "script_gen": 1.0, "tts": 1.0, "img_gen": 1.0, "i2v": 0.5, "compose": 0.0
-  },
-  "eta_seconds": 120
-}
-```
-
-### 11.2 通道
-- **Webhook**：完成 / 失败时 POST
-- **WebSocket**：实时进度流
-- **SSE**：服务端推送
-- **轮询**：`GET /v1/jobs/{id}`
+| 场景 | 行为 |
+|------|------|
+| 用户对成片反馈"不像本人" | `avc job feedback` → 进 `persona_samples` → 下次 evolve 自动消费 |
+| persona 已升级到 v5 | 已渲染视频继续绑其 v1/v2/v3，不重新生成 |
+| 想用最新效果 | 新建脚本时不传 `--version`（走默认） |
+| 想做 A/B | `--versions 3,4 --ab-ratio 50/50`（Phase 2 支持） |
 
 ---
 
-## 12. 性能与优化
+## 12. 关键指标
 
-- **节点级并发**：TTS / img_gen / i2v 全部并行
-- **缓存**：相同（persona_version_id + script_hash）命中复用
-- **渐进式输出**：先生成低清预览，再异步升级高清
-- **分片渲染**：长视频分片并行，最后合并
-- **GPU 池化**：Kling / 视频模型独立池
-
----
-
-## 13. 关键指标
-
-- 60s 视频端到端 P95 ≤ 8 分钟
+- 60s 视频端到端 P95 ≤ 8 min
 - 渲染成功率 ≥ 95%
-- 字幕对齐误差 ≤ 200ms
+- 字幕对齐误差 ≤ 200 ms
 - 口型同步相似度 ≥ 0.80
 
 ---
 
-## 14. 与演进的关系
-
-| 场景 | 行为 |
-|------|------|
-| 用户对成片点"不像本人" | `/v1/jobs/{id}/feedback` 写入 `SampleFeedback`，由 evolution 模块决定是否回灌为 PersonaSample |
-| persona 已升级到 v5 | 已生成的视频继续绑定其 v1/v2/v3，不重新生成 |
-| 用户想用最新效果出片 | 新建脚本时显式 `version_id=current` |
-
----
-
-## 15. 上下游
+## 13. 上下游
 
 - **上游**：
-  - [persona-modeling.md](./persona-modeling.md) / [persona-evolution.md](./persona-evolution.md) 提供 `PersonaModel + version`
+  - [persona-modeling.md](./persona-modeling.md) / [persona-evolution.md](./persona-evolution.md) 提供 persona + version
   - [knowledge-aspect.md](./knowledge-aspect.md) 提供检索召回
-  - [pipeline.md](./pipeline.md) 提供任务编排
-- **下游**：业务系统消费产物；用户反馈回灌到 evolution
+  - [pipeline.md](./pipeline.md) 提供编排
+- **下游**：CLI / crate 消费产物；用户反馈回灌到 evolution
