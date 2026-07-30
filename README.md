@@ -35,6 +35,33 @@ avc render run --persona yu --version 1 --topic "InnoDB Buffer Pool"  # [集成]
 
 avc shell                                          # 交互模式：可输自然语言
 avc ask --yes "把 Yu 的 traits 改成严谨务实"          # 非交互 NL：管道里用
+
+## 当前实现状态（Phase 0）
+
+```text
+✓ CLI 三入口路由（CLI / Shell / ask）
+✓ SQLite 单一数据库 + schema 迁移
+✓ persona CRUD：create / list / show / versions
+✓ iterate apply（refine：纯 SQL UPDATE，80% 路径）
+✓ finetune start + publish（含漂移兜底 / DELETE 整行事务回退）
+✓ job create / list / show
+✓ render run（出 job_id）
+✓ Provider trait + Mock 实现（无 token 也能跑通流程）
+✓ 7 个集成测试通过
+✗ 真实 Provider 实现（kling / openai / elevenlabs 等）— Phase 1+
+✗ Shell 内 NL 解析（需先配 provider.llm）— Phase 1+
+✗ DAG 引擎真调 Provider SFT 端点 — Phase 1+
+```
+
+## 本地构建
+
+```bash
+cargo build --release            # 单二进制 ./target/release/avc
+cargo test                       # 7 个集成测试
+./target/debug/avc init          # 初始化 ~/.local/share/avc/avc.db
+./target/debug/avc persona create --name yu --archetype db_kernel_expert
+./target/debug/avc iterate apply yu --version 1 --set-persona '{"traits":["严谨","务实"]}'
+```
 ```
 
 > `avc` 三种入口：**精确 CLI**（`avc persona list`）、**交互式 Shell**（`avc shell`，可输入自然语言）、**非交互式 NL**（`avc ask "..."`）。底层 = 原子命令 + 集成命令。详见 [`docs/cli.md`](docs/cli.md) 与 [`docs/shell.md`](docs/shell.md)。

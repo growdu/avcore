@@ -42,3 +42,8 @@ logs/
 /tmp/
 *.tmp
 *.bak
+
+
+# Added by cargo
+
+/target
