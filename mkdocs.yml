@@ -1,0 +1,101 @@
+site_name: AVCore
+site_description: 面向开发者的纯后端 AI 视频生成核心框架
+site_author: AVCore Team
+
+repo_name: growdu/avcore
+repo_url: https://github.com/growdu/avcore
+edit_uri: edit/main/docs/
+
+docs_dir: docs
+site_dir: site
+
+use_directory_urls: true
+strict: false
+
+theme:
+  name: material
+  language: zh
+  features:
+    - navigation.instant
+    - navigation.tracking
+    - navigation.tabs
+    - navigation.sections
+    - navigation.indexes
+    - navigation.top
+    - navigation.footer
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+    - content.code.annotate
+    - content.tabs.link
+    - content.action.edit
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-7
+        name: 切换到深色模式
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-4
+        name: 切换到浅色模式
+  icon:
+    repo: fontawesome/brands/github
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - def_list
+  - footnotes
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.details
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.tasklist:
+      custom_checkbox: true
+  - pymdownx.tilde
+  - pymdownx.caret
+  - pymdownx.keys
+  - pymdownx.mark
+  - pymdownx.emoji:
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
+
+plugins:
+  - search:
+      lang: zh
+
+nav:
+  - 首页: README.md
+  - 设计文档: design.md
+  - 架构文档: architecture.md
+  - 子模块设计:
+      - 模块索引: modules/README.md
+      - 人物形象建模: modules/character-modeling.md
+      - 角色养成: modules/character-cultivation.md
+      - 专家养成: modules/expert-cultivation.md
+      - 视频生成: modules/video-generation.md
+      - 工作流编排: modules/pipeline.md
+  - API 概览: api/README.md
+
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/growdu/avcore

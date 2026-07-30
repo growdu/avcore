@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# 测试 / 覆盖率
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# 环境 / 密钥
+.env
+.env.local
+*.pem
+*.key
+
+# MkDocs 构建产物
+/site/
+
+# 日志
+*.log
+logs/
+
+# 临时文件
+/tmp/
+*.tmp
+*.bak
