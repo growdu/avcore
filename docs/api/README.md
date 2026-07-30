@@ -30,10 +30,10 @@ for p in avc.personas().list()? {
 
 // 创建 persona
 let task = avc.personas().create(CreateSpec {
-    name: "Lily".into(),
-    archetype: Some("mentor".into()),
+    name: "Yu".into(),
+    archetype: Some("db_kernel_expert".into()),
     avatar: AvatarSpec {
-        description: "30 岁东亚女性，温和笑容".into(),
+        description: "数据库内核领域讲师".into(),
         style_tags: vec!["写实".into(), "教学".into()],
         ref_images: vec!["./samples/ref_1.png".into()],
         ..Default::default()
@@ -49,8 +49,8 @@ let task = avc.personas().create(CreateSpec {
     },
     persona_descriptor: PersonaDescriptor {
         traits: vec!["耐心".into(), "严谨".into(), "幽默".into()],
-        tone: "温和".into(),
-        catchphrases: vec!["来，我们一步步看".into()],
+        tone: "严谨".into(),
+        catchphrases: vec!["我们直接看源码".into()],
         taboos: vec!["绝对化表述".into()],
         formality: 0.6,
         temperature: 0.7,
@@ -77,7 +77,7 @@ let result = train.wait().await?;     // -> TrainingOutcome::Published | RolledB
 let job = avc.render().video(RenderSpec {
     persona_id: persona.id.clone(),
     version: 2,
-    topic: "牛顿第一定律".into(),
+    topic: "InnoDB Buffer Pool 替换算法".into(),
     key_points: vec!["定义".into(), "示例".into(), "应用".into()],
     duration: Duration::from_secs(60),
     options: JobRenderOptions::default(),
@@ -250,7 +250,7 @@ avc.providers().avatar().register("my_avatar", Arc::new(MyAvatarProvider));
 }
 ```
 
-`avc persona evolve lily --scope persona` 时会调 `llm.sft`（与 `llm.chat` 区分）：
+`avc persona evolve yu --scope persona` 时会调 `llm.sft`（与 `llm.chat` 区分）：
 ```json
 {
   "name": "openai_compat",
@@ -317,7 +317,7 @@ avc.providers().avatar().register("my_avatar", Arc::new(MyAvatarProvider));
 ---
 
 
-## 8. 存储 Provider（可选 / Phase 2）
+## 8. 存储 Provider（默认不开 / Phase 2+）
 
 ```json
 {
@@ -333,7 +333,7 @@ avc.providers().avatar().register("my_avatar", Arc::new(MyAvatarProvider));
 }
 ```
 
-Phase 0 / 1 默认本地文件系统。
+**默认推荐：本地文件系统**（参见 [`../storage.md`](../storage.md)）。本节描述的是当本地空间不足 / 团队多机时的可选方案。
 
 ---
 
@@ -366,8 +366,8 @@ CLI 错误格式：
 
 ```
 error[E0403]: persona_not_found
-  target: lily
-  hint: did you mean "Lily" (capital L)?
+  target: yu
+  hint: did you mean "Yu" (capital L)?
   doc: https://avc.dev/docs/cli/errors#E0403
 ```
 

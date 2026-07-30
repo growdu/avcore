@@ -157,8 +157,8 @@ Prompt 拼装：
 绑定/解绑命令：
 
 ```bash
-avc persona knowledge bind lily --corpus corpus_xxx --domain "高中物理"
-avc persona knowledge unbind lily
+avc persona knowledge bind yu --corpus corpus_xxx --domain "数据库内核"
+avc persona knowledge unbind yu
 ```
 
 ---
@@ -167,23 +167,23 @@ avc persona knowledge unbind lily
 
 ```bash
 # 创建语料
-avc corpus new --name "高中物理" --source-type upload --uri ./physics.md
+avc corpus new --name "数据库内核" --source-type upload --uri ./physics.md
 
 # 追加 chunk
 avc corpus chunks add corpus_xxx --from ./chunks.jsonl
 
 # 检索（试运行）
-avc corpus search corpus_xxx --query "牛顿第一定律"
+avc corpus search corpus_xxx --query "InnoDB Buffer Pool 替换算法"
 
 # 重建索引（在绑定/解绑失败时用）
 avc corpus reindex corpus_xxx
 
 # 试运行问答
-avc persona knowledge ask lily --query "..."
+avc persona knowledge ask yu --query "..."
 
 # 绑 / 解
-avc persona knowledge bind lily --corpus corpus_xxx --domain "高中物理"
-avc persona knowledge unbind lily
+avc persona knowledge bind yu --corpus corpus_xxx --domain "数据库内核"
+avc persona knowledge unbind yu
 ```
 
 ---

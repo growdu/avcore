@@ -193,9 +193,9 @@ fn compose(scenes: Vec<SceneClip>, bgm: Audio, opts: &JobRenderOptions) -> Video
 
 ```bash
 avc render video \
-  --persona lily \
+  --persona yu \
   --version 2 \
-  --topic "牛顿第一定律" \
+  --topic "InnoDB Buffer Pool 替换算法" \
   --key-points "定义,示例,应用" \
   --duration 60 \
   --resolution 1080p \
@@ -215,7 +215,7 @@ cat media/jobs/job_xxx/meta.json | jq .
   "job_id": "job_xxx",
   "persona_model_id": "pm_01H...",
   "persona_version_id": 2,
-  "topic": "牛顿第一定律",
+  "topic": "InnoDB Buffer Pool 替换算法",
   "duration_ms": 60000,
   "providers": {
     "tts": { "name": "cosyvoice", "version": "v0.6" },
@@ -237,11 +237,11 @@ cat media/jobs/job_xxx/meta.json | jq .
 use avc::{Avc, Model, RenderOptions};
 
 let avc = Avc::open_default()?;                    // ~/.local/share/avc
-let model = avc.persona("lily")?.version(2)?;
+let model = avc.persona("yu")?.version(2)?;
 let job = avc.render().video(
     &model,
     &RenderOptions::default()
-        .topic("牛顿第一定律")
+        .topic("InnoDB Buffer Pool 替换算法")
         .key_points(["定义", "示例", "应用"])
         .duration(Duration::from_secs(60))
 ).await?;

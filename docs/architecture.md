@@ -116,7 +116,7 @@ sequenceDiagram
     participant LP as llm Provider
     participant ST as storage (SQLite + FS)
 
-    U->>PS: avc persona new "Lily" --from sample.toml
+    U->>PS: avc persona new "Yu" --from sample.toml
     PS->>PS: 解析 + 校验输入
     PS->>ST: 预创建 personas/pm_xxx/v1/<br/>(空目录 + manifest.status=building)
     PS->>TS: 创建 task_tsk_xxx (running)
@@ -202,9 +202,9 @@ flowchart TB
 
 | 流程 | 触发命令 | 起始数据 | 产物 |
 |------|----------|----------|------|
-| 创建 v1 | `avc persona new "Lily" --from ./samples.toml` | 设定 + 样本 | `personas/pm_xxx/v1/` + SQLite row |
-| 持续训练 | `avc persona evolve lily --scope voice --add ./new.wav` | 样本池 | `personas/pm_xxx/v2/` (or rollback) |
-| 出片 | `avc render video --persona lily --topic "..."` | topic + 锁定 version | `media/jobs/job_xxx/final.mp4` |
+| 创建 v1 | `avc persona new "Yu" --from ./samples.toml` | 设定 + 样本 | `personas/pm_xxx/v1/` + SQLite row |
+| 持续训练 | `avc persona evolve yu --scope voice --add ./new.wav` | 样本池 | `personas/pm_xxx/v2/` (or rollback) |
+| 出片 | `avc render video --persona yu --topic "..."` | topic + 锁定 version | `media/jobs/job_xxx/final.mp4` |
 | 反馈回灌 | `avc job feedback job_xxx --signal looks_unlike` | 反馈 | `persona_samples(kind=feedback)` |
 
 ### 4.1 流程 A：创建 PersonaModel v1
@@ -213,7 +213,7 @@ flowchart TB
 
 ```mermaid
 flowchart TB
-    A["avc persona new 'Lily' --from ./samples.toml"] --> B{input 校验}
+    A["avc persona new 'Yu' --from ./samples.toml"] --> B{input 校验}
     B -->|failed| ER1[返回 invalid_input]
     B -->|ok| C[预创建 v1 目录<br/>manifest.status=building]
     C --> D[avatar Provider<br/>create(spec)]
@@ -263,7 +263,7 @@ sequenceDiagram
     participant EP as embed Provider<br/>(identity_anchor)
     participant ST as storage
 
-    U->>EV: avc persona evolve lily --scope avatar,voice<br/>--base-version 1 --anchors ./canary/<br/>--threshold 0.85
+    U->>EV: avc persona evolve yu --scope avatar,voice<br/>--base-version 1 --anchors ./canary/<br/>--threshold 0.85
     EV->>SM: 列 sample_ids by version_id_at_collection + scope
     SM-->>EV: N 个样本
     EV->>EV: 预创建 personas/pm_xxx/v2/ (空)
@@ -280,7 +280,7 @@ sequenceDiagram
         PL->>ST: 拷贝/写所有 v2 资产 + manifest.json
         PL->>ST: SQLite: persona_versions +1, training_jobs.status=succeeded
         PL-->>EV: published v2
-        EV-->>U: 训练报告 + 提示 "avc persona current lily --set 2"
+        EV-->>U: 训练报告 + 提示 "avc persona current yu --set 2"
     else drift detected
         PL->>ST: 删除 personas/pm_xxx/v2/ 整个目录
         PL->>ST: SQLite: training_jobs.status=failed_drift, drift_report_json=...
@@ -365,7 +365,7 @@ sequenceDiagram
     participant IV as video Provider
     participant ST as storage
 
-    U->>RS: avc render video --persona lily --version 2 --topic "牛顿第一定律"
+    U->>RS: avc render video --persona yu --version 2 --topic "InnoDB Buffer Pool 替换算法"
     RS->>ST: 读 personas/pm_xxx/v2/<br/>锁 version=2
     RS->>PL: 提交 DAG video.render.v1<br/>job_id=job_xxx
     PL->>LP: LLM 脚本生成 (system prompt from persona + RAG)
@@ -436,12 +436,12 @@ sequenceDiagram
     participant PS as persona-svc
     participant ST as storage (SQLite)
 
-    U->>PS: avc persona current lily --set 3
+    U->>PS: avc persona current yu --set 3
     PS->>ST: UPDATE persona_models<br/>SET current_version=3
     PS->>U: ok
     Note over U,ST: 后续任务默认用 v3；<br/>已渲染视频仍绑 v1/v2<br/>(Job 表 persona_version 字段不变)
 
-    U->>PS: avc persona deprecated lily --version 1
+    U->>PS: avc persona deprecated yu --version 1
     PS->>ST: UPDATE persona_versions<br/>SET status='deprecated' WHERE version=1
     PS->>U: ok
     Note over U,ST: v1 不再被默认选中<br/>但不删，已渲染的仍能溯源
@@ -502,6 +502,10 @@ flowchart LR
 ---
 
 ## 6. 信息存储（重点：本框架怎么存）
+
+> **一句话**：元数据进 SQLite（avc.db），二进制进本地文件系统（`~/.local/share/avc/`）。  
+> 默认**不**接对象存储——除非容量 / 跨机需求到了临界点（参见 [`storage.md §0`](./storage.md)）。
+
 
 ### 6.1 文件系统布局（graph）
 
@@ -734,7 +738,7 @@ flowchart LR
 - `avc persona new` 跑通：v1 生成（avatar / voice / persona 全部 token API）
 - `avc render video` 跑通：1 条视频（脚本 + tts + i2v + compose，全部远端 API）
 - 不做版本管理（先用 `current_version = 1`）
-- 验收：`avc persona new Lily → avc render video --persona lily --topic hi` 出一个能看的 mp4
+- 验收：`avc persona new Yu → avc render video --persona yu --topic hi` 出一个能看的 mp4
 
 ### Phase 1 — Provider 矩阵 + 持续训练（8 周）
 - 形象（商用）：kling_avatar / heygen_avatar / doubao_image / seedream
@@ -747,7 +751,7 @@ flowchart LR
 - 反馈回灌（手动 + 自动）
 
 ### Phase 2 — 可选插件能力（4 周）
-- `avc storage plugin install s3`（对象存储备份）
+- **对象存储插件**（`avc storage plugin install s3`）—— 默认仍推荐本地 FS，本插件只在空间 / 共享成为瓶颈时启用
 - OpenTelemetry 可选导出
 - 训练并行（同 persona 多 base / 多 worker）
 - 评测集 / canary 样本管理

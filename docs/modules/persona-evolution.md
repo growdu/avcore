@@ -171,9 +171,9 @@ struct VersionMetrics {
 
 ### 7.3 切版本 / A/B / 回滚
 ```bash
-avc persona current lily --set 3               # 单一默认
-avc persona ab lily --versions 2,3 --ratio 70/30   # A/B 灰度
-avc persona current lily --set 1               # 一行回滚
+avc persona current yu --set 3               # 单一默认
+avc persona ab yu --versions 2,3 --ratio 70/30   # A/B 灰度
+avc persona current yu --set 1               # 一行回滚
 ```
 回滚 = 指针回拨，不删任何数据。
 
@@ -202,21 +202,21 @@ avc persona current lily --set 1               # 一行回滚
 
 ```bash
 # 1. 追加样本
-avc persona sample add lily \
+avc persona sample add yu \
   --kind audio \
   --uri ./new_voice.wav \
   --duration-ms 60000 \
   --text "..." \
   --consent ./auth.pdf
 
-avc persona sample add lily \
+avc persona sample add yu \
   --kind image \
   --uri ./new_view.png \
   --tags side,neutral \
   --consent ./auth.pdf
 
 # 2. 启动训练
-avc persona evolve lily \
+avc persona evolve yu \
   --scope avatar,voice,persona \
   --base-version 2 \
   --anchors ./samples/canary/ \
@@ -258,10 +258,10 @@ avc training report task_xxx --json
 ## 10. 样本治理
 
 ```bash
-avc persona sample list lily --kind audio
+avc persona sample list yu --kind audio
 avc persona sample rm sample_01H...
 avc persona sample consign sample_01H...    # 标金丝雀（必须不漂移）
-avc persona sample stats lily               # 数量 / 质量 / 标签分布
+avc persona sample stats yu               # 数量 / 质量 / 标签分布
 ```
 
 入库前必跑校验：

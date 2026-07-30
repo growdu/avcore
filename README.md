@@ -83,19 +83,19 @@ cd avcore && cargo build --release
 
 # 开始
 avc init                                  # 初始化 ~/.local/share/avc/
-avc persona new "Lily" --from samples/    # 创建 persona v1
-avc persona show lily                     # 查看
-avc persona evolve lily --add voice.wav   # 追加样本，再训练
-avc render video --persona lily --topic "..."
+avc persona new "Yu" --from samples/    # 创建 persona v1
+avc persona show yu                     # 查看
+avc persona evolve yu --add voice.wav   # 追加样本，再训练
+avc render video --persona yu --topic "..."
 ```
 
 也可进入交互式：
 
 ```bash
 avc repl
-> persona new "Lily" --from ./samples
-> persona evolve lily --add ./new-voice.wav
-> render video --persona lily --topic "..."
+> persona new "Yu" --from ./samples
+> persona evolve yu --add ./new-voice.wav
+> render video --persona yu --topic "..."
 > exit
 ```
 

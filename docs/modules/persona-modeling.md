@@ -164,7 +164,7 @@ struct IdentityAnchor {
 ## 6. 创建流程
 
 ```
-$ avc persona new "Lily" --from ./persona.toml
+$ avc persona new "Yu" --from ./persona.toml
         │
         ▼
 [1] 校验输入（consent、文件存在、维度齐全）
@@ -266,13 +266,13 @@ LLM 调用走 `llm.openai_compat` Provider（兼容 OpenAI / 豆包 / DeepSeek /
 ## 11. CLI 接口
 
 ```bash
-avc persona new "Lily" \
-  --description "30 岁东亚女性，温和笑容，教学型主播" \
+avc persona new "Yu" \
+  --description "数据库内核领域讲师，数据库内核专家" \
   --avatar-style 写实,教学 \
   --avatar-refs ./samples/ref_*.png \
   --voice-samples ./samples/voice_*.wav \
   --persona-traits 耐心,严谨,幽默 \
-  --persona-catchphrase "来，我们一步步看" \
+  --persona-catchphrase "我们直接看源码" \
   --from ./persona.toml         # 或显式参数
 
 # 任务查询

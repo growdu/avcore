@@ -1,8 +1,97 @@
 # 人物形象资产存储格式（Persona Asset Storage）
 
+# 人物形象资产存储格式（Persona Asset Storage）
+
 > **核心关注**：AVCore 把"一个人物角色模型的某个版本"以**不可变目录**的形式落到本地文件系统中——这既是运行时的真相来源，也是版本可回滚的基础。本文件描述这个目录布局，以及每种资产的存储约定。
 
 > 这份规范有约束力。所有 Provider 实现必须按这个布局写入，反序列化时也按这个读取。
+
+---
+
+## 0. 为什么这样存？—— 三种方案对比
+
+> 在动手前先把这条逻辑讲清楚：AVCore 不用对象存储，也**不**把数据全塞 SQLite，更**不**只放文件系统，而是 **SQLite 管元数据 + 本地 FS 管二进制**。这是经过权衡后对"CLI 优先、单用户 / 小团队、本地优先"最合适的方案。
+
+### 0.1 候选方案
+
+| 方案 | 元数据 | 二进制 | 优点 | 缺点 |
+|------|--------|--------|------|------|
+| A. 全 SQLite | 库内 | BLOB 字段 | 单文件；强一致 | 单文件膨胀到 30~500 GB 后备份 / VACUUM / 锁都变痛；每读一次 BLOB 都拉整行；并发写遭锁 |
+| B. 全 FS（含 JSON） | JSON 文件 | 同目录 | 易 `tar`、易 `git diff`；不上 SQLite 也行 | 缺索引——"找版本 v3 那 6 个分镜"要 `find + grep` 全目录；缺事务；多表 join 难做 |
+| C. **SQLite + 本地 FS（采用）** | SQLite | 文件系统 | 元数据可索引可查询；二进制走 FS（原子替换、便宜备份）；符合"事实源 ↔ 索引库"模式 | 两边要同步（`avc verify` 自动校验） |
+| D. 对象存储（S3 / OSS） | 随你 | 远端 | 跨机共享；冷归档；理论上无限容量 | 每次访问多一跳网络；token 配置；**对单用户是过度设计** |
+
+### 0.2 为什么不用"全 SQLite"
+
+技术上 SQLite 支持大 BLOB，但工作量级一旦上去就**真的不行**。一个 Yu（数据库内核专家）的 v1 大致是：
+
+```
+avatar/primary.png       ~  2 MB
+avatar/views/ × 6        ~ 12 MB
+avatar/lora/ref.json     ~  1 KB
+voice/sample.wav 60s     ~ 10 MB
+voice/embed.bin          ~  1 KB
+persona.json + manifest  ~  1 KB
+identity_anchor.json     ~  1 KB
+knowledge/chunks/embed…  ~ 10 MB（仅 metadata, 真实向量可能更大）
+                       ──────────
+~ 35 MB / version
+```
+
+20 个 persona × 5 版本 ≈ **3.5 GB**——还能撑；  
+100 个 persona × 10 版本 ≈ **35 GB**——SQLite 文件没大问题，但 `VACUUM` 重写整库要好几分钟；  
+**1000 个 persona × 10 版本 ≈ 350 GB**——`avc verify` 全表 SUM 一次 = 噩梦；备份一次 = 网络瓶颈。
+
+更要命的是**写入语义**：BLOB 替换走 `UPDATE`，事务会持有整个 row 的锁；多人或并发任务下会互相等。把"原子替换 = tmp 文件 + rename"挪到 FS，几 GB 也不掉链子。
+
+### 0.3 为什么不全 FS（连元数据也 JSON）
+
+JSON + 文件树很美——`cat personas/pm_xxx/v1/manifest.json` 直接可读，`git diff` 友好。但缺一个东西：**索引**。
+
+- "列出所有 persona"
+- "找 v3 一致性 < 0.85 的训练任务"  
+- "按 `kind=audio` 列出某 persona 的样本"
+- "计算 `persona_samples` 总占用、做去重"
+
+全 FS 实现这些意味着每次 `walk_dir + parse_json`，5 个文件还好，5 万个时延秒级。SQLite 的索引就是为了替代这种 `walk` 模式。
+
+### 0.4 为什么**不**默认用对象存储
+
+对象存储（S3 / OSS / GCS）很有用，但**对本框架默认用户场景是过度设计**：
+
+- **目标场景**：单开发者 / 小团队在自己机或自己服务器上跑 persona
+- **痛点不在容量**：本地 1~2 TB 已经够；上 10 TB 才考虑迁移
+- **痛点不在跨机**：真有跨机需求，`avc export` 打 `tar.zst` 比挂对象存储便宜得多
+- **多一跳网络**：每次 `ls` 资产目录都用 HTTP 拿 presigned URL，根本不值得
+- **配置负担**：bucket / IAM / region / CORS / lifecycle——和"5 分钟跑出一个 Yu"的目标矛盾
+
+所以对象存储作为**可选插件**挂在 Phase 2 之后，而不是默认。下表是升级到对象存储的判断标准：
+
+| 信号 | 行为 |
+|------|------|
+| 本机可用 < 200 GB / 备份耗时长 / 团队 ≥ 3 人 | 考虑接对象存储 |
+| 单人 / 单机 / 总资产 < 200 GB | 继续本地 FS，不动 |
+| 需要跨 region 容灾 | 适合对象存储 + WAL |
+
+### 0.5 落地结论
+
+```
+            元数据（账本 / 索引 / 事务）                   二进制（图 / 音 / 上传样本）
+            ────────────────────────────                  ─────────────────────────────
+落点         SQLite（avc.db）                              本地文件系统（~.local/share/avc/...）
+引擎         rusqlite + bundled                           tokio fs / sync fs
+原子替换    单文件 SQLite 备份 / 热拷贝                        tmp file + rename
+可移植       整个 avc.db                                          整个目录树
+强制校验     avc verify（sha256 vs manifest）                avc verify
+
+二者关系：
+   · persona_versions.dir_path  ←─指向──→  ~/.local/share/avc/personas/<id>/v<N>/
+   · 写新版本 → 落新目录 + SQLite 增 row
+   · 删数据   → 改 SQLite + rm 目录（不可变原则下基本不删）
+   ·          avc verify 全量扫，sha256 不匹配即报 asset_corrupted
+```
+
+> 一句话：**"SQLite 提供索引，FS 提供容量，二者通过 dir_path + sha256 双向验证。"**
 
 ---
 
@@ -177,12 +266,12 @@ graph TD
 ```json
 {
   "schema_version": 1,
-  "name": "Lily",
-  "archetype": "mentor",
-  "description": "温和、严谨的物理讲师",
+  "name": "Yu",
+  "archetype": "db_kernel_expert",
+  "description": "数据库内核专家，严谨务实、注重源码与性能数据",
   "traits": ["耐心", "严谨", "幽默"],
-  "tone": "温和",
-  "catchphrases": ["来，我们一步步看"],
+  "tone": "严谨",
+  "catchphrases": ["我们直接看源码"],
   "taboos": ["绝对化表述", "医学诊断"],
   "scenario_prompts": {
     "teach": "请用通俗语言讲解，避免未定义术语",
@@ -241,7 +330,7 @@ if cos < threshold: drift_detected → rollback
 ### 7.2 删除策略
 - **永不物理删除**历史版本
 - 仅"停用"：把 `manifest.status` 改为 `deprecated`
-- 整个 persona 归档：`avc persona archive lily`，整个目录树加 `.archive` 后缀，30 天后由 `avc prune` 物理清理
+- 整个 persona 归档：`avc persona archive yu`，整个目录树加 `.archive` 后缀，30 天后由 `avc prune` 物理清理
 
 ### 7.3 大对象与加密
 - 形象参考图 / LoRA / 声音样本属于"敏感个人数据"

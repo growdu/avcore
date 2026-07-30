@@ -171,7 +171,7 @@ VideoJob ─── Script
 ## 4. 用例（典型场景）
 
 ### 4.1 案例 A：技术专家
-- v1：形象 + 声音 + 严谨人设 + 高中物理语料 → "高中物理讲解视频"
+- v1：形象 + 声音 + 严谨人设 + 数据库内核语料 → "数据库内核讲解视频"
 - v2：追加更高质量的题目语料 → 重建索引，知识更新
 - v3：根据完播率补开场白样本 → 人设微调
 
@@ -200,17 +200,17 @@ AVCore 暴露两种交互：
 
 ### 5.1 命令式 CLI
 ```bash
-avc persona new "Lily" --from ./samples.toml
-avc persona evolve lily --scope voice --add ./new.wav
-avc render video --persona lily --topic "..."
+avc persona new "Yu" --from ./samples.toml
+avc persona evolve yu --scope voice --add ./new.wav
+avc render video --persona yu --topic "..."
 ```
 
 ### 5.2 交互式 REPL
 ```bash
 avc repl
-> persona new "Lily"
-> evolve lily --add ./new.wav
-> render video --persona lily --topic "..."
+> persona new "Yu"
+> evolve yu --add ./new.wav
+> render video --persona yu --topic "..."
 ```
 
 详细命令 / 用法见 [`cli.md`](./cli.md)。
@@ -226,12 +226,12 @@ avc repl
 
 ### 6.1 首次创建 + 首次出片
 ```
-$ avc persona new "Lily" --from ./samples.toml
+$ avc persona new "Yu" --from ./samples.toml
   └─ persona-svc.create(v1)  ──▶  avatar ──▶ voice ──▶ persona (──▶ knowledge?)
   └─ identity_anchor_extract
   └─ 落盘 personas/pm_xxx/v1/
 
-$ avc render video --persona lily --topic "..."
+$ avc render video --persona yu --topic "..."
   └─ script_gen (LLM + RAG)
   └─ tts（v1.voice）
   └─ img_gen（v1.avatar）
@@ -241,8 +241,8 @@ $ avc render video --persona lily --topic "..."
 
 ### 6.2 持续训练闭环
 ```
-$ avc persona sample add lily --kind audio --uri ./new.wav ...
-$ avc persona evolve lily --scope voice --anchors ./canary/
+$ avc persona sample add yu --kind audio --uri ./new.wav ...
+$ avc persona evolve yu --scope voice --anchors ./canary/
 
   person-svc.evolve(v1 → v2)
   └─ sample_filter (quality / dedup / consent)
@@ -252,7 +252,7 @@ $ avc persona evolve lily --scope voice --anchors ./canary/
         ├─ yes → publish v2
         └─ no  → rollback + drift_report
 
-$ avc render video --persona lily --version 2 --topic "..."
+$ avc render video --persona yu --version 2 --topic "..."
   └─ 历史视频绑 v1 不变；新视频绑 v2
 ```
 
