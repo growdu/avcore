@@ -1,325 +1,717 @@
 # AVCore 架构文档（Architecture Document）
 
-> 回答"用什么技术、怎么组织代码、怎么打包、怎么演进"。配套设计文档 [`design.md`](./design.md)。
+> 回答"用什么技术、怎么组织、核心流程怎么跑、子模块怎么协作、信息怎么存"。配套设计文档 [`design.md`](./design.md)。
+
+> 📐 **本图多**——任何核心场景都至少配 2 张图（流程图 + 时序/状态/ER/gitgraph）。如果只想 5 分钟看懂全貌，跳到 §3 五个子模块 与 §4 核心流程。
 
 ---
 
-## 1. 一句话总结
+## 1. 一句话总结与强约束
 
-AVCore = **Rust 单二进制 CLI + 本地 SQLite + 本地文件系统 + 统一 DAG Pipeline + 一组 trait 化的 Provider 适配器**。
-**所有 Provider 都通过 token 鉴权调用商业 / 开源模型的 HTTP API；本框架不加载、不推理任何本地模型。**
+**AVCore = Rust 单二进制 + 本地 SQLite + 本地文件系统 + 统一 DAG Pipeline + 一组 trait 化的 Provider 适配器。**
+
+🔒 **强约束** —— AVCore **只调用商业 / 开源模型的 HTTP API（全部 token 鉴权），不加载、不推理任何本地模型**。每个 Provider 必须有 `api_key`；训练 / 微调都在远端完成，本框架只持有引用。
 
 不暴露 HTTP / gRPC 服务，不做 SaaS 控制台，不内嵌计费 / 可观测性 dashboard——把这些都交给外部系统。
-
-### 1.1 强约束
-
-> **AVCore 只调用模型 API，不调用本地模型。** 每个 Provider 必须有 `api_key`（或同义 token）字段。所有推理 / 训练 / 微调均在 Provider 端完成，本框架只负责编排、样本管理、版本管理、产物落盘。
-
-- ✅ 允许：商业 API（Kling / OpenAI / 豆包 / Doubao / 即梦 / 火山 / 阿里…）
-- ✅ 允许：通过商用 / 托管平台访问的开源模型（Replicate / Together / Hugging Face Inference API 等）
-- ❌ 禁止：自托管模型（`sdxl`、`cosyvoice`、`gpt-sovits`、本地 LLaMA 等）
-- ❌ 禁止：本地推理 / 本地 GPU / 本地权重加载
 
 ---
 
 ## 2. 顶层形态
 
-```
-┌──────────────────────────────────────────────────────────────────┐
-│  avc  (Rust 单二进制)                                              │
-│  ┌─────────────────────────────────────────────────────────────┐ │
-│  │  CLI (clap)       REPL (rustyline + completer)              │ │
-│  └─────────────────────────────────────────────────────────────┘ │
-│  ┌─────────────────────────────────────────────────────────────┐ │
-│  │  Core Services                                               │ │
-│  │   persona-svc  evolution-svc  script-svc  asset-svc           │ │
-│  │   pipeline-svc(DAG)  task-svc  job-svc                       │ │
-│  └─────────────────────────────────────────────────────────────┘ │
-│  ┌─────────────────────────────────────────────────────────────┐ │
-│  │  Provider Adapters  (trait + token 鉴权 HTTP 调用)            │ │
-│  │   avatar / voice / llm / video / knowledge / storage         │ │
-│  └─────────────────────────────────────────────────────────────┘ │
-│  ┌─────────────────────────────────────────────────────────────┐ │
-│  │  Storage Layer                                               │ │
-│  │   SQLite (rusqlite) + 文件系统 (tokio fs)                     │ │
-│  │   （存元数据 + 引用，**不存模型权重**）                        │ │
-│  └─────────────────────────────────────────────────────────────┘ │
-└─────────┬─────────────────────────┬────────────────────────────┘
-          │                         │
-          ▼                         ▼
-  ~/.local/share/avc/         商业 / 开源模型 API 端点
-  ├── avc.db                  ├── kling / openai / doubao / ...
-  ├── personas/pm_*/vN/...    ├── replicate / together / hf-inference / ...
-  ├── media/jobs/...          └── （每个端点都需要 api_key）
-  └── cache/...
+### 2.1 分层视图（flowchart）
 
-Provider 调用示意：
-        ┌────────────┐    POST /v1/chat     ┌─────────────┐
-        │  avc       ├─────────────────────▶│ OpenAI / 等 │
-        │  (无模型)    │   Authorization:    │             │
-        │            │     Bearer <token>   │             │
-        └────────────┘◀─────────────────────└─────────────┘
-```
+```mermaid
+flowchart TB
+    subgraph CLIENT["客户端"]
+        direction LR
+        cli["avc CLI<br/>avc 命令"]
+        repl["avc REPL<br/>交互 shell"]
+        lib["Rust crate<br/>(集成方)"]
+    end
 
-进程模型：**单进程多任务**——长任务走 tokio task，不起子进程（除非某个 Provider SDK 必须独立运行时）。
+    subgraph CORE["核心服务（单进程 tokio）"]
+        direction TB
+        persona["persona-svc<br/>建模/查询"]
+        evolution["evolution-svc<br/>训练/版本/漂移"]
+        render["render-svc<br/>脚本/出片"]
+        corpus["corpus-svc<br/>知识语料"]
+        pipeline["pipeline-svc<br/>DAG 调度"]
+        task["task / job-svc<br/>异步任务账本"]
+    end
 
----
+    subgraph PROV["Provider 适配器（trait）"]
+        direction TB
+        avatar["avatar<br/>kling/doubao/seedream/replicate"]
+        voice["voice<br/>elevenlabs/azure/doubao/openai"]
+        llm["llm<br/>openai_compat"]
+        video["video<br/>kling/seedance/pika/runway"]
+        embed["knowledge<br/>openai/cohere/volc"]
+    end
 
-## 3. Cargo Workspace
+    subgraph STORAGE["本地存储"]
+        direction TB
+        db[("SQLite<br/>avc.db")]
+        fs[/"FS<br/>~/.local/share/avc/"/]
+        cfg[/"avc.toml<br/>(token 加密)"/]
+    end
 
-```
-avcore/
-├── Cargo.toml                     # workspace
-├── crates/
-│   ├── avc/                       # 二进制入口：CLI + REPL
-│   ├── core/                      # 领域类型 + 服务 trait
-│   │   └── src/{persona, evolution, script, pipeline, asset, task}.rs
-│   ├── pipeline/                  # DAG 解析 / 调度 / 节点执行器
-│   ├── storage/                   # SQLite + 文件系统布局（参见 storage.md）
-│   │   └── src/{db.rs, fs.rs, migrations.rs}
-│   ├── providers/                 # trait 定义
-│   │   └── src/{avatar, voice, llm, video, knowledge}.rs
-│   ├── providers-impl/            # 具体实现（一个 Provider 一个文件）
-│   │   └── src/{sdxl, cosyvoice, kling, openai_compat, ...}.rs
-│   ├── renderer/                  # 视频渲染高层逻辑（合成/字幕/水印等）
-│   └── eval/                      # 漂移评估、评测集、canary 样本
-├── assets/
-│   └── providers/                 # 每个 provider 的 provider.json 示例
-├── docs/                          # 本文档站
-└── site/                          # mkdocs 构建产物
-```
+    subgraph EXTERNAL["远端模型 API"]
+        direction LR
+        kling[("Kling")]
+        openai[("OpenAI")]
+        doubao[("豆包 / 火山")]
+        replicate[("Replicate")]
+        other[("其他...")]
+    end
 
-### 关键依赖
+    cli --> persona
+    cli --> evolution
+    cli --> render
+    cli --> corpus
+    repl --> pipeline
+    lib --> pipeline
+    lib --> persona
 
-| Crate | 用途 |
-|-------|------|
-| `tokio` (full) | 异步运行时 |
-| `clap` | CLI 解析 |
-| `rustyline` | REPL |
-| `rusqlite` (bundled) | SQLite |
-| `reqwest` (rustls) | Provider HTTP 调用 |
-| `serde` / `serde_json` | 序列化 |
-| `tracing` + `tracing-subscriber` | 日志（可选 OTel 导出） |
-| `thiserror` / `anyhow` | 错误 |
-| `prometheus` / `tracing-opentelemetry` | 可选 |
-| `zstd` / `tokio-tar` | import/export 打包 |
+    persona --> pipeline
+    evolution --> pipeline
+    render --> pipeline
 
----
+    pipeline --> avatar
+    pipeline --> voice
+    pipeline --> llm
+    pipeline --> video
+    pipeline --> embed
 
-## 4. 技术选型
+    persona --> db
+    persona --> fs
+    evolution --> db
+    evolution --> fs
+    render --> db
+    render --> fs
+    corpus --> db
+    corpus --> fs
 
-| 维度 | 选型 | 理由 |
-|------|------|------|
-| 主语言 | **Rust** | 启动快、类型强、零外部依赖、单二进制；AI 主力语言虽在 Python，但 AVCore 不重算法重编排 |
-| 异步运行时 | tokio | 生态最广、Provider HTTP/WS 通杀 |
-| HTTP 客户端 | reqwest (rustls) | 跨平台无需 OpenSSL |
-| DB | SQLite (rusqlite, bundled) | 单文件、零运维、足够撑单租户 / 单团队 |
-| 对象存储 | 本地文件系统 → S3/OSS 通过 trait | 默认本地，可选迁移 |
-| CLI 框架 | clap v4 (derive) | 工业标准、文档自动生成 |
-| REPL | rustyline | 多行 + 历史 |
-| 日志 | tracing | 结构化、可选 OTel |
-| 可观测性 | 仅 tracing 日志；不内置 dashboard | 用户自行接 OTel collector |
-| Provider 集成 | trait + 仅 HTTP 调用 + token 鉴权；无本地推理 | 主仓不加载任何模型；所有能力由远端 API 完成 |
-
-> **故意不引入** Python 即使它是 AI 主力——AVCore 是**编排层**，算法侧已经在各家 Provider 内部，AVCore 只需要 HTTP 通它们。
-
----
-
-## 5. 数据模型（精简版）
-
-```sql
--- 顶层 persona
-CREATE TABLE persona_models (
-  id            TEXT PRIMARY KEY,
-  name          TEXT NOT NULL,
-  archetype     TEXT,
-  description   TEXT,
-  current_version INTEGER NOT NULL,
-  status        TEXT NOT NULL,
-  created_at    TEXT NOT NULL,
-  updated_at    TEXT NOT NULL
-);
-
--- 版本（不可变快照，账本）
-CREATE TABLE persona_versions (
-  persona_model_id TEXT NOT NULL,
-  version          INTEGER NOT NULL,
-  parent_version   INTEGER,
-  dir_path         TEXT NOT NULL,
-  status           TEXT NOT NULL,
-  training_job_id  TEXT,
-  manifest_json    TEXT NOT NULL,
-  created_at       TEXT NOT NULL,
-  PRIMARY KEY (persona_model_id, version)
-);
-
--- 训练样本池
-CREATE TABLE persona_samples (
-  id                       TEXT PRIMARY KEY,
-  persona_model_id         TEXT NOT NULL,
-  kind                     TEXT NOT NULL,
-  uri_or_text              TEXT,
-  version_id_at_collection INTEGER,
-  consent_proof            TEXT,
-  tags_json                TEXT,
-  quality_score            REAL,
-  created_at               TEXT NOT NULL
-);
-
--- 训练任务
-CREATE TABLE training_jobs (
-  id                   TEXT PRIMARY KEY,
-  persona_model_id     TEXT NOT NULL,
-  base_version         INTEGER NOT NULL,
-  target_version       INTEGER,
-  scope_json           TEXT NOT NULL,
-  config_json          TEXT,
-  status               TEXT NOT NULL,
-  result_version       INTEGER,
-  drift_report_json    TEXT,
-  started_at           TEXT,
-  finished_at          TEXT
-);
-
--- 渲染任务（绑定版本，不漂移）
-CREATE TABLE jobs (
-  id                  TEXT PRIMARY KEY,
-  script_id           TEXT,
-  persona_model_id    TEXT NOT NULL,
-  persona_version     INTEGER NOT NULL,
-  status              TEXT NOT NULL,
-  options_json        TEXT,
-  artifacts_json      TEXT,
-  created_at          TEXT,
-  finished_at         TEXT
-);
-
--- 知识语料（可选）
-CREATE TABLE knowledge_corpora ( id, name, source_type, language, chunk_count, index_version, ... );
-CREATE TABLE corpus_chunks ( id, corpus_id, ordinal, content, token_count, deprecated, meta_json );
+    avatar -.HTTP + Bearer.-> kling
+    avatar -.HTTP + Bearer.-> doubao
+    avatar -.HTTP + Bearer.-> replicate
+    voice -.HTTP + Bearer.-> openai
+    video -.HTTP + Bearer.-> kling
+    llm -.HTTP + Bearer.-> openai
+    embed -.HTTP + Bearer.-> openai
 ```
 
-完整布局见 [`storage.md §8`](./storage.md)。
+### 2.2 进程内协作（sequence）
 
----
+下面这张图展示一次 `avc persona new` 在**单进程内**跑过的所有 in-process 调用——尽管图中画了多个服务，实际都在同一进程、同一 tokio runtime 里。
 
-## 6. 模块边界
+```mermaid
+sequenceDiagram
+    autonumber
+    participant U as 用户 / CLI
+    participant PS as persona-svc
+    participant TS as task-svc
+    participant PL as pipeline-svc
+    participant AP as avatar Provider
+    participant VP as voice Provider
+    participant LP as llm Provider
+    participant ST as storage (SQLite + FS)
 
-| 模块 | 谁负责 | 不负责 |
-|------|--------|--------|
-| [persona-modeling](./modules/persona-modeling.md) | v1 创建 | 训练 / 渲染 |
-| [persona-evolution](./modules/persona-evolution.md) | 训练 / 版本 / 漂移兜底 | v1 创建、渲染 |
-| [video-generation](./modules/video-generation.md) | 出片 | 训练、人设设计 |
-| [pipeline](./modules/pipeline.md) | DAG 节点 / 调度 / 重试 / 断点 | 具体 Provider |
-| [knowledge-aspect](./modules/knowledge-aspect.md) | 语料 / RAG | 形象 / 声音 / 人设 |
-
----
-
-## 7. Provider 抽象
-
-> **每个 Provider 都是远端 API 客户端**——`api_key` 是必填，trait 方法都是 token 鉴权 HTTP 调用。本框架不持有任何模型权重，不本地推理。
-
-```rust
-#[async_trait]
-pub trait AvatarProvider: Send + Sync {
-    fn name(&self) -> &str;
-    /// 调用远端 API 创建形象。返回的 Avatar 是远端能力的引用（model_id / face_id）。
-    async fn create(&self, spec: &AvatarSpec) -> Result<Avatar>;
-    /// 调用远端 API 生成图。
-    async fn render(&self, avatar: &Avatar, prompt: &str, mot: &Motion) -> Result<Media>;
-    /// 调用远端 SFT/fine-tune 端点，提交样本集，**远端训练**，返回新模型引用。
-    async fn finetune(&self, base: &Avatar, samples: &[Sample], cfg: &TrainCfg) -> Result<Avatar>;
-}
-
-pub trait VoiceProvider {
-    /// 调用远端 API 克隆声音。
-    async fn clone(&self, samples: &[Audio]) -> Result<Voice>;
-    /// 调用远端 TTS 端点合成。
-    async fn synth(&self, voice: &Voice, text: &str, ssml: &Ssml) -> Result<Audio>;
-    /// 调用远端 SFT 端点增量训练，返回更新后的 voice_id。
-    async fn finetune(&self, base: &Voice, samples: &[Sample], cfg: &TrainCfg) -> Result<Voice>;
-}
-
-pub trait LlmProvider    { /* chat / sft (远端) */ }
-pub trait VideoProvider  { /* render (远端 i2v) */ }
-pub trait KnowledgeProvider { /* chunk / embed / search (远端) */ }
+    U->>PS: avc persona new "Lily" --from sample.toml
+    PS->>PS: 解析 + 校验输入
+    PS->>ST: 预创建 personas/pm_xxx/v1/<br/>(空目录 + manifest.status=building)
+    PS->>TS: 创建 task_tsk_xxx (running)
+    PS->>PL: 提交 DAG persona.create.v1
+    PL->>AP: create(spec)  [HTTP+token]
+    AP-->>PL: {avatar_ref, primary.png}
+    PL->>VP: clone(samples)  [HTTP+token]
+    VP-->>PL: {voice_ref, sample.wav, embed.bin}
+    PL->>LP: chat(extract persona)  [HTTP+token]
+    LP-->>PL: {persona_descriptor}
+    PL->>AP: 抽取 identity_anchor.face  [远端 embed]
+    PL->>VP: 抽取 identity_anchor.voice [远端 embed]
+    PL->>ST: 写 v1/avatar / v1/voice / v1/persona.json / v1/identity_anchor.json
+    PL->>ST: 落 manifest.json, status=ready
+    PL-->>PS: DAG 成功
+    PS->>TS: 标 task succeeded
+    PS->>ST: write SQLite persona_models + persona_versions
+    PS-->>U: 返回 persona_id + version=1
 ```
 
-每个 Provider 一份 `provider.json`：
+---
 
-```json
-{
-  "name": "kling_avatar",
-  "kind": "avatar",
-  "auth": { "scheme": "bearer", "env": "KLING_API_KEY", "config_key": "api_key" },
-  "endpoint": "https://api.kling.ai/v1/...",
-  "limits": { "max_refs": 6 }
-}
+## 3. 五个子模块
+
+| 子模块 | 主要服务 | 负责 | 不负责 |
+|--------|----------|------|--------|
+| [persona-modeling](./modules/persona-modeling.md) | `persona-svc` | PersonaModel v1 创建 | 训练、渲染 |
+| [persona-evolution](./modules/persona-evolution.md) | `evolution-svc` | 训练任务 / 版本管理 / 漂移兜底 | v1 创建、渲染 |
+| [video-generation](./modules/video-generation.md) | `render-svc` | 脚本 / DAG 出片 | 训练、人设设计 |
+| [pipeline](./modules/pipeline.md) | `pipeline-svc` | 节点编排 / 调度 / 重试 / 断点 | 具体 Provider 调用 |
+| [knowledge-aspect](./modules/knowledge-aspect.md) | `corpus-svc` | 语料 / RAG | 形象 / 声音 / 人设 |
+
+### 3.1 子模块依赖图（flowchart）
+
+```mermaid
+flowchart LR
+    PM[persona-modeling]
+    EV[persona-evolution]
+    VG[video-generation]
+    PL[pipeline]
+    KA[knowledge-aspect]
+
+    PL -->|"调度训练节点"| EV
+    PL -->|"调度渲染节点"| VG
+    PL -->|"调度建模节点"| PM
+    EV -->|"读样本池 + 写新版本"| ST[(storage)]
+    PM -->|"写 v1"| ST
+    VG -->|"读锁定 version<br/>写 media/jobs/"| ST
+    KA -->|"语料索引"| VG
+    KA -->|"训练时重建索引"| EV
+    EV -->|"反馈信号回流"| ST
 ```
 
-`auth` 字段描述：
-- `scheme`：`bearer`（默认） / `header:X-Custom` / `query` 等
-- `env`：token 来自环境变量（推荐）
-- `config_key`：也支持从 `avc.toml` 取（用 `secret: true` 标记加密存盘）
+### 3.2 单一子模块内部协作（以 evolution 为例）
 
-**所有 token 仅在内存中使用；日志中必须 mask。** `avc config show` 默认隐藏 secret。
+```mermaid
+flowchart TB
+    subgraph evolution["evolution-svc"]
+        EP[入口] --> SF[sample_filter]
+        SF -->|"scope=avatar"| AT[avatar_train 节点]
+        SF -->|"scope=voice"| VT[voice_train 节点]
+        SF -->|"scope=persona"| PT[persona_sft 节点]
+        SF -->|"scope=knowledge"| KR[knowledge_reindex 节点]
+        AT --> AN[anchor_extract]
+        VT --> AN
+        PT --> AN
+        KR --> AN
+        AN --> DE[drift_eval]
+        DE -->|"≥ threshold"| PUB[publish v(N+1)]
+        DE -->|"< threshold"| RB[rollback + drift_report]
+        PUB --> FS[(storage<br/>写入新目录)]
+        RB --> FS
+    end
+```
 
-新增 Provider = 新建 trait 实现 + 一个 `provider.json`；主仓无需修改。
-
-
----
-
-## 8. 单二进制设计的好处
-
-| 关心 | 体现 |
-|------|------|
-| 启动 | 亚秒级，REPL 交互不卡 |
-| 部署 | `cargo install avc` 完事；无 Docker 也能跑 |
-| 升级 | `avc self update`（后续） |
-| CI | 只测一个 binary |
-| 静态分发 | `--target x86_64-unknown-linux-musl` |
-
----
-
-## 9. DAG Pipeline
-
-统一的 DAG 模型同时支撑训练与渲染。节点元类型见 [`modules/pipeline.md`](./modules/pipeline.md)；节点类型新增例子：
-
-| 节点类型 | 用于 |
-|----------|------|
-| `script_gen`, `tts`, `img_gen`, `i2v`, `compose`, `encode` | 渲染 DAG |
-| `sample_filter`, `persona_train_avatar`, `persona_train_voice`, `anchor_extract`, `drift_eval`, `publish_or_rollback` | 训练 DAG |
-| `corpus_chunk`, `corpus_embed`, `corpus_index` | 知识重建 |
-
-调度：
-- 内存 + tokio task 即可起步（千级并发内）
-- 节点失败重试 + 节点结果落盘 → 进程重启后续跑
-- 节点完成事件写 SQLite `node_steps` 表
+> 其他子模块的内部结构见各自章节。下面把所有跨子模块的**用户场景**完整画出。
 
 ---
 
-## 10. 失败模式与恢复
+## 4. 核心流程
 
-| 场景 | 行为 |
-|------|------|
-| Provider 限速 | 切备 / 退避重试 / 失败入 `drift_report` |
-| 网络中断 | 节点 retry，超过阈值标 `failed` |
-| 磁盘满 | 写入前预检查；缺空间直接 abort |
-| 资产 sha 不匹配 | `asset_corrupted`，禁止用此版本渲染 |
-| 进程崩溃 | 启动时扫描 `node_steps`，把 `running → pending` 续跑 |
-| 版本漂移 | 训练任务自动回退到 base version + 报告 |
+下面四个流程构成 AVCore 的全部用户故事：
+
+| 流程 | 触发命令 | 起始数据 | 产物 |
+|------|----------|----------|------|
+| 创建 v1 | `avc persona new "Lily" --from ./samples.toml` | 设定 + 样本 | `personas/pm_xxx/v1/` + SQLite row |
+| 持续训练 | `avc persona evolve lily --scope voice --add ./new.wav` | 样本池 | `personas/pm_xxx/v2/` (or rollback) |
+| 出片 | `avc render video --persona lily --topic "..."` | topic + 锁定 version | `media/jobs/job_xxx/final.mp4` |
+| 反馈回灌 | `avc job feedback job_xxx --signal looks_unlike` | 反馈 | `persona_samples(kind=feedback)` |
+
+### 4.1 流程 A：创建 PersonaModel v1
+
+#### 4.1.1 逻辑流（flowchart）
+
+```mermaid
+flowchart TB
+    A["avc persona new 'Lily' --from ./samples.toml"] --> B{input 校验}
+    B -->|failed| ER1[返回 invalid_input]
+    B -->|ok| C[预创建 v1 目录<br/>manifest.status=building]
+    C --> D[avatar Provider<br/>create(spec)]
+    D --> E[voice Provider<br/>clone(samples)]
+    E --> F[llm Provider<br/>extract_persona]
+    F --> G{KnowledgeBinding?}
+    G -->|yes| H[corpus-svc: index chunks]
+    G -->|no| I[skip]
+    H --> J
+    I --> J
+    J[抽取 identity_anchor<br/>face/voice/style embedding] --> K[写 v1/avatar/voice/persona/identity_anchor]
+    K --> L[manifest.status=ready + 写 SQLite]
+    L --> M[任务 succeeded<br/>返回 persona_id]
+```
+
+#### 4.1.2 异常路径（flowchart）
+
+```mermaid
+flowchart TB
+    A["任一 Provider 失败"] --> B{kind?}
+    B -->|可重试<br/>网络/限速| C["retry 自动<br/>最多 N 次"]
+    C -->|"仍失败"| D[mark task failed]
+    B -->|不可重试<br/>输入/授权| D
+    B -->|Provider 限速且有备选| E["降级到备用 Provider<br/>(路由表)"]
+    E -->|"仍失败"| D
+    D --> F{keep_partials?}
+    F -->|true| G[保留 v1 目录中间产物<br/>供调试]
+    F -->|false 默认| H[删除 v1 目录<br/>+ SQLite rollback]
+    G --> I[avc task show task_xxx<br/>查看产物]
+    H --> I
+```
+
+### 4.2 流程 B：持续训练 v1 → v2
+
+#### 4.2.1 整体时序（sequence）
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant U as 用户
+    participant EV as evolution-svc
+    participant SM as sample pool (SQLite)
+    participant PL as pipeline-svc
+    participant AP as avatar Provider<br/>(SFT endpoint)
+    participant VP as voice Provider<br/>(SFT endpoint)
+    participant LP as llm Provider<br/>(SFT endpoint)
+    participant EP as embed Provider<br/>(identity_anchor)
+    participant ST as storage
+
+    U->>EV: avc persona evolve lily --scope avatar,voice<br/>--base-version 1 --anchors ./canary/<br/>--threshold 0.85
+    EV->>SM: 列 sample_ids by version_id_at_collection + scope
+    SM-->>EV: N 个样本
+    EV->>EV: 预创建 personas/pm_xxx/v2/ (空)
+    EV->>PL: 提交 DAG persona.train.v1<br/>job_id = tj_xxx
+    PL->>PL: 节点 sample_filter (去重 + 质检 + consent 校验)
+    PL->>AP: finetune(base_avatar_ref, samples) HTTP POST
+    AP-->>PL: 任务 ID + 长轮询 → { new_avatar_ref }
+    PL->>VP: finetune(base_voice_ref, samples) HTTP POST
+    VP-->>PL: 任务 ID + 长轮询 → { new_voice_ref }
+    PL->>EP: extract face/voice/style embedding
+    EP-->>PL: 新 anchor
+    PL->>PL: drift_eval (cos vs parent)
+    alt cos ≥ threshold
+        PL->>ST: 拷贝/写所有 v2 资产 + manifest.json
+        PL->>ST: SQLite: persona_versions +1, training_jobs.status=succeeded
+        PL-->>EV: published v2
+        EV-->>U: 训练报告 + 提示 "avc persona current lily --set 2"
+    else drift detected
+        PL->>ST: 删除 personas/pm_xxx/v2/ 整个目录
+        PL->>ST: SQLite: training_jobs.status=failed_drift, drift_report_json=...
+        PL-->>EV: rolled_back
+        EV-->>U: 失败 + drift_report<br/>(展示每个维度 cos 值)
+    end
+```
+
+#### 4.2.2 DAG 节点拓扑（flowchart）
+
+```mermaid
+flowchart LR
+    A[sample_filter] -->|"if scope=avatar"| B[avatar_train]
+    A -->|"if scope=voice"| C[voice_train]
+    A -->|"if scope=persona"| D[persona_sft]
+    A -->|"if scope=knowledge"| E[knowledge_reindex]
+    B --> F[anchor_extract]
+    C --> F
+    D --> F
+    E --> F
+    F --> G[drift_eval<br/>vs base]
+    G -->|"≥ threshold"| H[publish_or_rollback<br/>→ v2 ready]
+    G -->|"< threshold"| I[publish_or_rollback<br/>→ rollback]
+```
+
+#### 4.2.3 训练任务状态机
+
+```mermaid
+stateDiagram-v2
+    [*] --> queued
+    queued --> running: worker 接管
+    running --> succeeded: 漂移达标<br/>v(N+1) ready
+    running --> failed_drift: 漂移不达标<br/>触发回退
+    running --> failed: Provider 不可重试错误
+    running --> cancelled: 用户取消
+    failed --> queued: 用户 retry
+    failed_drift --> queued: 用户 collect 新样本后 retry
+    cancelled --> [*]
+    succeeded --> [*]
+    failed --> [*]
+    failed_drift --> [*]
+```
+
+#### 4.2.4 版本时间轴（gitgraph）
+
+```mermaid
+gitgraph
+    commit id: "v1<br/>initial"
+    commit id: "samples +n"
+    branch retry-1
+    commit id: "v2 candidate<br/>drift=0.79"
+    commit id: "rollback"
+    checkout main
+    commit id: "samples +m<br/>(canary)"
+    branch retry-2
+    commit id: "v2 candidate<br/>drift=0.92"
+    commit id: "publish v2"
+    checkout main
+    commit id: "samples +k"
+    branch alt
+    commit id: "v3 candidate<br/>drift=0.88"
+    commit id: "publish v3"
+    checkout main
+    commit id: "current=v3"
+```
+
+> 实际产品里 `current_version` 是 PersonaModel 的一个独立指针，可改回拨而不影响已渲染视频。
+
+### 4.3 流程 C：视频渲染
+
+#### 4.3.1 用户视角时序（sequence）
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant U as 用户
+    participant RS as render-svc
+    participant PL as pipeline-svc
+    participant LP as llm Provider
+    participant VP as voice Provider
+    participant AP as avatar Provider
+    participant IV as video Provider
+    participant ST as storage
+
+    U->>RS: avc render video --persona lily --version 2 --topic "牛顿第一定律"
+    RS->>ST: 读 personas/pm_xxx/v2/<br/>锁 version=2
+    RS->>PL: 提交 DAG video.render.v1<br/>job_id=job_xxx
+    PL->>LP: LLM 脚本生成 (system prompt from persona + RAG)
+    LP-->>PL: Script JSON
+    PL->>VP: tts(scene.batch) [并发]
+    VP-->>PL: audio + word_timestamps
+    PL->>AP: img_gen(scene.batch) [并发]
+    AP-->>PL: keyframes
+    PL->>IV: i2v(scene.batch) [依赖 tts+img]
+    IV-->>PL: clips
+    PL->>PL: lipsync + compose + encode
+    PL->>ST: 写 media/jobs/job_xxx/{final.mp4, cover.jpg, subtitle.srt, meta.json}
+    PL-->>RS: succeeded
+    RS-->>U: job_id + 产物路径
+```
+
+#### 4.3.2 DAG 节点拓扑（flowchart）
+
+```mermaid
+flowchart LR
+    SG[script_gen] --> SR{script_review<br/>人工门}
+    SR -->|"require_human_review=true"| HALT[暂停 等待人工]
+    SR -->|"默认 auto"| TT[tts]
+    SR --> BGM[bgm_select]
+    SG --> IMG[img_gen]
+    TT --> I2V[i2v]
+    IMG --> I2V
+    I2V --> LIP[lipsync<br/>数字人模态跳过]
+    BGM --> CMP[compose]
+    LIP --> CMP
+    CMP --> ENC[encode]
+    ENC --> OUT["media/jobs/job_xxx/<br/>final.mp4 + meta.json"]
+```
+
+#### 4.3.3 渲染任务状态机
+
+```mermaid
+stateDiagram-v2
+    [*] --> queued
+    queued --> running: worker 接管
+    running --> succeeded: 所有节点完成<br/>产物落盘
+    running --> failed: 关键节点失败<br/>重试耗尽
+    running --> partial: 节点失败但部分产物可用<br/>(avc job retry 自动重跑未完成节点)
+    running --> cancelled: 用户取消
+    failed --> queued: 用户 retry
+    partial --> running: 用户 retry
+    cancelled --> [*]
+    succeeded --> [*]
+    failed --> [*]
+```
+
+### 4.4 流程 D：反馈回灌
+
+```mermaid
+flowchart TB
+    U["avc job feedback job_xxx --signal looks_unlike"] --> RS[render-svc]
+    RS --> SM["persona_samples 表<br/>kind=feedback<br/>weight=1.0"]
+    SM -.->|"下次 evolve 自动消费"| EV[evolution-svc]
+    EV -.->|"漂移评估<br/>影响下次 v(N+1) 风格"| EVNEW[新版本]
+```
+
+### 4.5 流程 E：切版本 / 回滚 / A/B
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant U as 用户
+    participant PS as persona-svc
+    participant ST as storage (SQLite)
+
+    U->>PS: avc persona current lily --set 3
+    PS->>ST: UPDATE persona_models<br/>SET current_version=3
+    PS->>U: ok
+    Note over U,ST: 后续任务默认用 v3；<br/>已渲染视频仍绑 v1/v2<br/>(Job 表 persona_version 字段不变)
+
+    U->>PS: avc persona deprecated lily --version 1
+    PS->>ST: UPDATE persona_versions<br/>SET status='deprecated' WHERE version=1
+    PS->>U: ok
+    Note over U,ST: v1 不再被默认选中<br/>但不删，已渲染的仍能溯源
+```
 
 ---
 
-## 11. 打包与分发
+## 5. Provider 与 token 鉴权
 
-- 二进制：musl 静态链接，~ 30 MB
-- 镜像（可选）：`Dockerfile` 用 distroless 装二进制
-- Homebrew / scoop / cargo / apt 等由后续 CI 扩展；Phase 0 主打 `cargo install`
+### 5.1 鉴权流（sequence）
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant U as CLI
+    participant CFG as config-svc
+    participant TF as token preflight
+    participant PR as Provider Adapter
+    participant EXT as 远端 API
+
+    U->>CFG: avc config set provider.avatar.kling.api_key "klg_..."
+    CFG->>CFG: 加密落 avc.toml (chmod 600)
+    Note over U,CFG: 任何调用前先 preflight
+
+    U->>PR: 任意 Provider 调用
+    PR->>TF: preflight(provider_name)
+    TF->>CFG: 读 api_key
+    alt 缺失
+        TF-->>PR: Err(ProviderTokenMissing)
+        PR-->>U: error[E0501] provider_unauthenticated<br/>hint: avc config set ...
+    else 有
+        TF-->>PR: ok
+        PR->>EXT: HTTP POST {Bearer <token>}
+        EXT-->>PR: 200 / 401 / 429
+        alt 401/403
+            PR-->>U: error[E0502] provider_unauthorized<br/>(需重新生成 token)
+        else 429
+            PR->>PR: 退避重试 N 次
+        else 2xx
+            PR-->>U: 产物
+        end
+    end
+```
+
+### 5.2 Provider 路由降级（flowchart）
+
+```mermaid
+flowchart LR
+    CALL[Provider 调用] --> P1[kling_avatar 主]
+    P1 -->|失败 / 不可用| P2[heygen_avatar 备1]
+    P2 -->|失败| P3[doubao_image 备2]
+    P3 -->|失败| FAIL[failed: 标 task failed]
+    P1 -->|成功| OK[使用 P1 返回]
+```
+
+> Provider 注册到 `provider_registry`，`avc provider config` 可调整主/备顺序与启用列表。
 
 ---
 
-## 12. 关键技术决策（ADR 摘要）
+## 6. 信息存储（重点：本框架怎么存）
+
+### 6.1 文件系统布局（graph）
+
+```mermaid
+graph TD
+    ROOT["~/.local/share/avc/"]
+    ROOT --> DB[("avc.db (SQLite)")]
+    ROOT --> CFG["avc.toml (token 加密)"]
+    ROOT --> P_DIR["personas/"]
+    ROOT --> M_DIR["media/"]
+    ROOT --> C_DIR["cache/"]
+    ROOT --> L_DIR["logs/"]
+
+    P_DIR --> PM["pm_01HXXX/"]
+    PM --> V1["v1/<br/>(不可变快照)"]
+    PM --> V2["v2/<br/>(不可变快照)"]
+    PM --> V3["v3/<br/>(current)"]
+    PM --> ARC["archive/ (归档,<br/>不再被引用)"]
+
+    V1 --> MF1["manifest.json"]
+    V1 --> AV1["avatar/<br/>primary.png + views/ + ref/ + lora/ref.json"]
+    V1 --> VO1["voice/<br/>sample.wav + transcript.json + embed.bin + ref.json"]
+    V1 --> PD1["persona.json"]
+    V1 --> KA1["knowledge/ (可选)<br/>corpora/ + binding.json"]
+    V1 --> IA1["identity_anchor.json"]
+
+    V2 --> MF2["manifest.json"]
+    V2 --> AV2["avatar/ (新引用)"]
+    V2 --> VO2["voice/ (新引用)"]
+    V2 --> IA2["identity_anchor.json"]
+
+    M_DIR --> MJ["jobs/"]
+    MJ --> J1["job_01A/<br/>final.mp4 + cover.jpg<br/>subtitle.srt + meta.json"]
+    MJ --> J2["job_01B/..."]
+
+    C_DIR --> CJ["jobs/ (中间产物缓存)"]
+    L_DIR --> LA["audit.log (滚动)"]
+
+    classDef immutable fill:#e3f2fd,stroke:#1976d2
+    class V1,V2,V3,MF1,MF2,AV1,AV2,VO1,VO2,IA1,IA2,PD1,KA1 immutable
+```
+
+> **写 v(N+1) 即可；不修改 vN 中任何文件。** 详见 [`storage.md`](./storage.md)。
+
+### 6.2 SQLite Schema（erDiagram）
+
+```mermaid
+erDiagram
+    persona_models ||--o{ persona_versions : has
+    persona_models ||--o{ persona_samples : collects
+    persona_models ||--o{ training_jobs : trains
+    persona_versions ||--o{ training_jobs : produces
+    persona_versions ||--o{ jobs : locked_by
+    scripts ||--o{ jobs : executes
+    knowledge_corpora ||--o{ corpus_chunks : contains
+    knowledge_corpora ||--o{ persona_versions : bound_to
+
+    persona_models {
+        TEXT id PK
+        TEXT name
+        TEXT archetype
+        INTEGER current_version
+        TEXT status
+        DATETIME created_at
+        DATETIME updated_at
+    }
+
+    persona_versions {
+        TEXT persona_model_id PK
+        INTEGER version PK
+        INTEGER parent_version FK
+        TEXT dir_path
+        TEXT status
+        TEXT training_job_id FK
+        TEXT manifest_json
+        DATETIME created_at
+    }
+
+    persona_samples {
+        TEXT id PK
+        TEXT persona_model_id FK
+        TEXT kind  "image|audio|behavior_text|feedback"
+        TEXT uri_or_text
+        INTEGER version_id_at_collection
+        TEXT consent_proof
+        TEXT tags_json
+        REAL quality_score
+        DATETIME created_at
+    }
+
+    training_jobs {
+        TEXT id PK
+        TEXT persona_model_id FK
+        INTEGER base_version FK
+        INTEGER target_version
+        TEXT scope_json
+        TEXT config_json
+        TEXT status  "queued|running|succeeded|failed_drift|failed|cancelled"
+        INTEGER result_version FK
+        TEXT drift_report_json
+        DATETIME started_at
+        DATETIME finished_at
+    }
+
+    jobs {
+        TEXT id PK
+        TEXT script_id FK
+        TEXT persona_model_id FK
+        INTEGER persona_version FK
+        TEXT status
+        TEXT options_json
+        TEXT artifacts_json
+        DATETIME created_at
+        DATETIME finished_at
+    }
+
+    scripts {
+        TEXT id PK
+        TEXT persona_model_id FK
+        INTEGER persona_version FK
+        TEXT topic
+        TEXT scenes_json
+        DATETIME created_at
+    }
+
+    knowledge_corpora {
+        TEXT id PK
+        TEXT name
+        TEXT source_type
+        TEXT language
+        INTEGER chunk_count
+        INTEGER index_version
+        DATETIME created_at
+    }
+
+    corpus_chunks {
+        TEXT id PK
+        TEXT corpus_id FK
+        INTEGER ordinal
+        TEXT content
+        INTEGER token_count
+        INTEGER deprecated
+        TEXT meta_json
+    }
+
+    job_steps {
+        TEXT id PK
+        TEXT job_id FK
+        TEXT node_id
+        TEXT status
+        INTEGER attempt
+        TEXT outputs_json
+        TEXT artifacts_json
+        TEXT error_json
+        INTEGER duration_ms
+        TEXT trace_id
+    }
+
+    audit_log {
+        INTEGER id PK
+        DATETIME ts
+        TEXT actor
+        TEXT action
+        TEXT target_kind
+        TEXT target_id
+        TEXT detail_json
+    }
+```
+
+### 6.3 双层关系："事实目录 ↔ 索引数据库"
+
+```mermaid
+flowchart LR
+    subgraph FS["文件系统（事实源）"]
+        direction TB
+        D["personas/pm_xxx/vN/<br/>avatar/ · voice/ · persona.json<br/>identity_anchor.json · manifest.json"]
+    end
+
+    subgraph DB["SQLite（索引 + 账本）"]
+        direction TB
+        T1[persona_models]
+        T2[persona_versions<br/>dir_path 指向 FS]
+        T3[persona_samples]
+        T4[training_jobs]
+        T5[jobs / job_steps]
+    end
+
+    FS -->|"sha256 + dir_path<br/>(DB 索引 FS)"| DB
+    DB -->|"avc verify<br/>校验 sha + 列出孤儿"| FS
+    D -.->|"auditor 脚本"| DB
+```
+
+> 两者通过 `persona_versions.dir_path`（相对 `~/.local/share/avc/`）和文件 sha256 双向校验。`avc verify` 全量扫。
+
+---
+
+## 7. 跨场景对照
+
+| 场景 | 服务链 | 落盘位置 | 关键事件 |
+|------|--------|----------|----------|
+| 首次创建 persona | persona-svc → pipeline-svc → 3~4 Provider | `personas/pm_xxx/v1/` | `task_succeeded` / `persona_version=1` |
+| 持续训练 | evolution-svc → pipeline-svc → 1~3 Provider | `personas/pm_xxx/vN+1/` or rollback | `training_jobs.status` |
+| 出片 | render-svc → pipeline-svc → LLM/TTS/i2v Provider | `media/jobs/job_xxx/` | `jobs.status` |
+| 反馈回灌 | render-svc → SQLite (samples) → 下次 evolve | `persona_samples` | `sample(kind=feedback)` |
+| 跨机迁移 | tar.zst export/import | 整个 `~/.local/share/avc/` | `avc export` / `import` |
+| 紧急回滚 | persona-svc 改 current_version 指针 | 无新文件 | persona_models.current_version=vPrev |
+
+---
+
+## 8. 关键技术决策（ADR 摘要）
 
 | 编号 | 决策 | 备选 | 理由 |
 |------|------|------|------|
@@ -336,56 +728,60 @@ pub trait KnowledgeProvider { /* chunk / embed / search (远端) */ }
 
 ---
 
-## 13. 演进路线
+## 9. 演进路线
 
 ### Phase 0 — 最小闭环（4 周）
-- `avc persona new` 跑通：v1 生成（avatar = 商业 API；voice = 商业 API / 商用音色）
-- `avc render video` 跑通：1 条视频（脚本 + tts + i2v + compose，全部为远端 API）
+- `avc persona new` 跑通：v1 生成（avatar / voice / persona 全部 token API）
+- `avc render video` 跑通：1 条视频（脚本 + tts + i2v + compose，全部远端 API）
 - 不做版本管理（先用 `current_version = 1`）
-- 所有 provider 字段必须含 `api_key`；`avc init` 提示用户配置 token
 - 验收：`avc persona new Lily → avc render video --persona lily --topic hi` 出一个能看的 mp4
 
 ### Phase 1 — Provider 矩阵 + 持续训练（8 周）
-- 形象（商业 API）：kling_avatar / heygen_avatar / doubao_image / 即梦（seedream）/ volc_image
-- 形象（开源 via API）：replicate_sdxl / replicate_flux_lora / hf_inference_ip_adapter_faceid
-- 声音：volc_tts / azure_tts / elevenlabs / doubao_tts / openai_tts（gpt-4o audio）
-- LLM：openai_compat（兼容 OpenAI / Anthropic / DeepSeek / 智谱 / 豆包）
-- 视频：kling / doubao_seedance / pika / runway / 即梦 / replicate_cogvideox
-- 微调：openai_compat_sft / replicate_trainer / 厂商 SFT 端点（提交样本 / 等训练 / 拿回新 model_id）
+- 形象（商用）：kling_avatar / heygen_avatar / doubao_image / seedream
+- 形象（开源-via-API）：replicate_flux_lora / hf_inference
+- 声音：volc_tts / azure_tts / elevenlabs / doubao_tts / openai_tts
+- LLM：openai_compat
+- 视频：kling / doubao_seedance / pika / runway / replicate_cogvideox
+- 微调：openai_compat_sft / replicate_trainer / kling_avatar_finetune
 - 多版本 + 漂移评估 + 切版本 + 强制回滚
 - 反馈回灌（手动 + 自动）
 
 ### Phase 2 — 可选插件能力（4 周）
 - `avc storage plugin install s3`（对象存储备份）
-- OpenTelemetry 可选导出（接 collector）
+- OpenTelemetry 可选导出
 - 训练并行（同 persona 多 base / 多 worker）
 - 评测集 / canary 样本管理
 
 ### Phase 3 — 平台化扩展（不属本仓范围）
-- Web 控制台、模板市场、A/B 实验、多租户 SaaS —— 由独立上层项目承担
+- Web 控制台、模板市场、A/B 实验、多租户 SaaS — 由独立上层项目承担
 - AVCore 始终保持**纯 CLI 核心**
 
 ---
 
-## 14. 风险与对策
+## 10. 风险与对策
 
 | 风险 | 影响 | 对策 |
 |------|------|------|
-| Provider 限速 / 涨价 | 吞吐 / 成本 | 多 Provider + 路由表 |
+| Provider 限速 / 涨价 | 吞吐 / 成本 | 多 Provider + 路由表（§5.2） |
+| Provider token 失效 / 错误 | 任务中断 | preflight + 401 自动重试 + 自动告警 |
 | 数字人合规 | 法务 | 强制 consent + 可关闭"真实人物复刻"开关 |
-| 训练漂移 | 用户体验 | 漂移自动评估 + 回退 + drift 报告 |
+| 训练漂移 | 用户体验 | 漂移自动评估 + 回退 + drift_report |
 | 版本错乱 | 团队 | 版本不可变 + 切版本原子化 |
-| 训练 GPU 成本 | 团队 | 本地默认 CPU friendly 训练 / 可选 GPU 加速 |
+| Provider API 变更 | 中断 | provider.json 多版本兼容；token preflight catch change |
 | 模型效果不稳 | 口碑 | canary 样本 + 评测集 + 漂移告警 |
 | 跨机迁移 | 体验 | `avc export / import` tar.zst 包 |
-| 进程崩溃丢失任务 | 体验 | 节点级落盘 + 重启续跑 |
 
 ---
 
-## 15. 后续阅读
+## 11. 后续阅读
 
 - 设计：[design.md](./design.md)
-- 资产存储：[storage.md](./storage.md) ⭐
+- **资产存储（含目录树与 SQLite 表示例）：**[storage.md](./storage.md) ⭐
 - CLI / REPL 用法：[cli.md](./cli.md)
-- 子模块详细设计：[modules/README.md](./modules/README.md)
+- 子模块详细设计：
+  - [persona-modeling.md](./modules/persona-modeling.md)
+  - [persona-evolution.md](./modules/persona-evolution.md)
+  - [video-generation.md](./modules/video-generation.md)
+  - [pipeline.md](./modules/pipeline.md)
+  - [knowledge-aspect.md](./modules/knowledge-aspect.md)
 - Provider / API 参考：[api/README.md](./api/README.md)

@@ -37,6 +37,47 @@
 - ❌ 不强制云存储 / 云 GPU（本地能跑就跑）
 - ❌ **不加载 / 不推理任何本地模型**（没有自托管 SDXL / CosyVoice / LLaMA 等）
 
+
+### 1.3 全局流程一览（看图就用这张）
+
+> 完整图集见 [`architecture.md`](./architecture.md)。这里给最精简的两张。
+
+**全流程总览**：
+
+```mermaid
+flowchart LR
+    subgraph S1[阶段 1：建模]
+        A1[avc persona new] --> A2[personas/pm_xxx/v1/]
+    end
+    subgraph S2[阶段 2：演进]
+        B1[追加样本] --> B2[avc persona evolve]
+        B2 --> B3[v(N+1) 达标]
+        B2 --> B4[drift→rollback]
+    end
+    subgraph S3[阶段 3：消费]
+        C1[avc render video] --> C2[media/jobs/job_xxx/final.mp4]
+        C2 --> C3[反馈回灌]
+        C3 --> B1
+    end
+    S1 --> S2 --> S3
+```
+
+**子模块协作**：
+
+```mermaid
+flowchart TB
+    pipeline[pipeline-svc / DAG] --> PM[persona-svc]
+    pipeline --> EV[evolution-svc]
+    pipeline --> VG[render-svc]
+    pipeline --> KP[corpus-svc]
+    PM --> ST[(storage)]
+    EV --> ST
+    VG --> ST
+    KP --> ST
+    EV -.反馈回流.-> ST
+```
+
+---
 ---
 
 ## 2. 核心概念与领域模型

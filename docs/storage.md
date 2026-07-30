@@ -18,6 +18,50 @@
 
 ---
 
+## 1.1 目录结构图
+
+```mermaid
+graph TD
+    ROOT["~/.local/share/avc/"]
+    ROOT --> DB[("avc.db<br/>(SQLite)")]
+    ROOT --> CFG["avc.toml<br/>(token 加密)"]
+    ROOT --> PD["personas/"]
+    ROOT --> MD["media/"]
+    ROOT --> CD["cache/"]
+    ROOT --> LD["logs/"]
+
+    PD --> PM["pm_01HXXX/"]
+    PM --> V1["v1/<br/>(不可变快照)"]
+    PM --> V2["v2/<br/>(不可变快照)"]
+    PM --> V3["v3/<br/>(当前)"]
+
+    V1 --> AV1["avatar/"]
+    V1 --> VO1["voice/"]
+    V1 --> PD1["persona.json"]
+    V1 --> KA1["knowledge/"]
+    V1 --> IA1["identity_anchor.json"]
+    V1 --> MF1["manifest.json"]
+
+    V2 --> MF2["manifest.json"]
+    V2 --> AV2["avatar/"]
+    V2 --> VO2["voice/"]
+    V2 --> IA2["identity_anchor.json"]
+
+    MD --> MJ["jobs/"]
+    MJ --> J1["job_01A/<br/>final.mp4 + cover.jpg<br/>+ subtitle.srt + meta.json"]
+    MJ --> J2["job_01B/..."]
+
+    CD --> CCJ["jobs/ (中间产物缓存)"]
+    LD --> LA["audit.log"]
+
+    classDef imm fill:#e3f2fd,stroke:#1976d2
+    class V1,V2,V3,AV1,AV2,VO1,VO2,MF1,MF2,IA1,IA2,KA1 imm
+```
+
+> 蓝色节点是**不可变快照**，写新版本时另开目录。
+
+---
+
 ## 2. 默认根目录
 
 | 平台 | 默认路径 |
@@ -221,6 +265,77 @@ if cos < threshold: drift_detected → rollback
 
 ---
 
+### 8.0 ER 图
+
+```mermaid
+erDiagram
+    persona_models ||--o{ persona_versions : has
+    persona_models ||--o{ persona_samples : collects
+    persona_models ||--o{ training_jobs : trains
+    persona_versions ||--o{ jobs : locked_by
+    scripts ||--o{ jobs : executes
+    knowledge_corpora ||--o{ corpus_chunks : contains
+    knowledge_corpora ||--o{ persona_versions : bound_to
+    jobs ||--o{ job_steps : broken_into
+    persona_versions ||--|| identity_anchors : identified_by
+
+    persona_models {
+        TEXT id PK
+        TEXT name
+        INTEGER current_version
+    }
+    persona_versions {
+        TEXT persona_model_id PK
+        INTEGER version PK
+        TEXT dir_path
+        TEXT status
+    }
+    persona_samples {
+        TEXT id PK
+        TEXT persona_model_id FK
+        TEXT kind
+        INTEGER version_id_at_collection
+    }
+    training_jobs {
+        TEXT id PK
+        TEXT persona_model_id FK
+        INTEGER base_version
+        TEXT status
+    }
+    jobs {
+        TEXT id PK
+        TEXT script_id FK
+        INTEGER persona_version FK
+        TEXT status
+    }
+    scripts {
+        TEXT id PK
+        INTEGER persona_version FK
+    }
+    knowledge_corpora {
+        TEXT id PK
+        INTEGER chunk_count
+    }
+    corpus_chunks {
+        TEXT id PK
+        TEXT corpus_id FK
+        INTEGER ordinal
+        TEXT content
+    }
+    job_steps {
+        TEXT id PK
+        TEXT job_id FK
+        TEXT node_id
+    }
+    identity_anchors {
+        TEXT id PK
+        TEXT persona_version_id FK
+        BLOB face_emb
+        BLOB voice_emb
+    }
+```
+
+---
 ## 8. SQLite 主库：`avc.db`
 
 > 元数据 + 索引存 SQLite；大文件走文件系统。两边通过 hash 关联。
