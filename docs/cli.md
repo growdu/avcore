@@ -30,7 +30,7 @@
 
 | | 原子 | 集成 |
 |---|------|------|
-| 例 | `persona create`, `persona attach-avatar`, `persona commit` | `persona onboard`, `persona evolve`, `render run` |
+| 例 | `persona create`, `persona set-traits`, `finetune start` | `persona onboard`, `persona refine`, `persona finetune`, `render run` |
 | 调用频率 | 单次步骤 | 80% 工作流 |
 | 参数粒度 | 明确指出一个动作 | 接受"模板 / YAML / topic" |
 | 失败行为 | 仅该步失败，不影响其他 | 默认自动回退；可用 `--no-rollback` 关闭 |
@@ -45,7 +45,8 @@ avc
 ├── root        系统级（init / doctor / config / backup / ...）
 ├── persona     角色管理
 ├── sample      训练样本
-├── training    训练任务账本（只读 + cancel）
+├── iterate     refine 任务账本（只读 + cancel）
+├── finetune    finetune 任务账本（只读 + cancel）
 ├── job         渲染任务账本
 ├── render      出片工作流
 ├── corpus      知识语料（可选维度）
@@ -84,12 +85,15 @@ avc
 |------|------|
 | `avc persona create --name <n> --archetype <a>` | 预占 `persona_models` 行 + 新版本号 status=`pending` |
 | `avc persona show <name>` | 概要 |
-| `avc persona list [--status active|archived]` | 列表 |
+| `avc persona list [--status active\|archived]` | 列表 |
 | `avc persona versions <name>` | 历史版本 |
 | `avc persona attach-avatar <name> --version <v> --ref <img>` | 写 `avatar_*` 列 |
 | `avc persona attach-voice <name> --version <v> --ref <wav>` | 写 `voice_*` 列 |
 | `avc persona attach-persona <name> --version <v>` | 写 `persona_descriptor_json` |
 | `avc persona attach-knowledge <name> --version <v> --corpus <id>` | 写 `knowledge_binding_json` |
+| `avc persona set-traits <name> --version <v> --traits <list>` | refine：改 `persona_descriptor_json.traits` |
+| `avc persona set-catchphrase <name> --version <v> --add <s>` / `--remove <s>` | refine：改 catchphrases |
+| `avc persona set-render <name> --version <v> --resolution 1080p ...` | refine：改 `manifest_json.render_options` |
 | `avc persona commit <name> --version <v>` | pending → ready，触发 anchor 抽取并落行 |
 | `avc persona promote <name> --to <v>` | 改 `current_version` |
 | `avc persona demote <name> --version <v>` | 该版本 status=`deprecated` |
@@ -104,7 +108,8 @@ avc
 | 命令 | 内部等价于 |
 |------|----------|
 | `avc persona onboard --name <n> --from <yaml>` | `create` + `attach-avatar` + `attach-voice` + `attach-persona` (+ 可选 `attach-knowledge`) + `commit` |
-| `avc persona evolve <name> --scope <avatar|voice|persona> [--with-feedback] [--threshold <n>]` | 收集样本 + `training` + drift 评估 + 达标 → `commit` + `promote`，不达标 → `DELETE` 整行事务回退 |
+| `avc persona refine --name <n> --from <yaml>` | `set-traits` + `set-catchphrase` + `set-render` + `corpus attach/detach`（按 yaml diff；通常不调 Provider） |
+| `avc persona finetune --name <n> --scope <avatar\|voice\|persona> [--with-feedback] [--threshold <n>]` | 收集样本 + `finetune start` + drift 评估 + 达标 → `commit` + `promote`，不达标 → `DELETE` 整行事务回退 |
 
 > `--with-feedback` 自动把该 persona 最近标记 `looks_unlike` 的 feedback 样本纳入训练池。
 
@@ -112,173 +117,106 @@ avc
 
 | 命令 | 类型 | 作用 |
 |------|------|------|
-| `avc sample add <persona> --kind image|audio|behavior_text|feedback --uri <p>\|--text <s> --consent <p>` | `[A]` | 入训练池 |
-| `avc sample list <persona> [--kind]` | `[A]` | 列表 |
-| `avc sample show <sid>` | `[A]` | 详情 |
-| `avc sample remove <sid>` | `[A]` | 删除（仅删样本，不删 persona） |
-| `avc sample consign <sid>` | `[A]` | 标金丝雀（必须不漂移） |
+| `avc sample add <persona> --kind image\|audio\|behavior_text\|feedback --uri <p>\|--text <s> --consent <p>` | `[A]` | 入训练池 |
+| `avc sample list <persona> [--kind ...]` | `[A]` | 列出 |
+| `avc sample show <id>` | `[A]` | 详情 |
+| `avc sample remove <id>` | `[A]` | 删除 |
 
-### 3.4 training（只读）
-
-| 命令 | 类型 | 作用 |
-|------|------|------|
-| `avc training list [--persona <n>]` | `[A]` | 历史训练任务 |
-| `avc training show <tjid>` | `[A]` | 详情 + 已完成节点 |
-| `avc training report <tjid> [--json]` | `[A]` | 漂移评估报告 |
-| `avc training cancel <tjid>` | `[A]` | 取消 |
-
-> **训练任务**真正的"启动"在 persona.集成 `evolve` 里；这里只做查询。
-
-### 3.5 job（渲染任务账本）
+### 3.4 iterate（refine 任务账本）
 
 | 命令 | 类型 | 作用 |
 |------|------|------|
-| `avc job list [--persona <n>]` | `[A]` | 历史渲染任务 |
-| `avc job show <jobid>` | `[A]` | 详情 + 进度 |
-| `avc job wait <jobid> [--until <status>]` | `[A]` | 阻塞到结束（可设超时） |
-| `avc job cancel <jobid>` | `[A]` | 取消运行中 |
-| `avc job export <jobid> [--kind final_video|cover|subtitle|meta|all] --out <path>` | `[A]` | BLOB → FS |
-| `avc job retry <jobid>` | `[A]` | 重跑失败节点 |
-| `avc job rerender-scene <jobid> --idx <i>` | `[A]` | 重渲指定分镜 |
-| `avc job feedback <jobid> --signal looks_unlike|thumbs_up\|wrong_voice\|... [--note]` | `[A]` | 写 `persona_samples(kind=feedback)` |
+| `avc iterate list --persona <n>` | `[A]` | 列出该 persona 的 iterate 任务 |
+| `avc iterate show <id>` | `[A]` | 任务详情（含 `changes_json`） |
+| `avc iterate cancel <id>` | `[A]` | 取消 queued |
 
-### 3.6 render
-
-#### 原子
-
-| 命令 | 作用 |
-|------|------|
-| `avc render script --persona <p> --version <v> --topic <t> --out <script.json>` | 只出分镜，不渲染 |
-| `avc render script edit <file> --patch '<json-patch>'` | 编辑脚本（保留 diff） |
-| `avc render video --from-script <script.json>\|--script-id <sid>` | 拿已有脚本渲染 |
-
-#### 集成
-
-| 命令 | 内部等价 |
-|------|---------|
-| `avc render run --persona <p> --version <v> --topic <t> [...]` | `script` + `video`（默认 80% 走这条） |
-| `avc render pack --persona <p> --topics-file <path>` | 对每行 topic 跑一次 `render run` |
-
-### 3.7 corpus（可选：知识语料）
+### 3.5 finetune（SFT 任务账本）
 
 | 命令 | 类型 | 作用 |
 |------|------|------|
-| `avc corpus create --name <n> --source-type upload\|url\|faq --uri <p>` | `[A]` | 新建语料 |
-| `avc corpus chunks add <corpus> --from <jsonl>` | `[A]` | 追加 chunks（自动 embed） |
-| `avc corpus chunks list <corpus>` | `[A]` | 列表 |
-| `avc corpus search <corpus> --query <q>` | `[A]` | 远端 embed + cosine |
-| `avc corpus reindex <corpus>` | `[A]` | 清空 `deprecated` 之外的全重 embed |
+| `avc finetune start <persona> --scope ... --base-version <v> [--threshold <n>]` | `[A]` | 启动 finetune 任务（INSERT 新版本行 + 调 Provider SFT 端点） |
+| `avc finetune list --persona <n>` | `[A]` | 列出该 persona 的 finetune 任务 |
+| `avc finetune show <id>` | `[A]` | 任务详情 |
+| `avc finetune report <id> --json` | `[A]` | drift_report_json 结构化输出 |
+| `avc finetune cancel <id>` | `[A]` | 取消 queued / running |
 
-> `corpus bind` 等同 `persona attach-knowledge --corpus <id>`，所以放在 persona 那边。
-
-### 3.8 provider
+### 3.6 job
 
 | 命令 | 类型 | 作用 |
 |------|------|------|
-| `avc provider list` | `[A]` | 所有 Provider |
-| `avc provider show <name>` | `[A]` | 配置详情 + token 是否配 |
-| `avc provider test <name>` | `[A]` | preflight：网络 + 鉴权 + 远端一次最小调用 |
-| `avc provider config <name> --set KEY=VAL` | `[A]` | 改 provider.json 字段（不含 token） |
+| `avc job list --persona <n>` | `[A]` | 列出该 persona 的渲染任务 |
+| `avc job show <id> [--watch]` | `[A]` | 任务详情 |
+| `avc job wait <id> --until <status>` | `[A]` | 阻塞到目标状态 |
+| `avc job cancel <id>` | `[A]` | 取消 |
+| `avc job export <id> --all\|--kind <k> --out <dir>` | `[A]` | 拷 BLOB 到 FS |
+| `avc job feedback <id> --looks_unlike` | `[A]` | 把"不像"标记写入 `persona_samples(kind=feedback)`，供下次 finetune `--with-feedback` 用 |
+
+### 3.7 render
+
+**原子**：
+
+```bash
+avc render script  --persona yu --version 2 --topic "..." --out script.json
+avc render script edit script.json --patch '{"op":"replace","path":"/scenes/0/duration_ms","value":9000}'
+avc render video --from-script script.json --quiet    # 返 job_id
+```
+
+**集成**：
+
+```bash
+avc render run --persona yu --version 2 --topic "InnoDB Buffer Pool" --duration 60 --resolution 1080p
+# 内部 = render script + render video
+
+avc render pack --persona yu --topics-file ./daily_topics.txt
+# 对每行 topic 跑一次 render run
+```
+
+### 3.8 corpus
+
+| 命令 | 类型 | 作用 |
+|------|------|------|
+| `avc corpus create --name <n> --source <path>` | `[A]` | 切 chunk + 调 embed API |
+| `avc corpus chunks <id>` | `[A]` | 列 chunk |
+| `avc corpus search <id> --query <q> --topk 5` | `[A]` | embed cosine top-K |
+| `avc corpus attach <persona> --version <v> --corpus <id>` | `[A]` | 写 `knowledge_binding_json`（refine 路径） |
+| `avc corpus detach <persona> --version <v>` | `[A]` | 清空 `knowledge_binding_json` |
+| `avc corpus reindex <id>` | `[A]` | 重跑 embed |
+| `avc corpus delete <id> --confirm` | `[A]` | 硬删除 |
+
+### 3.9 provider
+
+| 命令 | 类型 | 作用 |
+|------|------|------|
+| `avc provider list` | `[A]` | 已注册 provider |
+| `avc provider show <name>` | `[A]` | 元数据 + endpoint + auth scheme |
+| `avc provider test <name>` | `[A]` | 一次轻量 ping（校验 token + 网络） |
+| `avc provider config <name> --set-key` | `[A]` | 写 token 到 `avc.toml`（不入 DB） |
 
 ---
 
-## 4. 组合示例（用原子搭流水线）
+## 4. 典型 shell 组合
 
-下面展示：一切"集成命令"都能用原子重新实现。这印证**原子化原则**——CLI 是壳，shell 是胶水。
-
-### 4.1 受控 6 步创建 persona
+集成命令把"大多数情况"一行搞定；原子命令 + shell 把"边角情况"完全覆盖。
 
 ```bash
-avc persona create yu --archetype db_kernel_expert
-# → persona_id=pm_xxx  version=1  status=pending
-
-avc persona attach-avatar yu --version 1 --ref ./ref_*.png --style 写实
-avc persona attach-voice yu --version 1 --ref ./sample.wav --lang zh
-avc persona attach-persona yu --version 1 \
-  --traits 严谨,务实 --tone 严谨 --catchphrase "我们直接看源码"
-avc persona commit yu --version 1
-# → status=ready
-```
-
-### 4.2 追加样本 + 训练
-
-```bash
-# 手动追样本
-avc sample add yu --kind audio --uri ./new.wav --text "..." --consent ./auth.pdf
-
-# 启动训练（集成）
-avc persona evolve yu --scope voice --threshold 0.85
-# 内部 = train + drift_eval + promote
-```
-
-或者纯原子版：
-
-```bash
-avc sample add yu --kind audio --uri ./new.wav --text "..." --consent ./auth.pdf
-tj=$(avc training start yu --scope voice --base-version 1 | jq -r .tjid)  # 假设 add 命令式
-avc training wait "$tj" --until succeeded
-v=$(avc training show "$tj" --json | jq -r .result_version)
-avc persona commit yu --version "$v"
-avc persona promote yu --to "$v"
-```
-
-### 4.3 出片 + 反馈回灌
-
-```bash
-# 常规（集成）
-avc render run --persona yu --version 2 --topic "InnoDB Buffer Pool" --duration 60
-# 内部 = script + video
-
-# 显式分步（原子）
-avc render script --persona yu --version 2 --topic "..." --out script.json
-avc render script edit script.json --patch '{"op":"replace","path":"/scenes/0/duration_ms","value":9000}'
-jid=$(avc render video --from-script script.json --json | jq -r .jobid)
-
-# 阻塞等结果
-avc job wait "$jid" --until succeeded
-avc job export "$jid" --kind final_video --out ./final.mp4
-
-# 反馈
-avc job feedback "$jid" --signal looks_unlike --note "侧脸不像本人"
-# 内部触发 persona evolve --with-feedback 时被消费
-```
-
-### 4.4 批量出片
-
-```bash
-# 单条不行？批量跑
-avc render pack --persona yu --topics-file ./daily_topics.txt --json | tee pack.log
-```
-
-### 4.5 完整运维脚本（示例）
-
-```bash
-#!/usr/bin/env bash
-# evolve-and-render.sh —— "给 yu 加样本、训练、出片、再反馈" 的一条流水线
-
-set -euo pipefail
-
+# A. 完整闭环：创建 → 迭代 → 出片
 NAME=yu
-TOPIC="$1"
+avc persona onboard $NAME --from ./yu.toml
 
-# 1. 收最近反馈到样本池
-avc job feedback scan "$NAME" --since 24h  # 辅助原子（未来可选）
+# 改 prompt / 知识（纯数据，常做）
+avc persona refine $NAME --from ./yu.v2.toml
 
-# 2. 训练（集成）
-avc persona evolve "$NAME" --scope voice --with-feedback --threshold 0.85
-
-# 3. 解析最新版本
-v=$(avc persona show "$NAME" --json | jq -r .current_version)
+# 加样本 + 微调（花 token，慢）
+avc persona finetune $NAME --scope voice --base-version 2 --with-feedback
 
 # 4. 出片
+v=$(avc persona show $NAME --json | jq -r .current_version)
 jid=$(avc render run --persona "$NAME" --version "$v" --topic "$TOPIC" --json | jq -r .jobid)
 avc job wait "$jid" --until succeeded
 
 # 5. 导出
 avc job export "$jid" --all --out "./out/$TOPIC/"
 ```
-
-集成命令把"大多数情况"一行搞定；原子命令+shell 把"边角情况"完全覆盖。
 
 ---
 
@@ -348,16 +286,28 @@ error[E0501]: provider_unauthenticated
 每个集成命令都必须做两件事：
 
 1. 接受 `--dry-run`：打印**将执行**的原子列表，不真执行
-2. 实际执行时，所有变更都体现为 SQLite 的 INSERT / UPDATE，长任务进度写到 `job_steps` 与 `training_jobs`
+2. 实际执行时，所有变更都体现为 SQLite 的 INSERT / UPDATE，长任务进度写到 `job_steps` 与 `iterate_jobs` / `finetune_jobs`
 
-`avc persona evolve yu --scope voice --dry-run` 应当输出：
+### 6.1 `avc persona refine yu --from ./yu.v2.toml --dry-run` 输出
+
+```
+plan (no changes made):
+
+  1. set-traits     yu --version 1 --traits 严谨,务实            (atomic)
+  2. set-catchphrase yu --version 1 --add "我们直接看源码"        (atomic)
+  3. set-render     yu --version 1 --resolution 1080p           (atomic)
+  4. corpus attach  yu --version 1 --corpus db-internals         (atomic)
+  no Provider SFT calls.  no new version.  no drift eval.
+```
+
+### 6.2 `avc persona finetune yu --scope voice --dry-run` 输出
 
 ```
 plan (no changes made):
 
   1. sample add yu --kind audio --uri ./feedback_*.wav   (atomic)
   2. sample add yu --kind audio --uri ./new_*.wav         (atomic, --with-feedback resolved)
-  3. training start yu --scope voice --base-version 1    (atomic)
+  3. finetune start yu --scope voice --base-version 1    (atomic)
   4.   ↳ publish_or_rollback branch
   5. persona commit yu --version <v>   if drift ok        (atomic)
   6. persona promote yu --to <v>      if drift ok        (atomic)
@@ -374,25 +324,25 @@ plan (no changes made):
                     ───────────────  ──────────────
 root                init/verify/...   doctor/prune/config
 persona             create           onboard
-                    attach-avatar    evolve
-                    attach-voice
-                    attach-persona
+                    attach-*         refine          ← 80% 路径（纯数据）
+                    set-traits/...   finetune        ← 少数路径（调 SFT）
                     commit
                     promote/demote
                     archive/delete
 sample              add/list/remove
-training            list/show/report/cancel     (start 由 evolve 触发)
+iterate             list/show/cancel             (start 由 refine 触发)
+finetune            start/list/show/report/cancel
 job                 list/show/wait/cancel/export/feedback
 render              script/video     run / pack
-corpus              create/chunks/search/reindex
+corpus              create/chunks/search/attach/detach/reindex
 provider            list/show/test/config
 ```
 
 只统计**真正保留**的（去掉"已删除 / 即将做"）。合计：
 
-- 原子：**约 38** 条
-- 集成：**约 8** 条
-- 总计：**46** 条左右
+- 原子：**约 50** 条
+- 集成：**约 9** 条
+- 总计：**59** 条左右
 
 ---
 
@@ -405,7 +355,9 @@ provider            list/show/test/config
 | `persona create` | `INSERT persona_models` + `INSERT persona_versions(status=pending)` |
 | `persona attach-avatar` | `UPDATE persona_versions SET avatar_primary=..., avatar_primary_sha256=... WHERE ...` |
 | `persona commit` | `UPDATE persona_versions SET status='ready' WHERE ...` |
-| `persona evolve` | `BEGIN; ... COMMIT;` 多步 |
+| `persona set-traits` | `UPDATE persona_versions SET persona_descriptor_json=... WHERE pm_id=? AND version=N`（refine 路径） |
+| `persona refine` | `BEGIN; UPDATE persona_versions ... COMMIT;` 多步（refine 路径） |
+| `finetune start` | `BEGIN; INSERT finetune_jobs; INSERT persona_versions(version=N+1, status=building); ... COMMIT;` |
 | `persona promote` | `UPDATE persona_models SET current_version=... WHERE id=...` |
 | `persona archive` | `UPDATE persona_models SET status='archived'` |
 | `sample add` | `INSERT persona_samples` |
@@ -441,8 +393,11 @@ avc prune --archive-older-than 30d
 # 一次性看 schema
 sqlite3 ~/.local/share/avc/avc.db ".schema persona_versions"
 
-# 重新跑训练从某版本
-avc persona evolve yu --scope voice --base-version 1
+# 改 prompt / 人设 / 知识（纯数据，常见）
+avc persona refine yu --from ./yu.v2.toml
+
+# 调 Provider SFT 重新训声音（少数路径）
+avc persona finetune yu --scope voice --base-version 1
 
 # 强制回滚到 v1
 avc persona promote yu --to 1

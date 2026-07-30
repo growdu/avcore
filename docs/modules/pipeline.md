@@ -44,7 +44,7 @@ nodes:
       on_fail: ABORT (整事务回退)
 ```
 
-### 5.2 `persona.train`（vN → v(N+1)）
+### 5.2 `persona.finetune`（vN → v(N+1)；仅在调 Provider SFT 时走）
 
 ```yaml
 nodes:

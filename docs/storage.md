@@ -42,7 +42,8 @@
 erDiagram
     persona_models ||--o{ persona_versions : has
     persona_versions ||--o{ persona_samples : collects
-    persona_models ||--o{ training_jobs : trains
+    persona_models ||--o{ iterate_jobs : iterates
+    persona_models ||--o{ finetune_jobs : finetunes
     scripts ||--o{ jobs : executes
     jobs ||--o{ artifacts : produces
     knowledge_corpora ||--o{ corpus_chunks : contains
@@ -147,14 +148,30 @@ CREATE TABLE persona_samples (
 );
 ```
 
-### 4.4 `training_jobs`
+### 4.4 `iterate_jobs`（refine 任务账本）
 
 ```sql
-CREATE TABLE training_jobs (
-    id TEXT PRIMARY KEY,                    -- tj_<ULID>
+CREATE TABLE iterate_jobs (
+    id TEXT PRIMARY KEY,                    -- ij_<ULID>
+    persona_model_id TEXT NOT NULL,
+    target_version INTEGER NOT NULL,        -- 同版本号升级 = current_version
+    changes_json TEXT NOT NULL,             -- {persona_descriptor?, knowledge_binding?, manifest?, metrics?}
+    status TEXT NOT NULL,                   -- queued/running/succeeded/failed/cancelled
+    started_at TEXT,
+    finished_at TEXT
+);
+```
+
+> 同版本号；不调 Provider；不存在漂移问题。
+
+### 4.5 `finetune_jobs`（SFT 任务账本）
+
+```sql
+CREATE TABLE finetune_jobs (
+    id TEXT PRIMARY KEY,                    -- fj_<ULID>
     persona_model_id TEXT NOT NULL,
     base_version INTEGER NOT NULL,
-    target_version INTEGER,
+    target_version INTEGER,                 -- 预占 = base+1
     scope_json TEXT NOT NULL,               -- ["avatar","voice","persona"]
     config_json TEXT,
     status TEXT NOT NULL,                   -- queued/running/succeeded/failed_drift/failed/cancelled
@@ -165,7 +182,7 @@ CREATE TABLE training_jobs (
 );
 ```
 
-### 4.5 `scripts`
+### 4.6 `scripts`
 
 ```sql
 CREATE TABLE scripts (
@@ -180,7 +197,7 @@ CREATE TABLE scripts (
 );
 ```
 
-### 4.6 `jobs`
+### 4.7 `jobs`
 
 ```sql
 CREATE TABLE jobs (
@@ -198,7 +215,7 @@ CREATE TABLE jobs (
 );
 ```
 
-### 4.7 `artifacts`
+### 4.8 `artifacts`
 
 视频产物。**BLOB 入 DB**——`avc job export` 可拷到 FS 分享。
 
@@ -217,7 +234,7 @@ CREATE TABLE artifacts (
 CREATE INDEX idx_artifacts_job ON artifacts(job_id, kind);
 ```
 
-### 4.8 `job_steps`（DAG 节点账本）
+### 4.9 `job_steps`（DAG 节点账本）
 
 ```sql
 CREATE TABLE job_steps (
@@ -235,7 +252,7 @@ CREATE TABLE job_steps (
 CREATE INDEX idx_steps_job ON job_steps(job_id);
 ```
 
-### 4.9 `knowledge_corpora` + `corpus_chunks`（**可选维度**）
+### 4.10 `knowledge_corpora` + `corpus_chunks`（**可选维度**）
 
 > 仅当 PersonaModel "懂某领域" 时才用。普通虚拟主播 / 品牌代言人 / 虚拟员工**完全不需要**这张表。
 
@@ -283,7 +300,7 @@ graph TD
 
 ```sql
 BEGIN;
-  INSERT INTO training_jobs(target_version=N+1, status='running');
+  INSERT INTO finetune_jobs(target_version=N+1, status='running');
   INSERT INTO persona_versions(?, N+1, ..., status='building');
   -- 节点结果 UPDATE 在 job_steps
 COMMIT;
@@ -294,7 +311,7 @@ COMMIT;
 ```sql
 BEGIN;
   DELETE FROM persona_versions WHERE persona_model_id=? AND version=N+1;
-  UPDATE training_jobs SET status='failed_drift', drift_report_json=? WHERE id=?;
+  UPDATE finetune_jobs SET status='failed_drift', drift_report_json=? WHERE id=?;
 COMMIT;
 ```
 
@@ -309,7 +326,7 @@ avc verify                 # 全表 sha256 重算 vs 表中 stored sha256
 avc verify --persona yu    # 单 persona
 ```
 
-不匹配 → 报错 `asset_corrupted`。修复策略：删除 corrupted 行 + 重新走训练任务出 v(N+1)（绝不"修补"覆盖原行）。
+不匹配 → 报错 `asset_corrupted`。修复策略：删除 corrupted 行 + 重新走 finetune 任务出 v(N+1)（绝不"修补"覆盖原行）。
 
 ---
 

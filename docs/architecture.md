@@ -12,11 +12,13 @@ flowchart TB
     CLI --> CORE
     CORE["core (in-process tokio)"]
     CORE --> PS[persona-svc]
-    CORE --> ES[evolution-svc]
+    CORE --> IS[iterate-svc]
+    CORE --> FS[finetune-svc]
     CORE --> RS[render-svc]
     CORE --> PL[pipeline-svc / DAG]
     PS --> PL
-    ES --> PL
+    IS --> PL
+    FS --> PL
     RS --> PL
     PL --> PR[Provider Adapters trait]
     PR --> API[(商业/开源模型 API<br/>token 鉴权)]
@@ -32,17 +34,19 @@ flowchart TB
 | 子模块 | 服务 | 负责 | 不负责 |
 |--------|------|------|--------|
 | persona-modeling | `persona-svc` | 创建 PersonaModel v1（含可选知识绑定） | 训练 / 渲染 |
-| persona-evolution | `evolution-svc` | 训练 / 版本管理 / 一致性兜底 | v1 创建 / 渲染 |
+| persona-iteration | `iterate-svc` + `finetune-svc` | refine（数据迭代）/ finetune（Provider SFT）/ 一致性兜底 | v1 创建 / 渲染 |
 | video-generation | `render-svc` | 脚本 + 渲染出片 | 训练 / 人设 |
 | pipeline | `pipeline-svc` | DAG 节点编排 / 调度 / 重试 / 断点 | 具体 Provider |
 
 ```mermaid
 flowchart LR
     PM[persona-svc] --> ST[(avc.db)]
-    EV[evolution-svc] --> ST
+    IT[iterate-svc] --> ST
+    FT[finetune-svc] --> ST
     VG[render-svc] --> ST
     PL[pipeline-svc] -.调度.-> PM
-    PL -.调度.-> EV
+    PL -.调度.-> IT
+    PL -.调度.-> FT
     PL -.调度.-> VG
 ```
 
@@ -92,7 +96,8 @@ graph LR
       PM[persona_models]
       PV[persona_versions<br/>宽表 + BLOB]
       PS[persona_samples]
-      TJ[training_jobs]
+      IJ[iterate_jobs]
+      FJ[finetune_jobs]
       JC[jobs]
       AR[artifacts<br/>BLOB]
       CR[knowledge_corpora]
@@ -127,7 +132,7 @@ graph LR
 ## 8. 路线
 
 - **Phase 0**：单 Provider × 1 角色 × 1 视频跑通
-- **Phase 1**：Provider 矩阵 + 持续训练 + 漂移兜底 + 多版本
+- **Phase 1**：Provider 矩阵 + refine/finetune + 漂移兜底 + 多版本
 - 后续均为可选扩展
 
 ---
@@ -146,5 +151,5 @@ graph LR
 ## 10. 后续阅读
 
 - [design.md](./design.md) · [storage.md](./storage.md) · [cli.md](./cli.md)
-- 子模块：[persona-modeling](./modules/persona-modeling.md) · [persona-evolution](./modules/persona-evolution.md) · [video-generation](./modules/video-generation.md) · [pipeline](./modules/pipeline.md)
+- 子模块：[persona-modeling](./modules/persona-modeling.md) · [persona-iteration](./modules/persona-iteration.md) · [video-generation](./modules/video-generation.md) · [pipeline](./modules/pipeline.md)
 - [api/README.md](./api/README.md) · Provider trait

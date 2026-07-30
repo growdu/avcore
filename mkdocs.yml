@@ -1,5 +1,5 @@
 site_name: AVCore
-site_description: 极简内核——AI 数字人角色模型生成、持续训练、出片
+site_description: 极简内核——AI 数字人角色模型生成、迭代与微调、出片
 site_author: AVCore Team
 
 repo_name: growdu/avcore
@@ -10,7 +10,7 @@ docs_dir: docs
 site_dir: site
 
 use_directory_urls: true
-strict: false
+strict: true
 
 theme:
   name: material
@@ -81,7 +81,7 @@ nav:
   - 子模块:
       - 模块索引: modules/README.md
       - 人物角色模型生成: modules/persona-modeling.md
-      - 人物角色模型完善演进: modules/persona-evolution.md
+      - 人物角色模型迭代与微调: modules/persona-iteration.md
       - 视频生成: modules/video-generation.md
       - 工作流编排: modules/pipeline.md
   - Provider: api/README.md
