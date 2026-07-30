@@ -208,18 +208,23 @@ $ avc persona new "Lily" --from ./persona.toml
 
 ### 7.2 LoRA 微调（可选）
 - ≥ 5 张高质量参考图触发
-- 输出 `weights.safetensors + lora.json` 落 `avatar/lora/`
-- 异步 + 幂等（断点续跑）
+- 调用 Provider 的 SFT/fine-tune 端点（提交样本 + base_avatar_ref），**远端训练**
+- 返回**不下载权重**：仅在 `avatar/lora/ref.json` 写 `{ model_id, provider, trained_at, base_model, ... }`
+- Provider 任务 ID 由长轮询推进；AVCore 端是异步包装
 
-### 7.3 Provider 路由
+### 7.3 Provider 路由（全部 token 鉴权）
+
 | Provider | 特点 |
 |----------|------|
-| `sdxl_ip_adapter` | 自托管性价比 |
-| `kling_avatar` | 商用稳定 |
-| `heygen_avatar` | 商用稳定 |
-| `flux_lora` | 高质量微调 |
+| `kling_avatar` | 商用稳定，token 调用 |
+| `heygen_avatar` | 商用稳定，token 调用 |
+| `doubao_image` | 字节豆包 image API，token 调用 |
+| `seedream`（即梦） | 阿里即梦 image API，token 调用 |
+| `replicate_flux_lora` | 商用平台访问开源 Flux LoRA，token 调用 |
 
 切换 = 改 `provider.json` 字段，不改业务代码。
+
+> 本框架**不支持自托管模型**（如 `sdxl_ip_adapter` / `cosyvoice` 等被设计为本地运行的不在 Provider 表中）。所有实现都是 HTTP API + Bearer token。
 
 ---
 

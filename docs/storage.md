@@ -9,9 +9,12 @@
 ## 1. 总原则
 
 - **一个 PersonaModelVersion = 一个不可变目录**
+- **本框架仅存元数据 + 产物引用 + 用户上传的原始素材**；**不下载、不缓存模型权重**
+- 所有"模型"在 Provider 端（远端 API），本框架只持有 `model_id / voice_id / face_id / knowledge_corpus_id` 等引用
 - 文件写入采用**原子替换**（先写临时文件，再 `rename`）
 - 元数据同时存 JSON（人类可读 / 调试友好）和 SQLite（索引 / 查询友好）
-- 大文件（图、音、LORA）作为原始 blob 落盘；小配置走 JSON
+- 大文件（图、音、上传样本）作为原始 blob 落盘；小配置走 JSON
+- 任何 Provider 返回的"模型权重 / LoRA 文件 / checkpoint"只存**引用**（URL / model_id），**不下载到本机**
 
 ---
 
@@ -60,16 +63,15 @@
 │   │   └── ...
 │   ├── ref/                   # 上传的参考图原图（仅用于审计与重训）
 │   │   └── ref_001.png
-│   ├── lora/                  # 可选；LoRA 权重
-│   │   ├── weights.safetensors
-│   │   └── lora.json          # 触发词 / 配置
+│   ├── lora/                  # 可选；远端 avatar LoRA 引用
+│   │   └── ref.json           # { model_id, provider, trained_at, base_model, ... }
 │   ├── face.json              # 通用 face_id / instantid / ip-adapter 锚点
 │   └── provider.json          # 哪个 provider 生成的 + provider 版本
 ├── voice/
-│   ├── sample.wav             # 高质量样本（≥ 30s 干净人声）
+│   ├── sample.wav             # 用户上传的高质量样本（≥ 30s 干净人声），原始材料
 │   ├── transcript.json        # sample 对应文本（用于训练对齐）
-│   ├── embed.bin              # speaker embedding（512 维 float32）
-│   └── provider.json
+│   ├── embed.bin              # Provider 返回的 speaker embedding（一致性度量用，非本地模型权重）
+│   └── ref.json               # 远端 voice_id / provider / created_at
 ├── persona.json               # 人设（详见 §5）
 ├── knowledge/                 # 可选——只有该版本绑定了知识时存在
 │   ├── corpora/
@@ -206,15 +208,16 @@ if cos < threshold: drift_detected → rollback
 ### 7.4 资产规模估算
 | 资产 | 单 persona 单版本 |
 |------|-----------------|
-| 主形象 PNG（1024px） | ~2 MB |
+| 主形象 PNG（1024px，由 Provider 生成 / 本地缓存） | ~2 MB |
 | 多视角 ×6 | ~12 MB |
-| LoRA（若启用） | 50–200 MB |
-| 声音样本（30~60s wav 48k） | ~10 MB |
-| embed.bin × 数个 | < 1 MB |
+| LoRA 引用（**仅 JSON**，不下载权重） | < 1 KB |
+| 声音样本（30~60s wav 48k，用户上传的原始材料） | ~10 MB |
+| embed.bin × 数个（一致性度量用特征向量） | < 1 MB |
 | JSON 配置 | KB 级 |
-| **典型单版本总量** | **80–250 MB** |
+| **典型单版本总量** | **30–60 MB** |
 
-1000 个 persona × 5 版本典型空间占用 ~ 1 TB；这部分未来可以由对象存储 plugin 接 S3 / OSS。
+1000 个 persona × 5 版本典型空间占用 ~ 300 GB；用户上传素材可由对象存储 plugin 接管。
+> 由于 LoRA 权重**不下载到本机**，单版本体积从 80–250 MB 降至 30–60 MB。这是与"仅 API"对齐的直接好处。
 
 ---
 

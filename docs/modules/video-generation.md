@@ -162,12 +162,14 @@ Script（已绑定 persona_version_id）
 
 ### 6.2 图生视频
 - 输入：关键帧 + 音频（驱动口型）
-- 模型：Kling / CogVideoX / HunyuanVideo
+- **远端模型 API**：Kling / Doubao Seedance / 即梦 / Pika / Runway / Replicate 上的 CogVideoX
 - 默认 5s 起步，可拼接
+- AVCore 不加载任何视频模型，仅持有 Provider 返回的 clip URL / 临时下载产物
 
 ### 6.3 商用数字人替代
-- 当 `PersonaVersion.mode = digital_human` 时，直接调用 HeyGen / D-ID / 商汤如影
+- 当 `PersonaVersion.mode = digital_human` 时，直接调用 HeyGen / D-ID / 商汤如影 等商用 API
 - 跳过关键帧 + i2v
+- 所有调用通过 token 鉴权
 
 ---
 

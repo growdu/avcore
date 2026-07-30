@@ -7,7 +7,18 @@
 ## 1. 一句话总结
 
 AVCore = **Rust 单二进制 CLI + 本地 SQLite + 本地文件系统 + 统一 DAG Pipeline + 一组 trait 化的 Provider 适配器**。
-不暴露 HTTP / GRPC 服务，不做 SaaS 控制台，不内嵌计费 / 可观测性 dashboard——把这些都交给外部系统。
+**所有 Provider 都通过 token 鉴权调用商业 / 开源模型的 HTTP API；本框架不加载、不推理任何本地模型。**
+
+不暴露 HTTP / gRPC 服务，不做 SaaS 控制台，不内嵌计费 / 可观测性 dashboard——把这些都交给外部系统。
+
+### 1.1 强约束
+
+> **AVCore 只调用模型 API，不调用本地模型。** 每个 Provider 必须有 `api_key`（或同义 token）字段。所有推理 / 训练 / 微调均在 Provider 端完成，本框架只负责编排、样本管理、版本管理、产物落盘。
+
+- ✅ 允许：商业 API（Kling / OpenAI / 豆包 / Doubao / 即梦 / 火山 / 阿里…）
+- ✅ 允许：通过商用 / 托管平台访问的开源模型（Replicate / Together / Hugging Face Inference API 等）
+- ❌ 禁止：自托管模型（`sdxl`、`cosyvoice`、`gpt-sovits`、本地 LLaMA 等）
+- ❌ 禁止：本地推理 / 本地 GPU / 本地权重加载
 
 ---
 
@@ -25,24 +36,32 @@ AVCore = **Rust 单二进制 CLI + 本地 SQLite + 本地文件系统 + 统一 D
 │  │   pipeline-svc(DAG)  task-svc  job-svc                       │ │
 │  └─────────────────────────────────────────────────────────────┘ │
 │  ┌─────────────────────────────────────────────────────────────┐ │
-│  │  Provider Adapters (trait + 动态加载)                          │ │
+│  │  Provider Adapters  (trait + token 鉴权 HTTP 调用)            │ │
 │  │   avatar / voice / llm / video / knowledge / storage         │ │
 │  └─────────────────────────────────────────────────────────────┘ │
 │  ┌─────────────────────────────────────────────────────────────┐ │
 │  │  Storage Layer                                               │ │
 │  │   SQLite (rusqlite) + 文件系统 (tokio fs)                     │ │
+│  │   （存元数据 + 引用，**不存模型权重**）                        │ │
 │  └─────────────────────────────────────────────────────────────┘ │
 └─────────┬─────────────────────────┬────────────────────────────┘
           │                         │
           ▼                         ▼
-  ~/.local/share/avc/         Provider endpoints (HTTP/gRPC)
-  ├── avc.db                  ├── 自托管 SDXL / CosyVoice ...
-  ├── personas/pm_*/vN/...    └── 商用 API（Kling / 即梦 / 豆包 ...）
-  ├── media/jobs/...
+  ~/.local/share/avc/         商业 / 开源模型 API 端点
+  ├── avc.db                  ├── kling / openai / doubao / ...
+  ├── personas/pm_*/vN/...    ├── replicate / together / hf-inference / ...
+  ├── media/jobs/...          └── （每个端点都需要 api_key）
   └── cache/...
+
+Provider 调用示意：
+        ┌────────────┐    POST /v1/chat     ┌─────────────┐
+        │  avc       ├─────────────────────▶│ OpenAI / 等 │
+        │  (无模型)    │   Authorization:    │             │
+        │            │     Bearer <token>   │             │
+        └────────────┘◀─────────────────────└─────────────┘
 ```
 
-进程模型：**单进程多任务**——长任务走 tokio task，不起子进程。需要隔离 Provider 时可 fork 子进程（仅当 Provider SDK 必须独立运行时）。
+进程模型：**单进程多任务**——长任务走 tokio task，不起子进程（除非某个 Provider SDK 必须独立运行时）。
 
 ---
 
@@ -100,7 +119,7 @@ avcore/
 | REPL | rustyline | 多行 + 历史 |
 | 日志 | tracing | 结构化、可选 OTel |
 | 可观测性 | 仅 tracing 日志；不内置 dashboard | 用户自行接 OTel collector |
-| Provider 集成 | trait + 动态子进程加载（plugins 后续） | 主仓不绑模型厂商 |
+| Provider 集成 | trait + 仅 HTTP 调用 + token 鉴权；无本地推理 | 主仓不加载任何模型；所有能力由远端 API 完成 |
 
 > **故意不引入** Python 即使它是 AI 主力——AVCore 是**编排层**，算法侧已经在各家 Provider 内部，AVCore 只需要 HTTP 通它们。
 
@@ -198,24 +217,32 @@ CREATE TABLE corpus_chunks ( id, corpus_id, ordinal, content, token_count, depre
 
 ## 7. Provider 抽象
 
+> **每个 Provider 都是远端 API 客户端**——`api_key` 是必填，trait 方法都是 token 鉴权 HTTP 调用。本框架不持有任何模型权重，不本地推理。
+
 ```rust
 #[async_trait]
 pub trait AvatarProvider: Send + Sync {
     fn name(&self) -> &str;
+    /// 调用远端 API 创建形象。返回的 Avatar 是远端能力的引用（model_id / face_id）。
     async fn create(&self, spec: &AvatarSpec) -> Result<Avatar>;
+    /// 调用远端 API 生成图。
     async fn render(&self, avatar: &Avatar, prompt: &str, mot: &Motion) -> Result<Media>;
+    /// 调用远端 SFT/fine-tune 端点，提交样本集，**远端训练**，返回新模型引用。
     async fn finetune(&self, base: &Avatar, samples: &[Sample], cfg: &TrainCfg) -> Result<Avatar>;
 }
 
 pub trait VoiceProvider {
+    /// 调用远端 API 克隆声音。
     async fn clone(&self, samples: &[Audio]) -> Result<Voice>;
+    /// 调用远端 TTS 端点合成。
     async fn synth(&self, voice: &Voice, text: &str, ssml: &Ssml) -> Result<Audio>;
+    /// 调用远端 SFT 端点增量训练，返回更新后的 voice_id。
     async fn finetune(&self, base: &Voice, samples: &[Sample], cfg: &TrainCfg) -> Result<Voice>;
 }
 
-pub trait LlmProvider { /* chat / sft */ }
-pub trait VideoProvider { /* render(i2v) */ }
-pub trait KnowledgeProvider { /* chunk / embed / search */ }
+pub trait LlmProvider    { /* chat / sft (远端) */ }
+pub trait VideoProvider  { /* render (远端 i2v) */ }
+pub trait KnowledgeProvider { /* chunk / embed / search (远端) */ }
 ```
 
 每个 Provider 一份 `provider.json`：
@@ -224,14 +251,21 @@ pub trait KnowledgeProvider { /* chunk / embed / search */ }
 {
   "name": "kling_avatar",
   "kind": "avatar",
-  "version": "v1.2",
-  "config_schema": { ... },
-  "endpoint": "https://api.kling.ai/...",
-  "limits": { "max_refs": 6, "max_lora_size_mb": 250 }
+  "auth": { "scheme": "bearer", "env": "KLING_API_KEY", "config_key": "api_key" },
+  "endpoint": "https://api.kling.ai/v1/...",
+  "limits": { "max_refs": 6 }
 }
 ```
 
+`auth` 字段描述：
+- `scheme`：`bearer`（默认） / `header:X-Custom` / `query` 等
+- `env`：token 来自环境变量（推荐）
+- `config_key`：也支持从 `avc.toml` 取（用 `secret: true` 标记加密存盘）
+
+**所有 token 仅在内存中使用；日志中必须 mask。** `avc config show` 默认隐藏 secret。
+
 新增 Provider = 新建 trait 实现 + 一个 `provider.json`；主仓无需修改。
+
 
 ---
 
@@ -290,7 +324,7 @@ pub trait KnowledgeProvider { /* chunk / embed / search */ }
 | 编号 | 决策 | 备选 | 理由 |
 |------|------|------|------|
 | ADR-001 | **Rust + 单二进制** 为主仓 | Python 服务 / Go / Node | 启动快、类型强、与"CLI 优先"对齐 |
-| ADR-002 | **SQLite + 本地文件系统** 起手 | Postgres / MinIO | 零运维、可拷走、单用户足够 |
+| ADR-002 | **SQLite + 本地文件系统** 起手（仅存元数据与产物引用） | Postgres / MinIO | 零运维、可拷走、单用户足够；模型权重不在本仓 |
 | ADR-003 | **DAG 节点编排引擎自研** | Temporal / Argo | 起步要轻、可演进 |
 | ADR-004 | **Provider 通过 trait 抽象** + 内置实现 | 配置化插件框架 | 内置足够简单；插件框架可后续加 |
 | ADR-005 | **PersonaModelVersion 不可变** | 可变 + 软删 | 历史视频必须稳定 |
@@ -298,22 +332,26 @@ pub trait KnowledgeProvider { /* chunk / embed / search */ }
 | ADR-007 | **不内嵌计费 / 可观测性 dashboard** | 内嵌 SaaS 化 | 与开源核心定位冲突 |
 | ADR-008 | **CLI + REPL 双形态** | 仅 CLI / 仅 REPL | 自动化 + 探索各有需求 |
 | ADR-009 | **Provider 通过 HTTP/gRPC，不在本仓跑模型** | 内置本地 GPU | 主仓是编排层，模型在 Provider |
+| ADR-010 | **仅调用 token 鉴权的商业 / 开源模型 API** | 自托管 / 本地推理 | 与"开源核心、可商用接入"定位一致；免除 GPU / 驱动 / 推理服务治理负担 |
 
 ---
 
 ## 13. 演进路线
 
 ### Phase 0 — 最小闭环（4 周）
-- `avc persona new` 跑通：v1 生成（一个 avatar provider + 一个 voice provider）
-- `avc render video` 跑通：1 条视频（脚本 + tts + i2v + compose）
+- `avc persona new` 跑通：v1 生成（avatar = 商业 API；voice = 商业 API / 商用音色）
+- `avc render video` 跑通：1 条视频（脚本 + tts + i2v + compose，全部为远端 API）
 - 不做版本管理（先用 `current_version = 1`）
+- 所有 provider 字段必须含 `api_key`；`avc init` 提示用户配置 token
 - 验收：`avc persona new Lily → avc render video --persona lily --topic hi` 出一个能看的 mp4
 
 ### Phase 1 — Provider 矩阵 + 持续训练（8 周）
-- 形象：sdxl / kling avatar / heygen / flux lora
-- 声音：cosyvoice / gpt-sovits / volc tts
-- LLM：openai 兼容接口
-- 视频：kling / cogvideox / animatediff
+- 形象（商业 API）：kling_avatar / heygen_avatar / doubao_image / 即梦（seedream）/ volc_image
+- 形象（开源 via API）：replicate_sdxl / replicate_flux_lora / hf_inference_ip_adapter_faceid
+- 声音：volc_tts / azure_tts / elevenlabs / doubao_tts / openai_tts（gpt-4o audio）
+- LLM：openai_compat（兼容 OpenAI / Anthropic / DeepSeek / 智谱 / 豆包）
+- 视频：kling / doubao_seedance / pika / runway / 即梦 / replicate_cogvideox
+- 微调：openai_compat_sft / replicate_trainer / 厂商 SFT 端点（提交样本 / 等训练 / 拿回新 model_id）
 - 多版本 + 漂移评估 + 切版本 + 强制回滚
 - 反馈回灌（手动 + 自动）
 

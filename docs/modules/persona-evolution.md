@@ -33,6 +33,8 @@
 
 平台必须承担"如何不漂移"的责任，而不是让用户自己解决。
 
+> **演进 ≠ 本地推理**。训练 / 微调都在远端 Provider 上完成，AVCore 只负责：收集样本 → 打包数据集 → 调用 Provider SFT 端点 → 等结果 → 拿到新 `model_id` → 建立新版本目录（只存产物，不存权重）。
+
 ---
 
 ## 3. 样本体系
@@ -58,24 +60,28 @@
 一次训练任务可同时改多维度，也可只改一个：
 
 ### 4.1 视觉（avatar）
-- 新参考图 → LoRA 增量训练 / InstantID 强化
-- 角度修正：发现"侧脸不像"→ 用新角度图专项训练
-- 风格切换："写实"换"皮克斯风"重新训练视觉资产
+- 新参考图 → 调用 Provider 的 SFT/fine-tune 端点（提交样本 + base model_id）→ 远端训练
+- 角度修正：发现"侧脸不像"→ 用新角度图专项远端训练
+- 风格切换："写实"换"皮克斯风"→ 在 Provider 上重新训练视觉模型
+- AVCore 不下载 LoRA 权重，只存 `lora/ref.json`（`model_id / provider / trained_at / base_model`）
 
 ### 4.2 声音（voice）
-- 新声音样本 → TTS 增量训练
-- 情绪校正：发现某情绪总翻车 → 该情绪专项样本
-- 多语扩展：中文 → 加上英粤 → 多语种训练
+- 新声音样本 → 调用 Provider 的 voice clone / SFT 端点 → 远端训练
+- 情绪校正：发现某情绪总翻车 → 该情绪专项样本 + Provider emotion-tuning 端点
+- 多语扩展：中文 → 加英粤 → Provider 多语训练端点
+- AVCore 仅持有更新后的 `voice_id / model_id`
 
 ### 4.3 人设（persona）
-- 行为样本追加 → SFT 对齐 / system prompt 强化
-- 口头禅萃取：高完播率回答 → 固化为 catchphrase
-- 禁忌收紧：出过几次错的话题 → 写入 taboo
+- 行为样本追加 → 调用兼容 OpenAI SFT 的 LLM Provider（提交 JSONL 数据集）→ 远端 SFT
+- 口头禅萃取：高完播率回答 → 固化为 catchphrase（写入 `persona.json`，不需要训练）
+- 禁忌收紧：出过几次错的话题 → 写入 taboo（写入 `persona.json`，不需要训练）
+- 训练后的模型 `ft_model_id` 由 Provider 返回；AVCore 仅存引用
 
 ### 4.4 知识（knowledge）
-- 追加语料 → 重建索引
-- 知识替换：错误语料标 `deprecated`（不删，权重视置零）
+- 追加语料 → 调用远端 embed API 重建向量索引；本地可选缓存 chunks + 向量以加速检索
+- 知识替换：错误语料标 `deprecated`（不删，检索时权重置零）
 - 领域切换：v2 法律 / v3 医学可整体换 corpus
+- Embedding 来自远端 API；本地不持有"模型"，仅持有特征数据
 
 ---
 
@@ -114,17 +120,19 @@ struct TrainingConfig {
 
 ## 6. 训练流水线（DAG 节点）
 
+> 所有训练节点都通过 HTTP 调用 Provider 的 SFT/fine-tune 端点；AVCore 只提交样本 + base model_id，等待远端返回新 model_id。
+
 ```
 [1] sample_filter       ─ 关联 base_version，质量过滤，去重（embedding cosine < 0.92 丢弃）
         │
         ▼
-[2] avatar_train (if)   ─ LoRA / InstantID 增量微调
-[3] voice_train (if)    ─ CosyVoice / SoVITS / F5 增量
-[4] persona_sft (if)    ─ LLM SFT + 偏好对齐
-[5] knowledge_reindex   ─ embed + 索引重建
+[2] avatar_train (if)   ─ POST { samples, base_avatar_ref } → Provider SFT → 返回 { new_avatar_ref }
+[3] voice_train (if)    ─ POST { samples, base_voice_ref  } → Provider SFT → 返回 { new_voice_ref  }
+[4] persona_sft (if)    ─ POST { jsonl_dataset, base_model } → Provider SFT → 返回 { new_model_id }
+[5] knowledge_reindex   ─ POST { chunks } → Provider embed → 返回 { vectors }（本地可缓存）
         │
         ▼
-[6] identity_anchor_extract  ─ 与父版本同样的编码器重新抽取
+[6] identity_anchor_extract  ─ 调用 Provider 的特征抽取 API（face / voice / style embeddings）
         │
         ▼
 [7] drift_eval          ─ face/voice/style cosine vs 父版本
@@ -132,6 +140,8 @@ struct TrainingConfig {
         ├─ 达标 (≥ threshold) ─▶ publish v(N+1)
         └─ 不达标            ─▶ fallback_to_base + drift_report
 ```
+
+训练耗时的实际来源是 Provider 端的排队与计算；AVCore 通过 `task_xxx --watch` 长轮询 Provider 任务状态。
 
 每个节点是 DAG 中的独立步，节点结果**全部落 v(N+1) 目录**。这就是为什么 v(N+1) 必须是新目录——任何中间产物都能定位。
 
@@ -261,26 +271,30 @@ avc persona sample stats lily               # 数量 / 质量 / 标签分布
 
 ---
 
-## 11. Provider 实现
+## 11. Provider 实现（全部 token 鉴权的商业 / 开源 API）
 
 | 维度 | Provider（规划） |
 |------|----------------|
-| 视觉 | `sdxl_lora_incremental`, `kling_avatar_finetune` |
-| 声音 | `cosyvoice_incremental`, `gpt_sovits_incremental` |
-| 人设 | `llm_sft`（OpenAI / Anthropic / 国产大模型 SFT） |
-| 知识 | `embed_reindex` |
+| 视觉 | `kling_avatar_finetune`, `heygen_avatar_finetune`, `replicate_flux_lora_trainer`, `doubao_image_finetune`, `seededit_finetune` |
+| 声音 | `elevenlabs_voice_clone`, `azure_speech_personal_voice`, `doubao_voice_finetune`, `openai_tts_finetune` |
+| 人设 | `openai_compat_sft`（兼容 OpenAI / Anthropic / DeepSeek / 智谱 / 豆包 SFT 端点） |
+| 知识 | `openai_embed`, `volcengine_embed`, `alibaba_embed`, `cohere_embed`（均为远端 API） |
 
-切换 = 配置 `provider.json` + 替换 trait 实现，主仓不动。
+切换 = 改 `provider.json` 的 `auth.endpoint` 字段 + 替换 trait 实现，主仓不动。
+
+> 每个 Provider 必须有 `api_key`（或兼容 token）；无 `api_key` 配置时 `avc` 会拒绝调用并提示 `avc config set provider.<name>.api_key ...`。
 
 ---
 
 ## 12. 调度与资源
 
-- 训练任务是 **GPU 重任务**，独立 `train-pool`（Phase 1 引入）
-- Phase 0：直接在主进程用 tokio task；本地 CPU 训练（小模型/Lora）即可
+- 实际计算发生在 Provider 端，AVCore 端是轻量编排
+- Phase 0：直接在主进程用 tokio task 长轮询 Provider 任务状态
+- Phase 1：可在 Provider 端为高频训练任务预留 "scheduled slot"（由 Provider 配额决定）
 - 单 PersonaModel **不并发训练**（防版本冲突）
-- 多 PersonaModel 可并行；按 tenant/本地用户公平分享
-- 失败也记 GPU/CPU 工时（防止恶意刷训练）
+- 多 PersonaModel 可并行；按 Provider 限速 (rate limit) 公平分享
+- 失败也记 cost（按 Provider 返回的 `usage` 字段），防止刷调用
+- **不涉及本地 GPU / CPU 显存**——选型不要混淆 "Provider 端排队" 与 "本地推理"
 
 ---
 

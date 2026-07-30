@@ -1,8 +1,10 @@
 # Provider / API 参考
 
 > AVCore **不暴露 HTTP / gRPC 服务**——它是 CLI + Rust crate。  
-> 这一页给出：(a) 各 Provider 的配置字段、(b) Rust crate 集成方式、(c) 程序化调用示例。
+> 这一页给出：(a) 各 Provider 的配置字段（含 `api_key`）、(b) Rust crate 集成方式、(c) 程序化调用示例。
 
+> **强约束**：每个 Provider 都通过 token 鉴权调用商业 / 开源模型的 HTTP API；本框架**不加载、不推理任何本地模型**。
+>
 > CLI / REPL 用法见 [`cli.md`](../cli.md)；统一架构见 [`architecture.md`](../architecture.md)。
 
 ---
@@ -117,62 +119,119 @@ avc.providers().avatar().register("my_avatar", Arc::new(MyAvatarProvider));
 
 ## 3. 形象 Provider
 
-### 3.1 `sdxl_ip_adapter`（规划）
+> 所有 Provider 必须有 `api_key`（`secret: true`）；调用前 `avc` 会做 preflight 校验，没配就拒绝。
 
-```json
-{
-  "name": "sdxl_ip_adapter",
-  "kind": "avatar",
-  "version": "v1",
-  "config_schema": {
-    "base_url":      { "type": "string", "required": true },
-    "max_refs":      { "type": "int",    "default": 6 },
-    "default_size":  { "type": "string", "default": "1024x1024" },
-    "steps":         { "type": "int",    "default": 30 },
-    "guidance":      { "type": "float",  "default": 7.5 }
-  }
-}
-```
-
-### 3.2 `kling_avatar`
+### 3.1 `kling_avatar`
 
 ```json
 {
   "name": "kling_avatar",
   "kind": "avatar",
-  "version": "v1.2",
-  "config_schema": {
-    "api_key":    { "type": "string", "required": true, "secret": true },
-    "endpoint":   { "type": "string", "default": "https://api.kling.ai" },
-    "max_refs":   { "type": "int",    "default": 6 },
-    "max_lora_mb":{ "type": "int",    "default": 250 }
-  }
+  "auth": { "scheme": "bearer", "env": "KLING_API_KEY", "config_key": "api_key" },
+  "endpoint": "https://api.kling.ai/v1/avatars",
+  "limits": { "max_refs": 6 },
+  "default_size": "1024x1024"
 }
 ```
 
-### 3.3 `heygen_avatar`、`flux_lora` 类似。
-
----
-
-## 4. 声音 Provider
-
-### 4.1 `cosyvoice`（自托管友好）
+### 3.2 `heygen_avatar`
 
 ```json
 {
-  "name": "cosyvoice",
-  "kind": "voice",
-  "config_schema": {
-    "api_url":  { "type": "string", "required": true },
-    "language": { "type": "string", "default": "zh" },
-    "min_sample_seconds": { "type": "int", "default": 30 }
-  }
+  "name": "heygen_avatar",
+  "kind": "avatar",
+  "auth": { "scheme": "bearer", "config_key": "api_key" },
+  "endpoint": "https://api.heygen.ai/v1/avatars",
+  "limits": { "max_refs": 8 }
 }
 ```
 
-### 4.2 `gpt_sovits`、`volc_tts`、`azure_tts` 类似。
+### 3.3 `doubao_image`（字节豆包）
+
+```json
+{
+  "name": "doubao_image",
+  "kind": "avatar",
+  "auth": { "scheme": "bearer", "env": "ARK_API_KEY", "config_key": "api_key" },
+  "endpoint": "https://ark.cn-beijing.volces.com/api/v3/images"
+}
+```
+
+### 3.4 `seedream`（阿里即梦 / 通义）
+
+```json
+{
+  "name": "seedream",
+  "kind": "avatar",
+  "auth": { "scheme": "bearer", "config_key": "api_key" },
+  "endpoint": "https://dashscope.aliyuncs.com/api/v1/services/aigc/image-generation"
+}
+```
+
+### 3.5 `replicate_flux_lora`
+
+```json
+{
+  "name": "replicate_flux_lora",
+  "kind": "avatar",
+  "auth": { "scheme": "bearer", "env": "REPLICATE_API_TOKEN", "config_key": "api_key" },
+  "endpoint": "https://api.replicate.com/v1/predictions"
+}
+```
+
+> 本框架**不包含**自托管形态的 avatar Provider——所有都是 token API。
 
 ---
+
+
+## 4. 声音 Provider
+
+### 4.1 `elevenlabs_voice_clone`
+
+```json
+{
+  "name": "elevenlabs_voice_clone",
+  "kind": "voice",
+  "auth": { "scheme": "bearer", "config_key": "api_key" },
+  "endpoint": "https://api.elevenlabs.io/v1/voices/add",
+  "limits": { "min_sample_seconds": 30, "max_sample_seconds": 300 }
+}
+```
+
+### 4.2 `azure_speech_personal_voice`
+
+```json
+{
+  "name": "azure_speech_personal_voice",
+  "kind": "voice",
+  "auth": { "scheme": "bearer", "config_key": "api_key" },
+  "endpoint": "https://<region>.api.cognitive.microsoft.com/",
+  "options": { "region": { "type": "string", "required": true } }
+}
+```
+
+### 4.3 `doubao_tts`
+
+```json
+{ "name": "doubao_tts", "kind": "voice",
+  "auth": { "scheme": "bearer", "env": "ARK_API_KEY", "config_key": "api_key" },
+  "endpoint": "https://openspeech.bytedance.com/api/v1/tts" }
+```
+
+### 4.4 `openai_tts`（gpt-4o audio 等）
+
+```json
+{ "name": "openai_tts", "kind": "voice",
+  "auth": { "scheme": "bearer", "config_key": "api_key" },
+  "endpoint": "https://api.openai.com/v1/audio/speech" }
+```
+
+### 4.5 `volc_tts`、`azure_tts` 等类似结构。
+
+> 不包含自托管声音 Provider（`cosyvoice` / `gpt-sovits` / `f5-tts` 等本地推理方案）。
+
+---
+
 
 ## 5. LLM Provider
 
@@ -215,38 +274,48 @@ avc.providers().avatar().register("my_avatar", Arc::new(MyAvatarProvider));
 {
   "name": "kling",
   "kind": "video",
-  "config_schema": {
-    "api_key":     { "type": "string", "required": true, "secret": true },
-    "endpoint":    { "type": "string" },
-    "max_seconds": { "type": "int", "default": 10 },
-    "mode":        { "type": "enum", "options": ["std", "pro"], "default": "std" }
-  }
+  "auth": { "scheme": "bearer", "env": "KLING_API_KEY", "config_key": "api_key" },
+  "endpoint": "https://api.kling.ai/v1/videos",
+  "limits": { "max_seconds": 10 },
+  "options": { "mode": { "type": "enum", "values": ["std", "pro"], "default": "std" } }
 }
 ```
 
-### 6.2 `cogvideox`、`animatediff`、`hunyuan_video` 类似。
+### 6.2 `doubao_seedance`
+
+```json
+{ "name": "doubao_seedance", "kind": "video",
+  "auth": { "scheme": "bearer", "env": "ARK_API_KEY", "config_key": "api_key" },
+  "endpoint": "https://ark.cn-beijing.volces.com/api/v3/video/generations" }
+```
+
+### 6.3 `pika`、`runway`、`replicate_cogvideox` 类似结构。
+
+> 不包含 `cogvideox` / `animatediff` / `hunyuan_video` 的本地推理版本。
 
 ---
+
 
 ## 7. 知识 Provider
 
-### 7.1 `embed_openai`
+### 7.1 `openai_embed`
 
 ```json
 {
-  "name": "embed_openai",
+  "name": "openai_embed",
   "kind": "embed",
-  "config_schema": {
-    "api_key":  { "type": "string", "required": true, "secret": true },
-    "model":    { "type": "string", "default": "text-embedding-3-large" },
-    "dim":      { "type": "int",    "default": 3072 }
-  }
+  "auth": { "scheme": "bearer", "config_key": "api_key" },
+  "endpoint": "https://api.openai.com/v1/embeddings",
+  "options": { "model": { "default": "text-embedding-3-large" }, "dim": { "default": 3072 } }
 }
 ```
 
-### 7.2 `embed_bge`、`reranker_bge` 类似。
+### 7.2 `volcengine_embed`、`alibaba_embed`、`cohere_embed`、`cohere_rerank`、`voyage_rerank` 结构类似。
+
+> 不包含 `embed_bge` / `bge-reranker` 的本地推理版本；若必须使用 BGE，需通过 Hugging Face Inference API 等远端端点。
 
 ---
+
 
 ## 8. 存储 Provider（可选 / Phase 2）
 

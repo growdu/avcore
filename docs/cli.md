@@ -25,12 +25,15 @@ avc init
 #   ├── media/
 #   └── cache/
 
-# 配置 Provider（Key 写入 avc.toml，权限 0600）
-avc config set provider.avatar.sdxl.base_url "http://127.0.0.1:7860"
-avc config set provider.voice.cosyvoice.api_key "..."
+# 配置 Provider（**必须** token，所有调用走远端 API）
+avc config set provider.avatar.kling.api_key   "klg_..."
+avc config set provider.voice.elevenlabs.api_key "el_..."
+avc config set provider.llm.openai.api_key     "sk-..."
+avc config set provider.video.kling.api_key    "klg_..."
 
-# 查看当前配置
+# 查看当前配置（secret 默认 mask）
 avc config show
+# 等价：avc config show --reveal-secrets  # 真要看需要显式 flag
 ```
 
 > 所有命令都支持 `--home <path>` 指向自定义根目录，便于多环境。
@@ -327,16 +330,18 @@ avc provider config sdxl_ip_adapter --set batch_size=4
 avc provider test sdxl_ip_adapter              # 连通性测试
 ```
 
-主流 Provider 在 Phase 1 起步时覆盖（规划）：
+主流 Provider 在 Phase 1 起步时覆盖（**全部 token 鉴权 API**）：
 
 | 维度 | Provider |
 |------|----------|
-| 形象 | `sdxl_ip_adapter`, `kling_avatar`, `heygen_avatar`, `flux_lora` |
-| 声音 | `cosyvoice`, `gpt_sovits`, `volc_tts`, `azure_tts` |
-| LLM | `openai_compat` (兼容 OpenAI / 豆包 / DeepSeek / 智谱等) |
-| 视频 | `kling`, `cogvideox`, `animatediff`, `hunyuan_video`, `minimax_hailuo` |
-| 知识 | `embed_openai`, `embed_bge`, `reranker_bge` |
+| 形象 | `kling_avatar`, `heygen_avatar`, `doubao_image`, `seedream`, `replicate_flux_lora` |
+| 声音 | `volc_tts`, `azure_tts`, `elevenlabs`, `doubao_tts`, `openai_tts` |
+| LLM | `openai_compat`（兼容 OpenAI / Anthropic / DeepSeek / 智谱 / 豆包等） |
+| 视频 | `kling`, `doubao_seedance`, `pika`, `runway`, `replicate_cogvideox` |
+| 知识 | `openai_embed`, `volcengine_embed`, `alibaba_embed`, `cohere_embed`, `cohere_rerank` |
+| 微调 | `openai_compat_sft`, `replicate_trainer`, `kling_avatar_finetune`, `elevenlabs_voice_clone` |
 
+> **强约束**：AVCore 不支持自托管模型。`sdxl_ip_adapter` / `cosyvoice` / `gpt_sovits` 这类需要本地推理的不在 Provider 表中。
 > 每个 Provider 是一份 `provider.json` 配置 + 一段 Rust trait 实现。新增 Provider 不需要修改核心代码。
 
 ---
@@ -407,12 +412,19 @@ REPL 上下文：
 
 ### 8.2 错误
 - 退出码：0 ok；1 通用失败；2 参数错；3 资源不存在；4 已废弃/冲突；10+ provider 错误
+  - `5` 鉴权失败（如 Provider token 无效 / 过期）
+  - `6` token 未配置
 - 错误消息统一格式：
   ```
   error[E0403]: persona_not_found
     target: lily
     hint: did you mean "Lily" (capital L)?
+  
+  error[E0501]: provider_unauthenticated
+    provider: provider.avatar.kling
+    hint: avc config set provider.avatar.kling.api_key ...
   ```
+- **Provider 的 api_key 未配置**：所有调用前 `avc` 强制 preflight；明确提示 `avc config set ...`
 
 ### 8.3 退出与清理
 - 任何命令 Ctrl+C 都先停下任务，再询问

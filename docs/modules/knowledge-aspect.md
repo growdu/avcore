@@ -188,16 +188,18 @@ avc persona knowledge unbind lily
 
 ---
 
-## 9. Provider
+## 9. Provider（全部 token 鉴权 API）
 
 | Provider | 说明 |
 |----------|------|
-| `embed_openai` | OpenAI text-embedding-3 |
-| `embed_bge` | BAAI BGE 系列（自托管友好） |
-| `reranker_bge` | BGE-reranker |
-| `splitter_langchain` | 各种切分器（Phase 1+） |
+| `openai_embed` | OpenAI text-embedding-3-large / small |
+| `volcengine_embed` | 火山引擎 embedding |
+| `alibaba_embed` | 阿里通义 embedding |
+| `cohere_embed` | Cohere embed（多语支持好） |
+| `cohere_rerank` | Cohere rerank |
+| `voyage_rerank` | Voyage AI rerank |
 
-切换 = 修改 `provider.json` 的 `embed` / `rerank` / `splitter` 字段。
+切换 = 修改 `provider.json` 的 `embed` / `rerank` / `splitter` 字段。**所有 embedding / rerank 都来自远端 API**，本地不持有 encoder。
 
 ---
 

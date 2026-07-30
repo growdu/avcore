@@ -243,17 +243,21 @@ ready 节点（依赖满足）
 - 多 persona 并行；按用户公平
 
 ### 7.3 资源池（Phase 1 引入）
-| 节点 | 池 |
-|------|----|
-| `llm`, `persona_train_style` | llm-pool |
-| `voice`, `persona_train_voice` | tts-pool |
-| `avatar_image`, `persona_train_avatar` | img-pool |
-| `video` | video-pool |
-| `lipsync` | lipsync-pool |
-| `consistency_eval`, `identity_anchor` | eval-pool |
-| `compose`, `encode` | compose-pool |
 
-> Phase 0 在主进程内用 tokio task 跑就够了。
+> AVCore 不持有本地计算资源（CPU/GPU 都不参与推理）。"资源池"指**对 Provider 的连接 / 限速管理**，而非本地 GPU 池。
+
+| 节点 | 对端资源 |
+|------|----------|
+| `llm`, `persona_train_style` | LLM API（OpenAI / Anthropic / DeepSeek / 豆包） |
+| `voice`, `persona_train_voice` | TTS / Voice Clone API（ElevenLabs / Azure / 豆包） |
+| `avatar_image`, `persona_train_avatar` | Avatar API（Kling / HeyGen / Doubao） |
+| `video` | i2v API（Kling / Seedance / 即梦 / Replicate） |
+| `lipsync` | Lipsync API（端到端由 i2v 提供商覆盖，无需独立节点） |
+| `consistency_eval`, `identity_anchor` | Embedding API（OpenAI / volcengine / cohere），用于特征对比 |
+| `compose`, `encode` | ffmpeg（**仅本机**运行的转码 / 拼接；不涉及 ML 模型） |
+
+注：`compose / encode` 是仅有的**本地**"模型"——FFmpeg 是工具，不算 ML 模型。  
+Phase 0 在主进程内用 tokio task 跑就够了；Phase 1 引入 Provider 限速路由表。
 
 ---
 
