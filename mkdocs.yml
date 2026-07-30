@@ -78,6 +78,7 @@ nav:
   - 架构: architecture.md
   - 存储: storage.md
   - CLI: cli.md
+  - Shell: shell.md
   - 子模块:
       - 模块索引: modules/README.md
       - 人物角色模型生成: modules/persona-modeling.md

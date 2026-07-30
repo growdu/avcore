@@ -32,9 +32,12 @@ avc init                                                         # 建 ~/.local/
 avc config set provider.llm.openai.api_key "sk-..."
 avc persona onboard yu --from ./yu.toml                          # [集成] 创建 + 上传资产
 avc render run --persona yu --version 1 --topic "InnoDB Buffer Pool"  # [集成] 出片
+
+avc shell                                          # 交互模式：可输自然语言
+avc ask --yes "把 Yu 的 traits 改成严谨务实"          # 非交互 NL：管道里用
 ```
 
-> `avc` 提供两类命令：**原子**（`persona create` / `set-traits` / `render script` 等）和 **集成**（`persona onboard` / `persona refine` / `persona finetune` / `render run`）。复杂工作流可用 shell 把原子串起来，详见 [`docs/cli.md`](docs/cli.md)。
+> `avc` 三种入口：**精确 CLI**（`avc persona list`）、**交互式 Shell**（`avc shell`，可输入自然语言）、**非交互式 NL**（`avc ask "..."`）。底层 = 原子命令 + 集成命令。详见 [`docs/cli.md`](docs/cli.md) 与 [`docs/shell.md`](docs/shell.md)。
 
 ---
 
@@ -44,7 +47,8 @@ avc render run --persona yu --version 1 --topic "InnoDB Buffer Pool"  # [集成]
 2. [架构](docs/architecture.md) · 怎么实现、模块划分
 3. [存储](docs/storage.md) · 单一 SQLite 的 schema
 4. [CLI](docs/cli.md) · 命令与用法
-5. [子模块](docs/modules/README.md)：
+5. [Shell](docs/shell.md) · 交互式 Shell 与自然语言
+6. [子模块](docs/modules/README.md)：
    - [人物角色模型生成](docs/modules/persona-modeling.md) — `persona-svc`（+ 可选知识维度）
    - [人物角色模型迭代与微调](docs/modules/persona-iteration.md) — `iterate-svc` + `finetune-svc`
    - [视频生成](docs/modules/video-generation.md) — `render-svc`
