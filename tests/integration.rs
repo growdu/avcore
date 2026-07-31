@@ -172,6 +172,195 @@ fn finetune_publish_failed_drifts_rollback() {
 }
 
 #[test]
+fn finetune_rejects_missing_base_version() {
+    // Task 2 / Step 1: persona 只有 v1，从不存在的 v99 分叉应被拒绝。
+    // 期望：exit 3 (NotFound)；DB 中无 v100、无 finetune_jobs。
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let config = dir.path().join("config");
+
+    bin().env("XDG_DATA_HOME", &data).env("XDG_CONFIG_HOME", &config).arg("init").output().unwrap();
+    bin().env("XDG_DATA_HOME", &data).env("XDG_CONFIG_HOME", &config)
+        .args(["persona", "create", "--name", "yu"]).output().unwrap();
+
+    let r = bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .args(["finetune", "start", "yu", "--base-version", "99"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        r.status.code(),
+        Some(3),
+        "missing base version 应 exit 3 (NotFound); stderr={}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+
+    // DB 中 v100 应不存在
+    let db = rusqlite::Connection::open(data.join("avc/avc.db")).unwrap();
+    let v100_count: i64 = db.query_row(
+        "SELECT COUNT(*) FROM persona_versions pv
+         JOIN persona_models pm ON pm.id = pv.persona_model_id
+         WHERE pm.name = ? AND pv.version = 100",
+        ["yu"], |r| r.get(0)).unwrap();
+    assert_eq!(v100_count, 0, "v100 不应被创建");
+
+    // finetune_jobs 应为空
+    let job_count: i64 = db.query_row(
+        "SELECT COUNT(*) FROM finetune_jobs fj
+         JOIN persona_models pm ON pm.id = fj.persona_model_id
+         WHERE pm.name = ?",
+        ["yu"], |r| r.get(0)).unwrap();
+    assert_eq!(job_count, 0, "finetune_jobs 不应有任何条目");
+}
+
+#[test]
+fn finetune_rejects_non_ready_base_version() {
+    // Task 2 / Step 1: 先 start base 1 创建 building v2（不 publish），
+    // 再以 base 2 start，应被拒绝（exit 4 Conflict），且无 v3。
+    // finetune_jobs 只保留第一次那条 1 条。
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let config = dir.path().join("config");
+
+    bin().env("XDG_DATA_HOME", &data).env("XDG_CONFIG_HOME", &config).arg("init").output().unwrap();
+    bin().env("XDG_DATA_HOME", &data).env("XDG_CONFIG_HOME", &config)
+        .args(["persona", "create", "--name", "yu"]).output().unwrap();
+
+    // 第一次 start base 1：应成功，v2 进入 building 状态（不 publish）。
+    let r1 = bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .args(["finetune", "start", "yu", "--base-version", "1"])
+        .output()
+        .unwrap();
+    assert!(
+        r1.status.success(),
+        "第一次 start base 1 应成功；stderr={}",
+        String::from_utf8_lossy(&r1.stderr)
+    );
+
+    // 第二次 start base 2：v2 处于 building，应被拒绝（exit 4 Conflict）。
+    let r2 = bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .args(["finetune", "start", "yu", "--base-version", "2"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        r2.status.code(),
+        Some(4),
+        "non-ready base version 应 exit 4 (Conflict); stderr={}",
+        String::from_utf8_lossy(&r2.stderr)
+    );
+
+    let db = rusqlite::Connection::open(data.join("avc/avc.db")).unwrap();
+
+    // v3 不应被创建
+    let v3_count: i64 = db.query_row(
+        "SELECT COUNT(*) FROM persona_versions pv
+         JOIN persona_models pm ON pm.id = pv.persona_model_id
+         WHERE pm.name = ? AND pv.version = 3",
+        ["yu"], |r| r.get(0)).unwrap();
+    assert_eq!(v3_count, 0, "v3 不应被创建");
+
+    // finetune_jobs 应只有第一次的 1 条
+    let job_count: i64 = db.query_row(
+        "SELECT COUNT(*) FROM finetune_jobs fj
+         JOIN persona_models pm ON pm.id = fj.persona_model_id
+         WHERE pm.name = ?",
+        ["yu"], |r| r.get(0)).unwrap();
+    assert_eq!(job_count, 1, "finetune_jobs 应只有 1 条");
+}
+
+#[test]
+fn config_set_get_round_trip() {
+    // 临时 XDG init，再 set provider.llm.openai.api_key sk-test，再 get
+    // 断言 exit 0、stdout 含完整 key 与 sk-test、且不含 `(unset)`
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let config = dir.path().join("config");
+
+    let r = bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .arg("init")
+        .output()
+        .unwrap();
+    assert!(r.status.success(), "init: {}", String::from_utf8_lossy(&r.stderr));
+
+    let key = "provider.llm.openai.api_key";
+    let val = "sk-test";
+
+    let r = bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .args(["config", "set", key, val])
+        .output()
+        .unwrap();
+    assert!(r.status.success(), "set: {}", String::from_utf8_lossy(&r.stderr));
+
+    let r = bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .args(["config", "get", key])
+        .output()
+        .unwrap();
+    assert!(r.status.success(), "get should exit 0: {}", String::from_utf8_lossy(&r.stderr));
+    let stdout = String::from_utf8_lossy(&r.stdout);
+    assert!(stdout.contains(key), "stdout 应含完整 key，实际: {:?}", stdout);
+    assert!(stdout.contains(val), "stdout 应含 sk-test，实际: {:?}", stdout);
+    assert!(!stdout.contains("(unset)"), "不应出现 (unset)，实际: {:?}", stdout);
+}
+
+#[test]
+fn config_rejects_empty_provider_name() {
+    // 契约：<name> 段必须非空；空 name 的 key 应作为参数错误被拒绝（exit 2）。
+    // get 与 set 对称：均不可接受 `provider.<dim>..<field>` 形式。
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let config = dir.path().join("config");
+
+    let r = bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .arg("init")
+        .output()
+        .unwrap();
+    assert!(r.status.success(), "init: {}", String::from_utf8_lossy(&r.stderr));
+
+    // GET 空 name
+    let r = bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .args(["config", "get", "provider.llm..api_key"])
+        .output()
+        .unwrap();
+    assert_eq!(r.status.code(), Some(2), "empty-name get 应 exit 2 (Arg)");
+    let stderr = String::from_utf8_lossy(&r.stderr);
+    assert!(
+        stderr.contains("参数") || stderr.contains("不支持"),
+        "stderr 应提示参数/不支持 key，实际: {:?}",
+        stderr
+    );
+
+    // SET 空 name：亦应被拒绝
+    let r = bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .args(["config", "set", "provider.llm..api_key", "sk-test"])
+        .output()
+        .unwrap();
+    assert_eq!(r.status.code(), Some(2), "empty-name set 应 exit 2 (Arg)");
+    let stderr = String::from_utf8_lossy(&r.stderr);
+    assert!(
+        stderr.contains("参数") || stderr.contains("不支持"),
+        "stderr 应提示参数/不支持 key，实际: {:?}",
+        stderr
+    );
+}
+
+#[test]
 fn ask_without_llm_errors() {
     let dir = tempfile::tempdir().unwrap();
     bin()
@@ -185,4 +374,89 @@ fn ask_without_llm_errors() {
         .args(["ask", "列出所有角色"])
         .output().unwrap();
     assert_eq!(r.status.code(), Some(6)); // token missing
+}
+
+#[test]
+fn render_rejects_missing_version() {
+    // Task 3 / Step 1: persona 只有 v1，render 指定 version 99 应被拒绝。
+    // 期望：exit 3 (NotFound)；jobs 计数为 0（无悬挂 job）。
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let config = dir.path().join("config");
+
+    bin().env("XDG_DATA_HOME", &data).env("XDG_CONFIG_HOME", &config).arg("init").output().unwrap();
+    bin().env("XDG_DATA_HOME", &data).env("XDG_CONFIG_HOME", &config)
+        .args(["persona", "create", "--name", "yu"]).output().unwrap();
+
+    let r = bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .args(["render", "run", "--persona", "yu", "--version", "99", "--topic", "demo"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        r.status.code(),
+        Some(3),
+        "missing version 应 exit 3 (NotFound); stderr={}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+
+    // jobs 表应为空：不得创建悬挂 job
+    let db = rusqlite::Connection::open(data.join("avc/avc.db")).unwrap();
+    let job_count: i64 = db.query_row(
+        "SELECT COUNT(*) FROM jobs j
+         JOIN persona_models pm ON pm.id = j.persona_model_id
+         WHERE pm.name = ?",
+        ["yu"], |r| r.get(0)).unwrap();
+    assert_eq!(job_count, 0, "jobs 不应有任何条目");
+}
+
+#[test]
+fn render_rejects_non_ready_version() {
+    // Task 3 / Step 1: 先 finetune start base 1 创建 building v2（不 publish），
+    // 再 render v2；应被拒绝（exit 4 Conflict），且 jobs 为 0。
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let config = dir.path().join("config");
+
+    bin().env("XDG_DATA_HOME", &data).env("XDG_CONFIG_HOME", &config).arg("init").output().unwrap();
+    bin().env("XDG_DATA_HOME", &data).env("XDG_CONFIG_HOME", &config)
+        .args(["persona", "create", "--name", "yu"]).output().unwrap();
+
+    // 第一次 finetune start base 1：应成功，v2 进入 building 状态（不 publish）。
+    let r1 = bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .args(["finetune", "start", "yu", "--base-version", "1"])
+        .output()
+        .unwrap();
+    assert!(
+        r1.status.success(),
+        "第一次 finetune start base 1 应成功；stderr={}",
+        String::from_utf8_lossy(&r1.stderr)
+    );
+
+    // render v2：v2 处于 building，应被拒绝（exit 4 Conflict）。
+    let r = bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .args(["render", "run", "--persona", "yu", "--version", "2", "--topic", "demo"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        r.status.code(),
+        Some(4),
+        "non-ready version 应 exit 4 (Conflict); stderr={}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+
+    let db = rusqlite::Connection::open(data.join("avc/avc.db")).unwrap();
+
+    // jobs 表应为空
+    let job_count: i64 = db.query_row(
+        "SELECT COUNT(*) FROM jobs j
+         JOIN persona_models pm ON pm.id = j.persona_model_id
+         WHERE pm.name = ?",
+        ["yu"], |r| r.get(0)).unwrap();
+    assert_eq!(job_count, 0, "jobs 不应有任何条目");
 }

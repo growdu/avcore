@@ -5,10 +5,39 @@
 
 use crate::db::Db;
 use crate::error::{AvcError, AvcResult};
+use rusqlite::OptionalExtension;
 
 pub fn create_job(db: &Db, name: &str, version: i64, _topic: &str) -> AvcResult<String> {
     let p = crate::svc::persona::get_persona(db, name)?;
     let conn = db.conn.lock().unwrap();
+
+    // Task 3：在任何 INSERT 前、同一连接内校验 version 状态。
+    // - 无行 → NotFound("persona '<name>' version <n>")
+    // - status 既不是 'ready' 也不是 'pending' → Conflict (信息含 version/status)
+    let ver_status: Option<String> = conn
+        .query_row(
+            "SELECT status FROM persona_versions
+             WHERE persona_model_id = ? AND version = ?",
+            rusqlite::params![&p.id, version],
+            |r| r.get(0),
+        )
+        .optional()?;
+    match ver_status {
+        None => {
+            return Err(AvcError::NotFound(format!(
+                "persona '{}' version {}",
+                name, version
+            )));
+        }
+        Some(s) if s != "ready" && s != "pending" => {
+            return Err(AvcError::Conflict(format!(
+                "persona '{}' version {} is not stable (status: {})",
+                name, version, s
+            )));
+        }
+        _ => {} // ready 或 pending，放行
+    }
+
     let job_id = crate::svc::new_id("job");
     let now = crate::svc::now_iso();
     conn.execute(

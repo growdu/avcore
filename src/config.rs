@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::error::AvcResult;
+use crate::error::{AvcError, AvcResult};
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -113,5 +113,42 @@ impl Config {
             std::fs::set_permissions(path, perms)?;
         }
         Ok(())
+    }
+
+    /// 只读点号路径查询（与 `apply_set` 范围一致）：
+    /// 仅支持 `provider.<dim>.<name>.{api_key|model|endpoint}`。
+    /// 未知维度/字段/形状返回 `AvcError::Arg`；已知路径但未设置返回 `None`。
+    pub fn get_path(&self, key: &str) -> AvcResult<Option<String>> {
+        let parts: Vec<&str> = key.split('.').collect();
+        if parts.len() != 4 || parts[0] != "provider" {
+            return Err(AvcError::Arg(format!("暂不支持此 key: {}", key)));
+        }
+        let dim = parts[1];
+        let name = parts[2];
+        let field = parts[3];
+        if dim.is_empty() || name.is_empty() || field.is_empty() {
+            return Err(AvcError::Arg(format!("暂不支持此 key: {}", key)));
+        }
+
+        let map = match dim {
+            "avatar" => &self.provider.avatar,
+            "voice" => &self.provider.voice,
+            "llm" => &self.provider.llm,
+            "video" => &self.provider.video,
+            "embed" => &self.provider.embed,
+            _ => return Err(AvcError::Arg(format!("未知维度: {}", dim))),
+        };
+
+        let entry = match map.get(name) {
+            Some(e) => e,
+            None => return Ok(None),
+        };
+        let val = match field {
+            "api_key" => entry.api_key.as_ref(),
+            "model" => entry.model.as_ref(),
+            "endpoint" => entry.endpoint.as_ref(),
+            _ => return Err(AvcError::Arg(format!("未知字段: {}", field))),
+        };
+        Ok(val.map(|s| s.clone()))
     }
 }

@@ -68,16 +68,11 @@ pub fn cmd_config(argv: &[String]) -> AvcResult<()> {
             if argv.len() < 2 {
                 return Err(AvcError::Arg("config get <key>".into()));
             }
-            // 简化：用 toml 序列化后 grep
-            let s = toml::to_string_pretty(&cfg)?;
             let key = &argv[1];
-            for line in s.lines() {
-                if line.starts_with(key) {
-                    println!("{}", line);
-                    return Ok(());
-                }
+            match cfg.get_path(key)? {
+                Some(v) => println!("{} = {}", key, v),
+                None => println!("(unset) {}", key),
             }
-            println!("(unset) {}", key);
         }
         "set" => {
             if argv.len() < 3 {
@@ -104,6 +99,9 @@ fn apply_set(cfg: &mut Config, key: &str, val: &str) -> AvcResult<()> {
     let dim = parts[1];
     let name = parts[2];
     let field = parts[3];
+    if dim.is_empty() || name.is_empty() || field.is_empty() {
+        return Err(AvcError::Arg(format!("暂不支持此 key: {}", key)));
+    }
 
     let map = match dim {
         "avatar" => &mut cfg.provider.avatar,

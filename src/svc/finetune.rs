@@ -4,7 +4,8 @@
 //! 详见 docs/modules/persona-iteration.md §4。
 
 use crate::db::Db;
-use crate::error::AvcResult;
+use crate::error::{AvcError, AvcResult};
+use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -42,6 +43,33 @@ pub fn start(
 ) -> AvcResult<String> {
     let p = crate::svc::persona::get_persona(db, name)?;
     let conn = db.conn.lock().unwrap();
+
+    // Task 2：在任何 INSERT 前、同一连接内校验 base_version 状态。
+    // - 无行 → NotFound("persona '<name>' version <n>")
+    // - status 既不是 'ready' 也不是 'pending' → Conflict (信息含 version/status)
+    let base_status: Option<String> = conn
+        .query_row(
+            "SELECT status FROM persona_versions
+             WHERE persona_model_id = ? AND version = ?",
+            rusqlite::params![&p.id, base_version],
+            |r| r.get(0),
+        )
+        .optional()?;
+    match base_status {
+        None => {
+            return Err(AvcError::NotFound(format!(
+                "persona '{}' version {}",
+                name, base_version
+            )));
+        }
+        Some(s) if s != "ready" && s != "pending" => {
+            return Err(AvcError::Conflict(format!(
+                "persona '{}' version {} is not stable (status: {})",
+                name, base_version, s
+            )));
+        }
+        _ => {} // ready 或 pending，放行
+    }
 
     // 预占 v(N+1) 行
     let target = base_version + 1;
