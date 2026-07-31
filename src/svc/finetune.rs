@@ -42,12 +42,20 @@ pub fn start(
     cfg: &FinetuneConfig,
 ) -> AvcResult<String> {
     let p = crate::svc::persona::get_persona(db, name)?;
-    let conn = db.conn.lock().unwrap();
+    let mut conn = db.conn.lock().unwrap();
+    // Immediate 事务：跨进程并发 start 时直接把事务升级到写锁。
+    // rusqlite 默认 busy_timeout=5000ms，足够让短事务排队；胜者完成 INSERT 后
+    // 释放锁，后续排队的 BEGIN IMMEDIATE 进入事务体并被"target-version 已存在"
+    // Conflict 拒绝（exit 4），不会出现 exit 20 (SQLITE_BUSY)。
+    //
+    // 注：本次最小修复仅改事务行为为 Immediate，由既有的"target-version 已存在"
+    // Conflict 兜底；不再做全局 SQLITE_BUSY → Conflict 映射。
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
 
-    // Task 2：在任何 INSERT 前、同一连接内校验 base_version 状态。
+    // Task 1 / Task 2: 在 tx 内、任何 INSERT 前校验 base_version 状态。
     // - 无行 → NotFound("persona '<name>' version <n>")
     // - status 既不是 'ready' 也不是 'pending' → Conflict (信息含 version/status)
-    let base_status: Option<String> = conn
+    let base_status: Option<String> = tx
         .query_row(
             "SELECT status FROM persona_versions
              WHERE persona_model_id = ? AND version = ?",
@@ -71,11 +79,27 @@ pub fn start(
         _ => {} // ready 或 pending，放行
     }
 
-    // 预占 v(N+1) 行
+    // 预占 v(N+1) 行；tx 内先查 (persona, target) 是否已存在 → Conflict。
+    // 任一 Err 都由 RAII 自动 rollback。
     let target = base_version + 1;
+    let existing: Option<String> = tx
+        .query_row(
+            "SELECT status FROM persona_versions
+             WHERE persona_model_id = ? AND version = ?",
+            rusqlite::params![&p.id, target],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if let Some(s) = existing {
+        return Err(AvcError::Conflict(format!(
+            "persona '{}' target version {} already exists (status: {})",
+            name, target, s
+        )));
+    }
+
     let now = crate::svc::now_iso();
-    conn.execute(
-        "INSERT OR IGNORE INTO persona_versions
+    tx.execute(
+        "INSERT INTO persona_versions
             (persona_model_id, version, parent_version, status, created_at)
          VALUES (?, ?, ?, 'building', ?)",
         rusqlite::params![&p.id, target, base_version, &now],
@@ -85,13 +109,14 @@ pub fn start(
     let scope_json = serde_json::to_string(scope)?;
     let config_json = serde_json::to_string(cfg)?;
 
-    conn.execute(
+    tx.execute(
         "INSERT INTO finetune_jobs
             (id, persona_model_id, base_version, target_version, scope_json, config_json, status, started_at)
          VALUES (?, ?, ?, ?, ?, ?, 'running', ?)",
         rusqlite::params![&job_id, &p.id, base_version, target, &scope_json, &config_json, &now],
     )?;
 
+    tx.commit()?;
     Ok(job_id)
 }
 

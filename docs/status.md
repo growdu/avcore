@@ -12,13 +12,13 @@
 | 单一 SQLite + migrations | ✅ | `src/db/` + `migrations/0001_init.sql`；启动幂等迁移 |
 | persona CRUD | ✅ | `persona create / list / show / versions` 走原子 SQLite 操作 |
 | iterate apply (refine) | ✅ | 纯 SQL UPDATE；不调 Provider；同版本号升级；写 iterate_jobs 账本 |
-| finetune start + publish | ✅ | start 前校验 base_version：缺失 → NotFound；非 pending/ready（如 building）→ Conflict；pending/ready 接受；publish 依据 drift 走 UPDATE ready 或 DELETE 回退 |
+| finetune start + publish | ✅ | start 前校验 base_version：缺失 → NotFound；非 pending/ready（如 building）→ Conflict；pending/ready 接受；Immediate 事务避免 deferred 锁升级 BUSY；target 与 finetune job 在同一事务创建，target 已存在（含并发重复）→ Conflict；publish 依据 drift 走 UPDATE ready 或 DELETE 回退 |
 | job create / list / show | ✅ | render run 前校验 version：缺失 → NotFound；非 pending/ready → Conflict；pending/ready 接受 → INSERT jobs 行；status 字段可手改 |
 | Provider trait + Mock | ✅ | `src/provider/mod.rs`（5 个 trait）+ `mock.rs`（返回占位 BLOB） |
 | Shell 模式（原子透传） | ✅ | rustyline；`help / exit / clear / history` 内建 |
 | ask 模式（NL 入口骨架） | ✅ | 无 LLM 时明确报错 exit 6；占位实现 |
 | config set/get 往返 | ✅ | `config set provider.<dim>.<name>.<field>` 后，`config get` 同路径返回 `key = value`；`get` 仍对未知维度/字段返回 `AvcError::Arg`；set/get 对空 name 段对称拒绝（exit 2） |
-| Phase 0 核心正确性加固（config 往返 + 版本状态守卫） | ✅ | 13 个集成测试：见下方测试矩阵 |
+| Phase 0 核心正确性加固（config 往返 + 版本状态守卫） | ✅ | 15 个集成测试：见下方测试矩阵 |
 
 ---
 
@@ -60,7 +60,7 @@
 ## 测试矩阵
 
 ```
-tests/integration.rs           13 tests
+tests/integration.rs           15 tests
 ├── version_and_help
 ├── init_idempotent_guard
 ├── persona_lifecycle_json
@@ -69,6 +69,8 @@ tests/integration.rs           13 tests
 ├── finetune_publish_failed_drifts_rollback
 ├── finetune_rejects_missing_base_version       [新增] Task 2: 缺失 base → NotFound
 ├── finetune_rejects_non_ready_base_version     [新增] Task 2: building → Conflict
+├── finetune_rejects_duplicate_target_version   [新增] Task 1: 重复 target → Conflict，target/job 不重复写入
+├── finetune_concurrent_starts_are_conflicts    [新增] 3×8 并发：每轮 1 成功 + 7 exit 4，无 BUSY/exit 20
 ├── render_rejects_missing_version              [新增] Task 3: 缺失 version → NotFound
 ├── render_rejects_non_ready_version            [新增] Task 3: building → Conflict
 ├── config_set_get_round_trip                   [新增] Task 1: 点号路径 round-trip

@@ -274,6 +274,179 @@ fn finetune_rejects_non_ready_base_version() {
 }
 
 #[test]
+fn finetune_rejects_duplicate_target_version() {
+    // Task 1 / Step 1: 同一 persona + 同一 base_version 重复 finetune start，
+    // 第二次必须 exit 4 (Conflict)；DB 中 persona_versions 恰好 1 行 v2、
+    // finetune_jobs 恰好 1 行（v2 行 + job 行原子，拒绝时必须回滚）。
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let config = dir.path().join("config");
+
+    bin().env("XDG_DATA_HOME", &data).env("XDG_CONFIG_HOME", &config).arg("init").output().unwrap();
+    bin().env("XDG_DATA_HOME", &data).env("XDG_CONFIG_HOME", &config)
+        .args(["persona", "create", "--name", "yu"]).output().unwrap();
+
+    // 第一次 start base 1：应成功，创建 v2 building + 1 条 finetune_jobs。
+    let r1 = bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .args(["finetune", "start", "yu", "--base-version", "1"])
+        .output()
+        .unwrap();
+    assert!(
+        r1.status.success(),
+        "第一次 finetune start 应成功；stderr={}",
+        String::from_utf8_lossy(&r1.stderr)
+    );
+
+    // 第二次同一命令：应被拒绝 (exit 4 Conflict)。
+    let r2 = bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .args(["finetune", "start", "yu", "--base-version", "1"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        r2.status.code(),
+        Some(4),
+        "重复 target version 应 exit 4 (Conflict); stderr={}",
+        String::from_utf8_lossy(&r2.stderr)
+    );
+    let stderr2 = String::from_utf8_lossy(&r2.stderr);
+    // 错误信息须可定位：含 persona 名、target version 字样、冲突关键词之一
+    assert!(
+        stderr2.contains("yu") && stderr2.contains("2") && (
+            stderr2.contains("target") || stderr2.contains("conflict")
+                || stderr2.contains("冲突") || stderr2.contains("存在")
+        ),
+        "stderr 应包含 persona 名 'yu' + target version '2' + 冲突定位关键词，实际: {:?}",
+        stderr2
+    );
+
+    // DB 断言：persona_versions 中 yu 的 v2 恰好 1 行；finetune_jobs 恰好 1 行。
+    let db = rusqlite::Connection::open(data.join("avc/avc.db")).unwrap();
+    let v2_count: i64 = db.query_row(
+        "SELECT COUNT(*) FROM persona_versions pv
+         JOIN persona_models pm ON pm.id = pv.persona_model_id
+         WHERE pm.name = ? AND pv.version = 2",
+        ["yu"], |r| r.get(0)).unwrap();
+    assert_eq!(v2_count, 1, "persona_versions v2 应恰好 1 行");
+
+    let job_count: i64 = db.query_row(
+        "SELECT COUNT(*) FROM finetune_jobs fj
+         JOIN persona_models pm ON pm.id = fj.persona_model_id
+         WHERE pm.name = ?",
+        ["yu"], |r| r.get(0)).unwrap();
+    assert_eq!(job_count, 1, "finetune_jobs 应恰好 1 行（重复请求应被回滚）");
+}
+
+#[test]
+fn finetune_concurrent_starts_are_conflicts() {
+    // TDD: 跨进程并发 finetune start 必须有且仅有一个成功，
+    // 其余全部 exit 4 (Conflict)；绝不能出现 exit 20 (Db / SQLITE_BUSY)。
+    // 复现路径：N 个独立 CLI 同时 start，Deferred 事务升级写锁时会随机触发 BUSY。
+    // 修复后：所有非胜者都应被 target-version 已存在拒绝。
+    //
+    // 设计：3 轮 × 8 进程并发，使用独立临时 XDG，确保在原 deferred 实现下
+    // 至少 1 轮触发 exit20（独立探针 10/10 中 9 次命中 1 轮），从而 RED 稳定；
+    // 修复后 3 轮全部 GREEN。
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+
+    const N: usize = 8;
+    const ROUNDS: usize = 3;
+
+    for round_idx in 0..ROUNDS {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data");
+        let config = dir.path().join("config");
+
+        bin().env("XDG_DATA_HOME", &data).env("XDG_CONFIG_HOME", &config).arg("init").output().unwrap();
+        bin().env("XDG_DATA_HOME", &data).env("XDG_CONFIG_HOME", &config)
+            .args(["persona", "create", "--name", "yu"]).output().unwrap();
+
+        let barrier = Arc::new(Barrier::new(N));
+        let mut handles = Vec::with_capacity(N);
+        for _ in 0..N {
+            let data = data.clone();
+            let config = config.clone();
+            let b = barrier.clone();
+            handles.push(thread::spawn(move || {
+                // 等齐后同时发起，最大化抢锁竞争
+                b.wait();
+                bin()
+                    .env("XDG_DATA_HOME", &data)
+                    .env("XDG_CONFIG_HOME", &config)
+                    .args(["finetune", "start", "yu", "--base-version", "1"])
+                    .output()
+                    .unwrap()
+            }));
+        }
+
+        let mut ok = 0usize;
+        let mut conflicts = 0usize;
+        let mut busy = 0usize; // exit 20 = Db(SQLITE_BUSY) — 严禁出现
+        let mut other = 0usize;
+        let mut busy_stderr = String::new();
+        for h in handles {
+            let out = h.join().unwrap();
+            let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+            match out.status.code() {
+                Some(0) => ok += 1,
+                Some(4) => conflicts += 1,
+                Some(20) => {
+                    busy += 1;
+                    if busy_stderr.len() < 512 {
+                        busy_stderr.push_str(&stderr);
+                    }
+                }
+                _ => {
+                    other += 1;
+                    if busy_stderr.len() < 512 {
+                        busy_stderr.push_str(&format!("code={:?} ", out.status.code()));
+                        busy_stderr.push_str(&stderr);
+                    }
+                }
+            }
+        }
+
+        assert_eq!(
+            ok, 1,
+            "round {round_idx}: 恰好 1 个成功；实测 ok={ok} conflicts={conflicts} busy={busy} other={other}\n\
+             busy_stderr={busy_stderr:?}"
+        );
+        assert_eq!(
+            conflicts,
+            N - 1,
+            "round {round_idx}: 其余 {n} 个应全 exit 4 (Conflict)；实测 ok={ok} conflicts={conflicts} busy={busy} other={other}",
+            n = N - 1
+        );
+        assert_eq!(
+            busy, 0,
+            "round {round_idx}: 严禁出现 exit 20 (SQLITE_BUSY)；实测 busy={busy}\n\
+             busy_stderr={busy_stderr:?}"
+        );
+        assert_eq!(other, 0, "round {round_idx}: 不应出现其它 exit 码；other={other}");
+
+        // 终态：v2 恰好 1 行、finetune_jobs 恰好 1 行（被拒绝的全部回滚）。
+        let db = rusqlite::Connection::open(data.join("avc/avc.db")).unwrap();
+        let v2_count: i64 = db.query_row(
+            "SELECT COUNT(*) FROM persona_versions pv
+             JOIN persona_models pm ON pm.id = pv.persona_model_id
+             WHERE pm.name = ? AND pv.version = 2",
+            ["yu"], |r| r.get(0)).unwrap();
+        assert_eq!(v2_count, 1, "round {round_idx}: persona_versions v2 应恰好 1 行");
+
+        let job_count: i64 = db.query_row(
+            "SELECT COUNT(*) FROM finetune_jobs fj
+             JOIN persona_models pm ON pm.id = fj.persona_model_id
+             WHERE pm.name = ?",
+            ["yu"], |r| r.get(0)).unwrap();
+        assert_eq!(job_count, 1, "round {round_idx}: finetune_jobs 应恰好 1 行");
+    }
+}
+
+#[test]
 fn config_set_get_round_trip() {
     // 临时 XDG init，再 set provider.llm.openai.api_key sk-test，再 get
     // 断言 exit 0、stdout 含完整 key 与 sk-test、且不含 `(unset)`
