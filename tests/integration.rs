@@ -663,6 +663,27 @@ fn provider_test_unsupported_dim() {
 }
 
 #[test]
+fn provider_test_embed_unknown() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let config = dir.path().join("config");
+
+    bin().env("XDG_DATA_HOME", &data).env("XDG_CONFIG_HOME", &config).arg("init").output().unwrap();
+
+    let r = bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .args(["provider", "test", "embed.ghost"])
+        .output()
+        .unwrap();
+    assert!(
+        !r.status.success(),
+        "不存在的 embed provider 应非 0；stderr={}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+}
+
+#[test]
 fn render_rejects_missing_version() {
     // Task 3 / Step 1: persona 只有 v1，render 指定 version 99 应被拒绝。
     // 期望：exit 3 (NotFound)；jobs 计数为 0（无悬挂 job）。

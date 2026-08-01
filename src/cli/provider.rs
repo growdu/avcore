@@ -55,6 +55,23 @@ pub fn dispatch(argv: &[String]) -> AvcResult<()> {
                     });
                     print(mode, &payload)?;
                 }
+                "embed" => {
+                    let cfg = Config::load(&Config::default_config_path()?)?;
+                    let provider = crate::provider::real::make_embed(&cfg, name)?;
+                    let samples = vec!["hello", "world"];
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .map_err(|e| AvcError::Internal(e.to_string()))?;
+                    let vectors = rt.block_on(provider.embed(&samples))?;
+                    let payload = json!({
+                        "provider": target,
+                        "ok": true,
+                        "count": vectors.len(),
+                        "dim": vectors.first().map(|v| v.len()).unwrap_or(0),
+                    });
+                    print(mode, &payload)?;
+                }
                 other => {
                     return Err(AvcError::Arg(format!(
                         "provider test.{}: not yet implemented (Phase 1+ scope)",
