@@ -49,6 +49,21 @@ pub fn run(args: &[String]) -> AvcResult<()> {
     rt.block_on(run_async(args))
 }
 
+/// NL 直管入口：接受原始自然语言，返回同步结果。
+/// Shell 模式用：直接构造 argv + 调 `run(&[avc, ask, --yes, nl])`，
+/// 这样能复用 plan 流水线的所有副作用（BLOB / 错误码 / exit code）。
+/// 本函数保留供将来 inline 用（如 Ncurses 风格 nl-input 或 fzf picker）。
+///
+/// 在 TTY 下若 plan 含 write step 仍走 stdin read y/n；可传 `auto_yes` 跳过。
+pub fn dispatch_nl(nl: &str, auto_yes: bool) -> AvcResult<()> {
+    let mut argv: Vec<String> = vec!["avc".into(), "ask".into()];
+    if auto_yes {
+        argv.push("--yes".into());
+    }
+    argv.push(nl.to_string());
+    run(&argv)
+}
+
 const SYSTEM_PROMPT: &str = r#"你是 avc CLI 的命令规划器。把用户自然语言翻译成 plan JSON。
 
 规则：
@@ -206,7 +221,13 @@ async fn run_async(args: &[String]) -> AvcResult<()> {
     // 执行：在主进程调用 cli::run
     let mut results = Vec::new();
     for s in plan.steps.iter() {
-        let mut cli_argv: Vec<String> = vec![s.cmd.clone()];
+        // s.cmd 是 "<noun> <verb>" 形式（LLM 输出）；拆成 argv tokens。
+        // 带 --flag 形态 args 仍按 "key value" 追加（与 CLI 兼容）。
+        let mut cli_argv: Vec<String> = s
+            .cmd
+            .split_whitespace()
+            .map(String::from)
+            .collect();
         if let Some(map) = s.args.as_object() {
             for (k, v) in map.iter() {
                 cli_argv.push(k.clone());
