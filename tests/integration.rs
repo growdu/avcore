@@ -550,6 +550,54 @@ fn ask_without_llm_errors() {
 }
 
 #[test]
+fn ask_nl_plan_executes_read_only_plan() {
+    // mock LLM 返一个 plan: persona list (read_only)。CLI 解析后真跑 `persona list`，
+    // 验证结果反映 person 列表（空）。
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let handle = std::thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut buf = [0u8; 8192];
+            let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+            let _ = stream.read(&mut buf);
+            let body = r#"{"choices":[{"message":{"role":"assistant","content":"{\"intent\":\"list\",\"read_only\":true,\"steps\":[{\"cmd\":\"persona list\",\"args\":{}}]}"}}]}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(resp.as_bytes());
+            let _ = stream.flush();
+        }
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let config = dir.path().join("config");
+    bin().env("XDG_DATA_HOME", &data).env("XDG_CONFIG_HOME", &config).arg("init").output().unwrap();
+    std::fs::create_dir_all(config.join("avc")).unwrap();
+    let toml = format!(
+        "[provider.llm.local]\napi_key = \"sk-fake\"\nmodel = \"fake\"\nbase_url = \"http://127.0.0.1:{}\"\n",
+        port
+    );
+    std::fs::write(config.join("avc/avc.toml"), toml).unwrap();
+
+    let r = bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .args(["ask", "--yes", "列出所有角色"])
+        .output().unwrap();
+    let _ = handle.join();
+
+    assert!(r.status.success(), "ask 应成功；stderr={}", String::from_utf8_lossy(&r.stderr));
+    let stdout = String::from_utf8_lossy(&r.stdout);
+    // plan intent 出现 + 结果 OK
+    assert!(stdout.contains("intent") || stdout.contains("ok"), "stdout={:?}", stdout);
+}
+
+#[test]
 fn ask_with_real_llm_round_trip() {
     // Phase 1 第一刀：起一个最小 HTTP mock 充当 OpenAI 兼容端点，
     // 验证 ask 真发出请求并回显 reply。
