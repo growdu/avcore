@@ -131,6 +131,8 @@ flowchart TB
 | 自然语言 | "列出所有角色" / "把 Yu 的 traits 改成严谨务实" | LLM 解析 → 原子计划 |
 
 > Shell 内识别 `avc` 前缀是可选的（`persona list` 和 `avc persona list` 等价）；脚本里必须带 `avc`。
+>
+> **Phase 1 实现状态：** NL 解析已在 `avc ask` 入口落地（见 `src/ask/mod.rs`：发请求到 provider.llm → 解析 Plan JSON → 验证白名单 atom → read_only 自动跑 / write 在 TTY 下 y/n）。Shell 模式下的 NL 入口尚未接通（Phase 1.3 续）。
 
 ### 3.3 NL 解析流水线
 

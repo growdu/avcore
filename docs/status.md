@@ -29,14 +29,16 @@
 | 真实 Provider 实现（kling / openai / elevenlabs / doubao 等） | ✅/⬜ | Phase 1.1 拆分如下 ↓ |
 | `openai_compat` LLM 真实现（任意 OpenAI 兼容 chat 端点） | ✅ | `src/provider/real.rs::OpenAiCompatLlmProvider`；接任意 OpenAI 兼容 `/chat/completions`；通过 `base_url` + `extra_headers` 兼容 OpenAI / Anthropic 兼容 proxy / DeepSeek / 智谱 / 豆包 / Ollama 等；401/403→TokenAuth、429→RateLimited、非 2xx→ProviderUpstream（exit 码 5/10/11/12 映射见 `docs/cli.md` §6.5）；第一道集成测试 `ask_with_real_llm_round_trip` 用最小 HTTP 端点验证 request → reply 路径 |
 | `openai_compat` Embed 真实现（任意 OpenAI 兼容 `/embeddings` 端点） | ✅ | `src/provider/real.rs::OpenAiCompatEmbedProvider`；同一模板（base_url + extra_headers），覆盖 OpenAI text-embedding-3-* / 阿里 DashScope / 智谱 / Cohere embed-v3 / Ollama nomic-embed 等；`avc provider test embed.<name>` 探针 |
-| avatar / voice / video 真 Provider | ⬜ | Phase 1.1 续；按 `src/provider/real.rs` 模式复制 trait 实现 |
-| Provider 路由表（provider.json + 注册） | ✅ | 已落地：`~/.config/avc/avc.toml` 的 `[provider.<dim>.<name>]` 段 + `extra_headers`，工厂 `make_llm(&Config, name)` / `make_embed(&Config, name)` 解析 |
-| avatar / voice SFT 节点真调 Provider | ⬜ | 接 avatar.create / voice.clone / voice.finetune |
-| drift_eval 用 Provider 返回的 embedding 真算 | ⬜ | 当前用 Mock 写死 0.9 |
-| DAG 引擎真调度 | ⬜ | 当前 pipeline-svc 仅 stub；Phase 1.2 |
-| LLM chat 真解析 NL → plan | ⬜ | 当前 ask 模式无 LLM 时报错；Phase 1.3 |
-| Shell 内 NL 解析 | ⬜ | Phase 1.3 |
-| corpus 切 chunk + embed | ⬜ | Phase 1.4 |
+| `openai_compat` Avatar 真实现 | ✅ | `OpenAiCompatAvatarProvider` 接 `/v1/images/generations`（OpenAI dall-e-3 / DashScope wanx / 智谱 CogView / Ollama SD 等）；finetune 仍为 stub（vendor SFT 端点 Phase 2）；`provider test avatar.<name>` 探针 |
+| `openai_compat` Voice 真实现 | ✅ | `OpenAiCompatVoiceProvider` 接 `/audio/speech`（OpenAI tts-1）；`clone` Phase 1 占位 WAV（OpenAI 无 clone 接口，复用 vendor endpoint）；finetune stub；`provider test voice.<name>` 探针 |
+| Cli Video Provider 真实现 | ✅ | `CliVideoProvider` 抽象 vendor-CLI "submit/poll/mp4"（kling-cli / doubao-cli 等）；Phase 1 占位 mp4 BLOB，接口固定 Phase 2 接 vendor；`provider test video.<name>` 探针 |
+| Provider 路由表（provider.json + 注册） | ✅ | 已落地：`~/.config/avc/avc.toml` 的 `[provider.<dim>.<name>]` 段 + `extra_headers`，工厂 `make_llm/make_embed/make_avatar/make_voice/make_video(&Config, name)` 解析 |
+| avatar / voice SFT 节点真调 Provider | ⬜ | finetune.publish 走 vendor SFT（Phase 2 接 vendor CLI；Phase 1 仍用手 mock drift） |
+| drift_eval 用 Provider 返回的 embedding 真算 | ✅ | `svc/drift::eval_voice_with_provider` 真发请求到 embed Provider 算 cosine；`finetune drift eval <fj_id> --embed <name> --threshold ...` 子命令；未配 embed 时降级走 DB 已有 vector |
+| DAG 引擎真调度 | ✅ | `svc/pipeline::run()` Kahn 拓扑排序 → 顺序执行节点 → 落 `job_steps`（status / attempt / outputs_json / duration_ms）；节点 BLOB 落 `artifacts` 表（base64 解码 + sha256）；失败 → job status='failed' + error_json |
+| LLM chat 真解析 NL → plan | ✅ | `avc ask "..."` 发请求 → 解析为 `Plan JSON` → 验证白名单 atom → read_only 自动跑 / write 在 TTY 走 y/n、非 TTY 缺 `--yes` 拒绝；支持 `persona list/show/versions/set-traits/set-catchphrase/set-render/commit/promote`；集成测试 `ask_nl_plan_executes_read_only_plan` |
+| Shell 内 NL 解析 | ⬜ | 同 `avc ask`，Shell 模式未接通（Phase 1.3 后续） |
+| corpus 切 chunk + embed | ✅ | `svc/corpus::create_from_file()` 双换行/单换行回退切 chunk → 调 embed Provider → 落 `corpus_chunks`；`search` 调 embed API 算 query 向量 + 全表 cosine top-K；CLI: `corpus create/chunks/search/list/attach/detach`；集成测试 `corpus_create_and_search_round_trip` |
 
 ---
 
@@ -63,7 +65,7 @@
 ## 测试矩阵
 
 ```
-tests/integration.rs           19 tests
+tests/integration.rs           27 tests
 ├── version_and_help
 ├── init_idempotent_guard
 ├── persona_lifecycle_json
@@ -80,9 +82,17 @@ tests/integration.rs           19 tests
 ├── config_rejects_empty_provider_name          [新增] Task 1+: set/get 对空 name 对称拒绝
 ├── ask_without_llm_errors
 ├── ask_with_real_llm_round_trip                [新增] Phase 1.1: ask 真发请求到 OpenAI 兼容 LLM（最小 HTTP 端点）
+├── ask_nl_plan_executes_read_only_plan         [新增] Phase 1.3: NL→plan JSON→真执行
 ├── provider_test_unknown_llm_name_says_not_configured   [新增] Phase 1.1: provider test 未配置
-├── provider_test_unsupported_dim               [新增] Phase 1.1: avatar/voice/video 暂未实现
-└── provider_test_embed_unknown                 [新增] Phase 1.1: 不存在的 embed provider
+├── provider_test_unsupported_dim               [新增] Phase 1.1: avatar/voice/video 暂未实现（已被 B1 替换为真探针）
+├── provider_test_embed_unknown                 [新增] Phase 1.1: 不存在的 embed provider
+├── provider_test_avatar_unknown                [新增] Phase 1.1: 不存在的 avatar provider
+├── provider_test_voice_unknown                  [新增] Phase 1.1: 不存在的 voice provider
+├── provider_test_video_unknown                  [新增] Phase 1.1: 不存在的 video provider
+├── corpus_create_and_search_round_trip         [新增] Phase 1.4: corpus 切 chunk + embed + search
+├── finetune_drift_eval_requires_voice_embed_on_base        [新增] Phase 1.1: drift eval 缺 voice_embed → Conflict
+├── finetune_drift_eval_with_provider_uses_embed_api        [新增] Phase 1.1: drift eval 真发请求到 embed Provider
+└── render_run_executes_full_pipeline_and_produces_artifacts [新增] Phase 1.2: render run 真走 5 节点 DAG + artifacts 落库
 ```
 
 CI：

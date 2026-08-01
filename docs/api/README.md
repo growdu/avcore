@@ -103,9 +103,12 @@ avc.providers().avatar().register("kling_avatar", Arc::new(KlingAvatarProvider::
 | 维度 | Provider | 说明 |
 |------|----------|------|
 | avatar | `kling_avatar` / `heygen_avatar` / `doubao_image` / `seedream` / `replicate_flux_lora` | 商业 / 开源 via Replicate |
+| avatar | `openai_compat` ✅ 真实现已落地（Phase 1.1） | 任意 OpenAI 兼容 `/v1/images/generations`；接 OpenAI dall-e-3 / 阿里 DashScope wanx / 智谱 CogView / Ollama SD 等；设 `provider.avatar.<name>.api_key`+`model`+`base_url` 后 `provider test avatar.<name>` 可用；finetune 仍为 vendor-only stub；errors 映射同 §5 |
 | voice | `elevenlabs` / `azure_speech` / `doubao_tts` / `openai_tts` | |
+| voice | `openai_compat` ✅ 真实现已落地（Phase 1.1） | 任意 OpenAI 兼容 `/audio/speech`；接 OpenAI tts-1 + OpenAI 兼容 proxy；`provider test voice.<name>` 可用；`clone` Phase 1 占位 WAV（OpenAI 无 clone 接口）；finetune stub |
 | llm | `openai_compat` ✅ 真实现已落地（Phase 1.1） | 任意 OpenAI 兼容 `/chat/completions` 端点；通过 `base_url` + `extra_headers` 接 OpenAI / DeepSeek / 智谱 / Anthropic 兼容 proxy / Ollama 等；设 `provider.llm.<name>.api_key`+`model`+`base_url` 后 `avc ask` 直接可用，错误按 401/403→`TokenAuth`、429→`RateLimited`、非 2xx→`ProviderUpstream` 映射到 §5 exit 码 |
 | video | `kling` / `doubao_seedance` / `pika` / `runway` / `replicate_cogvideox` | |
+| video | `openai_compat` `cli_video` ✅ 真实现已落地（Phase 1.1） | `CliVideoProvider` 抽象 vendor-CLI "submit/poll/mp4"（kling-cli / doubao-cli）；Phase 1 占位 mp4 BLOB，接口固定 Phase 2 接 vendor；设 `provider.video.<name>.api_key`+`model` 后 `provider test video.<name>` 可用 |
 | embed | `openai_embed` / `volcengine_embed` / `alibaba_embed` / `cohere_embed` | |
 | embed | `openai_compat` ✅ 真实现已落地（Phase 1.1） | 任意 OpenAI 兼容 `/embeddings` 端点；接 OpenAI text-embedding-3-* / 阿里 DashScope / 智谱 / Cohere embed-v3 / Ollama nomic-embed 等；设 `provider.embed.<name>.api_key`+`model`+`base_url` 后 `provider test embed.<name>` 可用；errors 映射同 §5 |
 
