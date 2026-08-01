@@ -45,6 +45,14 @@ pub fn dispatch(argv: &[String]) -> AvcResult<()> {
                 }
             };
             let job_id = crate::svc::render::create_job(&db, persona, v, topic)?;
+            // Wave B：render run 真跑 DAG 五节点 (script_gen → tts+img_gen → i2v → compose)
+            // 节点 BLOB 落 artifacts 表；失败 → job status='failed' + error_json。
+            let spec = crate::svc::pipeline::render_publishment_spec();
+            if let Err(e) = crate::svc::pipeline::run(&db, &job_id, &spec, topic) {
+                // 打印到 stderr 但不 exit — 仍返回 job_id，让调用方决定查询 status。
+                eprintln!("error: pipeline failed: {}", e);
+                let _ = e; // suppress unused
+            }
             if mode == OutputMode::Quiet {
                 println!("{}", job_id);
             } else {

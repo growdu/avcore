@@ -945,6 +945,111 @@ fn finetune_drift_eval_with_provider_uses_embed_api() {
 }
 
 #[test]
+fn render_rejects_non_ready_version() {
+    // Task 3 / Step 1: 先 finetune start base 1 创建 building v2（不 publish），
+    // 再 render v2；应被拒绝（exit 4 Conflict），且 jobs 为 0。
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let config = dir.path().join("config");
+
+    bin().env("XDG_DATA_HOME", &data).env("XDG_CONFIG_HOME", &config).arg("init").output().unwrap();
+    bin().env("XDG_DATA_HOME", &data).env("XDG_CONFIG_HOME", &config)
+        .args(["persona", "create", "--name", "yu"]).output().unwrap();
+
+    // 第一次 finetune start base 1：应成功，v2 进入 building 状态（不 publish）。
+    let r1 = bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .args(["finetune", "start", "yu", "--base-version", "1"])
+        .output()
+        .unwrap();
+    assert!(r1.status.success(), "第一次 finetune start base 1 应成功；stderr={}", String::from_utf8_lossy(&r1.stderr));
+
+    // render v2 应被拒绝：v2 处于 building → exit 4 (Conflict)
+    let r = bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .args(["render", "run", "--persona", "yu", "--version", "2", "--topic", "demo"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        r.status.code(),
+        Some(4),
+        "non-ready version 应 exit 4 (Conflict); stderr={}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+
+    // jobs 表应为空：未到 CREATE JOB 阶段 → 拒绝时也不写
+    let db = rusqlite::Connection::open(data.join("avc/avc.db")).unwrap();
+    let job_count: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM jobs j
+             JOIN persona_models pm ON pm.id = j.persona_model_id
+             WHERE pm.name = ?",
+            ["yu"],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(job_count, 0, "jobs 不应有任何条目");
+}
+
+#[test]
+fn render_run_executes_full_pipeline_and_produces_artifacts() {
+    // Wave B：render run 真跑 DAG 五节点，落 artifacts BLOB。
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let config = dir.path().join("config");
+
+    bin().env("XDG_DATA_HOME", &data).env("XDG_CONFIG_HOME", &config).arg("init").output().unwrap();
+    bin().env("XDG_DATA_HOME", &data).env("XDG_CONFIG_HOME", &config)
+        .args(["persona", "create", "--name", "yu"]).output().unwrap();
+
+    let r = bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .args(["render", "run", "--persona", "yu", "--version", "1", "--topic", "demo"])
+        .output()
+        .unwrap();
+    assert!(r.status.success(), "render run 应成功；stderr={}", String::from_utf8_lossy(&r.stderr));
+    let stdout = String::from_utf8_lossy(&r.stdout);
+    let job_id: String = serde_json::from_str::<serde_json::Value>(&stdout).unwrap()
+        ["job_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let db = rusqlite::Connection::open(data.join("avc/avc.db")).unwrap();
+
+    // job 终态应为 succeeded
+    let status: String = db
+        .query_row("SELECT status FROM jobs WHERE id = ?1", [&job_id], |r| r.get(0))
+        .unwrap();
+    assert_eq!(status, "succeeded", "job 应 succeeded; 实际={}", status);
+
+    // 5 个 job_steps 节点落地
+    let step_count: i64 = db
+        .query_row("SELECT COUNT(*) FROM job_steps WHERE job_id = ?1", [&job_id], |r| r.get(0))
+        .unwrap();
+    assert_eq!(step_count, 5, "job_steps 应 5 行; 实际={}", step_count);
+
+    // 至少 5 个 artifact BLOB（含 final_video）
+    let art_count: i64 = db
+        .query_row("SELECT COUNT(*) FROM artifacts WHERE job_id = ?1", [&job_id], |r| r.get(0))
+        .unwrap();
+    assert_eq!(art_count, 5, "artifacts 应 5 行; 实际={}", art_count);
+
+    // 至少一个 blob 长度 > 0
+    let has_blob: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM artifacts WHERE job_id = ?1 AND byte_size > 0",
+            [&job_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(has_blob > 0, "至少应有一个非空 BLOB; 实际={}", has_blob);
+}
+
+#[test]
 fn render_rejects_missing_version() {
     // Task 3 / Step 1: persona 只有 v1，render 指定 version 99 应被拒绝。
     // 期望：exit 3 (NotFound)；jobs 计数为 0（无悬挂 job）。
@@ -971,60 +1076,14 @@ fn render_rejects_missing_version() {
 
     // jobs 表应为空：不得创建悬挂 job
     let db = rusqlite::Connection::open(data.join("avc/avc.db")).unwrap();
-    let job_count: i64 = db.query_row(
-        "SELECT COUNT(*) FROM jobs j
-         JOIN persona_models pm ON pm.id = j.persona_model_id
-         WHERE pm.name = ?",
-        ["yu"], |r| r.get(0)).unwrap();
-    assert_eq!(job_count, 0, "jobs 不应有任何条目");
-}
-
-#[test]
-fn render_rejects_non_ready_version() {
-    // Task 3 / Step 1: 先 finetune start base 1 创建 building v2（不 publish），
-    // 再 render v2；应被拒绝（exit 4 Conflict），且 jobs 为 0。
-    let dir = tempfile::tempdir().unwrap();
-    let data = dir.path().join("data");
-    let config = dir.path().join("config");
-
-    bin().env("XDG_DATA_HOME", &data).env("XDG_CONFIG_HOME", &config).arg("init").output().unwrap();
-    bin().env("XDG_DATA_HOME", &data).env("XDG_CONFIG_HOME", &config)
-        .args(["persona", "create", "--name", "yu"]).output().unwrap();
-
-    // 第一次 finetune start base 1：应成功，v2 进入 building 状态（不 publish）。
-    let r1 = bin()
-        .env("XDG_DATA_HOME", &data)
-        .env("XDG_CONFIG_HOME", &config)
-        .args(["finetune", "start", "yu", "--base-version", "1"])
-        .output()
+    let job_count: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM jobs j
+             JOIN persona_models pm ON pm.id = j.persona_model_id
+             WHERE pm.name = ?",
+            ["yu"],
+            |r| r.get(0),
+        )
         .unwrap();
-    assert!(
-        r1.status.success(),
-        "第一次 finetune start base 1 应成功；stderr={}",
-        String::from_utf8_lossy(&r1.stderr)
-    );
-
-    // render v2：v2 处于 building，应被拒绝（exit 4 Conflict）。
-    let r = bin()
-        .env("XDG_DATA_HOME", &data)
-        .env("XDG_CONFIG_HOME", &config)
-        .args(["render", "run", "--persona", "yu", "--version", "2", "--topic", "demo"])
-        .output()
-        .unwrap();
-    assert_eq!(
-        r.status.code(),
-        Some(4),
-        "non-ready version 应 exit 4 (Conflict); stderr={}",
-        String::from_utf8_lossy(&r.stderr)
-    );
-
-    let db = rusqlite::Connection::open(data.join("avc/avc.db")).unwrap();
-
-    // jobs 表应为空
-    let job_count: i64 = db.query_row(
-        "SELECT COUNT(*) FROM jobs j
-         JOIN persona_models pm ON pm.id = j.persona_model_id
-         WHERE pm.name = ?",
-        ["yu"], |r| r.get(0)).unwrap();
     assert_eq!(job_count, 0, "jobs 不应有任何条目");
 }
