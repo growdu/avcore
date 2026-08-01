@@ -37,7 +37,7 @@
 | drift_eval 用 Provider 返回的 embedding 真算 | ✅ | `svc/drift::eval_voice_with_provider` 真发请求到 embed Provider 算 cosine；`finetune drift eval <fj_id> --embed <name> --threshold ...` 子命令；未配 embed 时降级走 DB 已有 vector |
 | DAG 引擎真调度 | ✅ | `svc/pipeline::run()` Kahn 拓扑排序 → 顺序执行节点 → 落 `job_steps`（status / attempt / outputs_json / duration_ms）；节点 BLOB 落 `artifacts` 表（base64 解码 + sha256）；失败 → job status='failed' + error_json |
 | LLM chat 真解析 NL → plan | ✅ | `avc ask "..."` 发请求 → 解析为 `Plan JSON` → 验证白名单 atom → read_only 自动跑 / write 在 TTY 走 y/n、非 TTY 缺 `--yes` 拒绝；支持 `persona list/show/versions/set-traits/set-catchphrase/set-render/commit/promote`；集成测试 `ask_nl_plan_executes_read_only_plan` |
-| Shell 内 NL 解析 | ⬜ | 同 `avc ask`，Shell 模式未接通（Phase 1.3 后续） |
+| Shell 内 NL 解析 | ✅ | `avc shell` 输入 NL 时按启发式分类（首 token 在 KNOWN_NOUNS 才走 atomic，否则走 ask::dispatch_nl）。`avc> 列出所有角色` → 真发请求 → 解析 plan → 调 cli::run 执行每步；3 shell unit tests 覆盖分类规则 |
 | corpus 切 chunk + embed | ✅ | `svc/corpus::create_from_file()` 双换行/单换行回退切 chunk → 调 embed Provider → 落 `corpus_chunks`；`search` 调 embed API 算 query 向量 + 全表 cosine top-K；CLI: `corpus create/chunks/search/list/attach/detach`；集成测试 `corpus_create_and_search_round_trip` |
 
 ---
