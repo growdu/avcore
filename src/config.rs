@@ -38,6 +38,12 @@ pub struct ProviderCfg {
     pub api_key: Option<String>,
     pub model: Option<String>,
     pub endpoint: Option<String>,
+    #[serde(default)]
+    pub base_url: Option<String>,
+    /// 额外 HTTP headers（用于 Anthropic x-api-key / anthropic-version 等）。
+    /// BTreeMap 让序列化结果稳定，便于 round-trip 测试与人工审阅。
+    #[serde(default)]
+    pub extra_headers: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -147,6 +153,7 @@ impl Config {
             "api_key" => entry.api_key.as_ref(),
             "model" => entry.model.as_ref(),
             "endpoint" => entry.endpoint.as_ref(),
+            "base_url" => entry.base_url.as_ref(),
             _ => return Err(AvcError::Arg(format!("未知字段: {}", field))),
         };
         Ok(val.map(|s| s.clone()))

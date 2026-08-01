@@ -117,6 +117,7 @@ fn apply_set(cfg: &mut Config, key: &str, val: &str) -> AvcResult<()> {
         "api_key" => entry.api_key = Some(val.to_string()),
         "model" => entry.model = Some(val.to_string()),
         "endpoint" => entry.endpoint = Some(val.to_string()),
+        "base_url" => entry.base_url = Some(val.to_string()),
         _ => return Err(AvcError::Arg(format!("未知字段: {}", field))),
     }
     Ok(())
