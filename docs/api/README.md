@@ -107,6 +107,7 @@ avc.providers().avatar().register("kling_avatar", Arc::new(KlingAvatarProvider::
 | llm | `openai_compat` ✅ 真实现已落地（Phase 1.1） | 任意 OpenAI 兼容 `/chat/completions` 端点；通过 `base_url` + `extra_headers` 接 OpenAI / DeepSeek / 智谱 / Anthropic 兼容 proxy / Ollama 等；设 `provider.llm.<name>.api_key`+`model`+`base_url` 后 `avc ask` 直接可用，错误按 401/403→`TokenAuth`、429→`RateLimited`、非 2xx→`ProviderUpstream` 映射到 §5 exit 码 |
 | video | `kling` / `doubao_seedance` / `pika` / `runway` / `replicate_cogvideox` | |
 | embed | `openai_embed` / `volcengine_embed` / `alibaba_embed` / `cohere_embed` | |
+| embed | `openai_compat` ✅ 真实现已落地（Phase 1.1） | 任意 OpenAI 兼容 `/embeddings` 端点；接 OpenAI text-embedding-3-* / 阿里 DashScope / 智谱 / Cohere embed-v3 / Ollama nomic-embed 等；设 `provider.embed.<name>.api_key`+`model`+`base_url` 后 `provider test embed.<name>` 可用；errors 映射同 §5 |
 
 > **本框架不包含任何自托管 Provider**（如 `sdxl_ip_adapter` / `cosyvoice` / `gpt_sovits` / 本地 BGE 等被设计为本地推理的不在内）。
 
