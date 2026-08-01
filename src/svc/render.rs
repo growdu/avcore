@@ -180,3 +180,55 @@ pub fn feedback(
     )?;
     Ok(sample_id)
 }
+
+/// Phase 2.4: pack — 从 topics-file 逐行读 topic → 跑 create_job + pipeline.run。
+/// 失败不中断其他 topic；返 (job_ids, errors: Vec<(topic, error_msg)>)。
+/// - 失败容忍：单 topic 失败 → 记录 + 继续
+/// - 失败后 job 状态由 `pipeline::run` 写为 'failed' + error_json，**继续**跑下一个 topic
+/// - 全部结束后由 CLI 一次性输出汇总 JSON
+pub fn pack(
+    db: &Db,
+    persona: &str,
+    version: Option<i64>,
+    topics_file: &std::path::Path,
+) -> AvcResult<(Vec<String>, Vec<(String, String)>)> {
+    // 1. 校验 persona 存在 + version 决定
+    let v = match version {
+        Some(v) => v,
+        None => crate::svc::persona::get_persona(db, persona)?.current_version,
+    };
+
+    // 2. 读 topics 文件（每行一条，跳过空行 + `#` 开头注释）
+    let text = std::fs::read_to_string(topics_file).map_err(|e| AvcError::Db(format!(
+        "read topics file {}: {}", topics_file.display(), e
+    )))?;
+    let topics: Vec<String> = text.lines()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty() && !s.starts_with('#'))
+        .collect();
+    if topics.is_empty() {
+        return Err(AvcError::Arg(format!(
+            "topics file {} is empty (only blank lines / comments)", topics_file.display()
+        )));
+    }
+
+    // 3. 复用 render_publishment_spec 单跑每条
+    let spec = crate::svc::pipeline::render_publishment_spec();
+    let mut job_ids = Vec::with_capacity(topics.len());
+    let mut errors = Vec::new();
+    for topic in topics {
+        match create_job(db, persona, v, &topic) {
+            Ok(job_id) => {
+                if let Err(e) = crate::svc::pipeline::run(db, &job_id, &spec, &topic) {
+                    // job 已被 pipeline::run 写 failed + error_json；记录 + 继续
+                    errors.push((topic.clone(), e.to_string()));
+                }
+                job_ids.push(job_id);
+            }
+            Err(e) => {
+                errors.push((topic.clone(), e.to_string()));
+            }
+        }
+    }
+    Ok((job_ids, errors))
+}

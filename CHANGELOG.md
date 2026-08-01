@@ -8,15 +8,14 @@ Versioning follows [Semantic Versioning](https://semver.org/) — Phase 1 = `0.1
 
 ## [Unreleased]
 
-### Added
-- (Phase 2.4, planned) `avc render pack <persona> --topics-file <path>` — batch render N topics → N jobs
-
-### Changed
-- `ProviderCfg` 增 `binary: Option<String>`（vendor CLI 路径，向后兼容）
+### Planned
+- avatar / voice SFT 节点真接 vendor SFT 端点（kling-API / ElevenLabs-clone）—— 现为 stub
+- 真 vendor CLI 替换 mock（kling-cli / doubao-cli 等）—— 接口已固定，替换 binary 即可
+- `export` 接 S3 / 对象存储（当前仅落本地 FS）
 
 ---
 
-## [0.2.0] - 2026-08-01 — Phase 2 渲染体验闭环
+## [0.2.0] - 2026-08-01 — Phase 2 渲染体验闭环 (vendor + export + feedback + pack)
 
 ### Added
 - `CliVideoProvider` 真 spawn 三段式（`submit / status / fetch`）；stdout 兼容 KV / JSON / SSE 三种 flavor；超时 5 min；Phase 1 占位 mp4 行为零回归
@@ -24,14 +23,17 @@ Versioning follows [Semantic Versioning](https://semver.org/) — Phase 1 = `0.1
 - `avc job export <job_id> --out <dir>` — `artifacts` BLOB 落 FS `<kind>__<name>__<id>.bin`
 - `avc job show <job_id> --artifacts` JSON 列 5 条 artifact
 - `avc job feedback <job_id> --looks-unlike [--reason <text>]` — 写 `persona_samples(kind='feedback', source='user_feedback')`，开启"持续微调"飞轮
-- 单测 5 个 + 集成 4 个（CliVideoProvider spawn / job export / job feedback / 真 vendor 端到端落 final_video BLOB）
+- `avc render pack <persona> --topics-file <path> [--version <n>]` — batch 批跑 N topics → N jobs，失败不中断 + 返 `(job_ids, errors)` + 任一失败 exit 4 供 CI 探测
+- `svc::render::pack` 服务函数（topics-file 解析：跳过空行 + `#` 注释）
+- `CHANGELOG.md` 入库（Keep a Changelog 风格）
+- 单测 5 个 + 集成 7 个（CliVideoProvider spawn × 3 / job export / job feedback × 2 / render pack × 3）
 
 ### Changed
-- `docs/status.md` 三条 ⬜ → ✅（render vendor / artifacts export / feedback 路径）
-- `docs/api/README.md` 同步：新增 3 条方法行（job export / job show --artifacts / job feedback）
+- `ProviderCfg` 增 `binary: Option<String>` 字段（vendor CLI 路径，向后兼容 None）
+- `docs/status.md` 三条 ⬜ → ✅（render vendor / artifacts export / feedback 路径 / render pack）
 
 ### Known Limitations
-- vendor CLI 仍需用户自己写二进制（mock shell 脚本可用）；`kling-cli` / `doubao-cli` 等真实 二进制为 Phase 2.5
+- vendor CLI 仍需用户自己写二进制（mock shell 脚本可用）；`kling-cli` / `doubao-cli` 等真实二进制为 Phase 2.5
 - avatar / voice SFT 节点仍为 stub（vendor SFT 端点未接）
 - `export` 仅落本地 FS，不接 S3 等对象存储
 

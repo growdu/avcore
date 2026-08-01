@@ -59,6 +59,43 @@ pub fn dispatch(argv: &[String]) -> AvcResult<()> {
                 print(mode, &serde_json::json!({"job_id": job_id}))?;
             }
         }
+        "pack" => {
+            // avc render pack <persona> --topics-file <path> [--version <n>]
+            // - topics-file: 每行一个 topic（`#` 开头 / 空行 跳过）
+            // - 默认 version = current；可手动覆盖
+            let persona = argv.get(1).ok_or_else(|| AvcError::Arg("render pack <persona> --topics-file <path>".into()))?.clone();
+            let mut topics_file: Option<String> = None;
+            let mut version: Option<i64> = None;
+            let mut i = 2;
+            while i < argv.len() {
+                match argv[i].as_str() {
+                    "--topics-file" => { topics_file = argv.get(i+1).cloned(); i += 2; }
+                    "--version" => {
+                        version = argv.get(i+1).and_then(|s| s.parse().ok());
+                        i += 2;
+                    }
+                    _ => { i += 1; }
+                }
+            }
+            let tf = topics_file.ok_or_else(|| AvcError::Arg("render pack: --topics-file <path> required".into()))?;
+            let (job_ids, errors) = crate::svc::render::pack(&db, &persona, version, std::path::Path::new(&tf))?;
+            let errs_json: Vec<serde_json::Value> = errors.iter().map(|(t, e)| {
+                serde_json::json!({"topic": t, "error": e})
+            }).collect();
+            print(mode, &serde_json::json!({
+                "persona": persona,
+                "version": version,
+                "topics_file": tf,
+                "jobs": job_ids,
+                "job_count": job_ids.len(),
+                "failed_count": errors.len(),
+                "errors": errs_json,
+            }))?;
+            // 任一失败 → exit 4 (Conflict)，让 CI/script 能探测
+            if !errors.is_empty() {
+                std::process::exit(4);
+            }
+        }
         _ => return Err(AvcError::Arg(format!("render: unknown verb '{}'", argv[0]))),
     }
     Ok(())

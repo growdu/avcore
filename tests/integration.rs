@@ -1229,6 +1229,84 @@ esac
 }
 
 #[test]
+fn render_pack_runs_multiple_jobs_from_topics_file() {
+    // Phase 2.4: render pack --topics-file → 多 topic 并行串接跑
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let config = dir.path().join("config");
+
+    bin().env("XDG_DATA_HOME", &data).env("XDG_CONFIG_HOME", &config).arg("init").output().unwrap();
+    bin().env("XDG_DATA_HOME", &data).env("XDG_CONFIG_HOME", &config)
+        .args(["persona", "create", "--name", "yu"]).output().unwrap();
+
+    // 写 topics file（包含注释 + 空行 + 3 条有效）
+    let topics_path = dir.path().join("topics.txt");
+    std::fs::write(&topics_path, "\
+# 第一批生成计划
+如何用 avc 写一个 cli_service
+
+# 接下来：
+读 SQLite 快的 5 个技巧
+rust async 调试 tips
+").unwrap();
+
+    let r = bin()
+        .env("XDG_DATA_HOME", &data).env("XDG_CONFIG_HOME", &config)
+        .args(["render", "pack", "yu", "--topics-file", topics_path.to_str().unwrap(), "--json"]).output().unwrap();
+    assert!(r.status.success(), "pack: {}", String::from_utf8_lossy(&r.stderr));
+    let v = serde_json::from_str::<serde_json::Value>(&String::from_utf8_lossy(&r.stdout)).unwrap();
+    assert_eq!(v["job_count"].as_i64().unwrap(), 3, "3 个 job；实际={}", v["job_count"]);
+    assert_eq!(v["failed_count"].as_i64().unwrap(), 0);
+    let jobs = v["jobs"].as_array().unwrap();
+    assert_eq!(jobs.len(), 3);
+
+    // DB：jobs 表 3 行 + artifacts 表 5 行 × 3 = 15 行
+    let db = rusqlite::Connection::open(data.join("avc/avc.db")).unwrap();
+    let job_count: i64 = db.query_row(
+        "SELECT COUNT(*) FROM jobs j JOIN persona_models pm ON pm.id = j.persona_model_id WHERE pm.name = 'yu'",
+        [], |r| r.get(0)).unwrap();
+    assert_eq!(job_count, 3, "DB 应 3 个 yu jobs；实际={}", job_count);
+    let art_count: i64 = db.query_row(
+        "SELECT COUNT(*) FROM artifacts WHERE job_id IN (SELECT j.id FROM jobs j JOIN persona_models pm ON pm.id = j.persona_model_id WHERE pm.name = 'yu')",
+        [], |r| r.get(0)).unwrap();
+    assert_eq!(art_count, 15, "3 jobs × 5 artifacts = 15；实际={}", art_count);
+}
+
+#[test]
+fn render_pack_skips_empty_topics_file() {
+    // 空 topics file（全注释 / 空行）→ Arg 错误
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let config = dir.path().join("config");
+    bin().env("XDG_DATA_HOME", &data).env("XDG_CONFIG_HOME", &config).arg("init").output().unwrap();
+    bin().env("XDG_DATA_HOME", &data).env("XDG_CONFIG_HOME", &config)
+        .args(["persona", "create", "--name", "yu"]).output().unwrap();
+    let topics_path = dir.path().join("empty.txt");
+    std::fs::write(&topics_path, "# only a comment\n\n   \n").unwrap();
+
+    let r = bin()
+        .env("XDG_DATA_HOME", &data).env("XDG_CONFIG_HOME", &config)
+        .args(["render", "pack", "yu", "--topics-file", topics_path.to_str().unwrap()]).output().unwrap();
+    assert_eq!(r.status.code(), Some(2), "空 topics 应 Arg (exit 2)；实际={:?}", r.status.code());
+    let stderr = String::from_utf8_lossy(&r.stderr);
+    assert!(stderr.contains("empty") || stderr.contains("topics"),
+        "stderr 应提到 empty/topics；实际={}", stderr);
+}
+
+#[test]
+fn render_pack_requires_topics_file() {
+    // 缺 --topics-file → Arg 错误
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let config = dir.path().join("config");
+    bin().env("XDG_DATA_HOME", &data).env("XDG_CONFIG_HOME", &config).arg("init").output().unwrap();
+    let r = bin()
+        .env("XDG_DATA_HOME", &data).env("XDG_CONFIG_HOME", &config)
+        .args(["render", "pack", "yu"]).output().unwrap();
+    assert_eq!(r.status.code(), Some(2), "缺 --topics-file 应 Arg (exit 2)；实际={:?}", r.status.code());
+}
+
+#[test]
 fn render_run_executes_full_pipeline_and_produces_artifacts() {
     // Wave B：render run 真跑 DAG 五节点，落 artifacts BLOB。
     let dir = tempfile::tempdir().unwrap();

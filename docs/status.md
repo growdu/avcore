@@ -46,10 +46,10 @@
 
 | 模块 | 状态 |
 |------|------|
-| video.render DAG 节点（script_gen / tts / img_gen / i2v / compose） | ⬜ |
-| artifacts BLOB 落库 + export | ✅ | `svc::render::export_artifacts` 落 `<out_dir>/<kind>__<name>__<id>.bin`；CLI `avc job export <job_id> --out <dir>`；进度：31+31 tests 全过 |
-| feedback 路径（`avc job feedback`） | ⬜ |
-| render pack（topics-file → 批跑） | ⬜ |
+| video.render DAG 节点（script_gen / tts / img_gen / i2v / compose） | ✅ | `Pipeline::run` 5 节点 + 真 vendor CLI 接入（Phase 2.1） + `job export` 落 FS + `job feedback` 写样本（Phase 2.2/2.3） |
+| artifacts BLOB 落库 + export | ✅ | `svc::render::export_artifacts` 落 `<out_dir>/<kind>__<name>__<id>.bin`；CLI `avc job export <job_id> --out <dir>`；进度：31+34 tests 全过 |
+| feedback 路径（`avc job feedback`） | ✅ | `svc::render::feedback()` 写 `persona_samples(kind='feedback', source='user_feedback')`；CLI `avc job feedback <job_id> --looks-unlike [--reason ...]` |
+| render pack（topics-file 批跑） | ✅ | `svc::render::pack(persona, version?, topics_file)` 逐行读 topic → 串调 create_job + pipeline.run；失败不中断 + 返 `(job_ids, errors)`；CLI `avc render pack <persona> --topics-file <path>`；任一失败 exit 4 供 CI 探测 |
 
 ---
 
