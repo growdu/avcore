@@ -26,8 +26,10 @@
 
 | 模块 | 状态 | 说明 |
 |------|------|------|
-| 真实 Provider 实现（kling / openai / elevenlabs / doubao 等） | ⬜ | Phase 1.1 |
-| Provider 路由表（provider.json + 注册） | ⬜ | 加载 `~/.config/avc/avc.toml` 的 `[provider.*.*]` 段 |
+| 真实 Provider 实现（kling / openai / elevenlabs / doubao 等） | ✅/⬜ | Phase 1.1 拆分如下 ↓ |
+| `openai_compat` LLM 真实现（任意 OpenAI 兼容 chat 端点） | ✅ | `src/provider/real.rs`：接任意 OpenAI 兼容 `/chat/completions`；通过 `base_url` + `extra_headers` 兼容 OpenAI / Anthropic 兼容 proxy / DeepSeek / 智谱 / 豆包 / Ollama 等；401/403→TokenAuth、429→RateLimited、非 2xx→ProviderUpstream（exit 码 5/10/11/12 映射见 `docs/cli.md` §6.5）；第一道集成测试 `ask_with_real_llm_round_trip` 用最小 HTTP 端点验证 request → reply 路径 |
+| avatar / voice / video / embed 真 Provider | ⬜ | Phase 1.1 续；按 `src/provider/real.rs` 模式复制 trait 实现 |
+| Provider 路由表（provider.json + 注册） | ✅ | 已落地：`~/.config/avc/avc.toml` 的 `[provider.<dim>.<name>]` 段 + `extra_headers`，工厂 `make_llm(&Config, name)` 解析 |
 | avatar / voice SFT 节点真调 Provider | ⬜ | 接 avatar.create / voice.clone / voice.finetune |
 | drift_eval 用 Provider 返回的 embedding 真算 | ⬜ | 当前用 Mock 写死 0.9 |
 | DAG 引擎真调度 | ⬜ | 当前 pipeline-svc 仅 stub；Phase 1.2 |
@@ -60,7 +62,7 @@
 ## 测试矩阵
 
 ```
-tests/integration.rs           15 tests
+tests/integration.rs           18 tests
 ├── version_and_help
 ├── init_idempotent_guard
 ├── persona_lifecycle_json
@@ -75,7 +77,10 @@ tests/integration.rs           15 tests
 ├── render_rejects_non_ready_version            [新增] Task 3: building → Conflict
 ├── config_set_get_round_trip                   [新增] Task 1: 点号路径 round-trip
 ├── config_rejects_empty_provider_name          [新增] Task 1+: set/get 对空 name 对称拒绝
-└── ask_without_llm_errors
+├── ask_without_llm_errors
+├── ask_with_real_llm_round_trip                [新增] Phase 1.1: ask 真发请求到 OpenAI 兼容 LLM（最小 HTTP 端点）
+├── provider_test_unknown_llm_name_says_not_configured   [新增] Phase 1.1: provider test 未配置
+└── provider_test_unsupported_dim               [新增] Phase 1.1: avatar/voice/video/embed 暂未实现
 ```
 
 CI：

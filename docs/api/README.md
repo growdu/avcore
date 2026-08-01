@@ -104,7 +104,7 @@ avc.providers().avatar().register("kling_avatar", Arc::new(KlingAvatarProvider::
 |------|----------|------|
 | avatar | `kling_avatar` / `heygen_avatar` / `doubao_image` / `seedream` / `replicate_flux_lora` | 商业 / 开源 via Replicate |
 | voice | `elevenlabs` / `azure_speech` / `doubao_tts` / `openai_tts` | |
-| llm | `openai_compat` | 兼容 OpenAI / Anthropic / DeepSeek / 智谱 / 豆包 |
+| llm | `openai_compat` ✅ 真实现已落地（Phase 1.1） | 任意 OpenAI 兼容 `/chat/completions` 端点；通过 `base_url` + `extra_headers` 接 OpenAI / DeepSeek / 智谱 / Anthropic 兼容 proxy / Ollama 等；设 `provider.llm.<name>.api_key`+`model`+`base_url` 后 `avc ask` 直接可用，错误按 401/403→`TokenAuth`、429→`RateLimited`、非 2xx→`ProviderUpstream` 映射到 §5 exit 码 |
 | video | `kling` / `doubao_seedance` / `pika` / `runway` / `replicate_cogvideox` | |
 | embed | `openai_embed` / `volcengine_embed` / `alibaba_embed` / `cohere_embed` | |
 
