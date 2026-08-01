@@ -684,6 +684,119 @@ fn provider_test_embed_unknown() {
 }
 
 #[test]
+fn finetune_drift_eval_requires_voice_embed_on_base() {
+    // base version 没有 voice_embed → Conflict
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let config = dir.path().join("config");
+    bin().env("XDG_DATA_HOME", &data).env("XDG_CONFIG_HOME", &config).arg("init").output().unwrap();
+    bin().env("XDG_DATA_HOME", &data).env("XDG_CONFIG_HOME", &config)
+        .args(["persona", "create", "--name", "yu"]).output().unwrap();
+
+    let r = bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .args(["finetune", "start", "yu", "--base-version", "1"])
+        .output().unwrap();
+    assert!(r.status.success());
+    let stdout = String::from_utf8_lossy(&r.stdout);
+    let fj_id: String = serde_json::from_str::<serde_json::Value>(&stdout).unwrap()
+        ["finetune_job_id"].as_str().unwrap().to_string();
+
+    let r = bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .args(["finetune", "drift", "eval", &fj_id, "--threshold", "0.5"])
+        .output().unwrap();
+    assert_eq!(
+        r.status.code(),
+        Some(4),
+        "缺 voice_embed 应 exit 4 (Conflict); stderr={}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+}
+
+#[test]
+fn finetune_drift_eval_with_provider_uses_embed_api() {
+    // 写入 base voice_embed BLOB 进去；起 mock embed server；
+    // --embed mock 触发真发请求；断言 cosine 字段非空。
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    // 简单 mock：所有请求返一个常向量 [1, 0, 0]。与 base = [1,0,0] cosine=1。
+    let handle = std::thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut buf = [0u8; 8192];
+            let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+            let _ = stream.read(&mut buf);
+            let body = r#"{"data":[{"embedding":[1.0,0.0,0.0]}]}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(), body
+            );
+            let _ = stream.write_all(resp.as_bytes());
+            let _ = stream.flush();
+        }
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let config = dir.path().join("config");
+    bin().env("XDG_DATA_HOME", &data).env("XDG_CONFIG_HOME", &config).arg("init").output().unwrap();
+    bin().env("XDG_DATA_HOME", &data).env("XDG_CONFIG_HOME", &config)
+        .args(["persona", "create", "--name", "yu"]).output().unwrap();
+
+    // 把 [1,0,0] 写入 base v1 voice_embed。直接走 rusqlite。
+    let db_path = data.join("avc/avc.db");
+    let db = rusqlite::Connection::open(&db_path).unwrap();
+    let blob: Vec<u8> = [1.0f32, 0.0, 0.0].iter().flat_map(|f| f.to_le_bytes()).collect();
+    db.execute(
+        "UPDATE persona_versions SET voice_embed = ?1, voice_embed_dim = ?2
+         WHERE persona_model_id = (SELECT id FROM persona_models WHERE name = 'yu')
+           AND version = 1",
+        rusqlite::params![&blob, 3i64],
+    ).unwrap();
+
+    // 起一个 finetune job（用预先有的 v1 作 base）
+    let r = bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .args(["finetune", "start", "yu", "--base-version", "1"])
+        .output().unwrap();
+    assert!(r.status.success());
+    let stdout = String::from_utf8_lossy(&r.stdout);
+    let fj_id: String = serde_json::from_str::<serde_json::Value>(&stdout).unwrap()
+        ["finetune_job_id"].as_str().unwrap().to_string();
+
+    // 写 embed provider 配置
+    std::fs::create_dir_all(config.join("avc")).unwrap();
+    let toml = format!(
+        "[provider.embed.mock]\napi_key = \"sk-test\"\nmodel = \"mock\"\nbase_url = \"http://127.0.0.1:{}\"\n",
+        port
+    );
+    std::fs::write(config.join("avc/avc.toml"), toml).unwrap();
+
+    let r = bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .args([
+            "finetune", "drift", "eval", &fj_id,
+            "--embed", "mock", "--threshold", "0.5",
+        ])
+        .output().unwrap();
+
+    let _ = handle.join();
+
+    assert!(r.status.success(), "drift eval 应成功；stderr={}", String::from_utf8_lossy(&r.stderr));
+    let stdout = String::from_utf8_lossy(&r.stdout);
+    assert!(stdout.contains("\"passed\": true"), "passed=true；stdout={:?}", stdout);
+    assert!(stdout.contains("\"cosine_provider\": 1.0"), "cosine_provider=1.0；stdout={:?}", stdout);
+}
+
+#[test]
 fn render_rejects_missing_version() {
     // Task 3 / Step 1: persona 只有 v1，render 指定 version 99 应被拒绝。
     // 期望：exit 3 (NotFound)；jobs 计数为 0（无悬挂 job）。

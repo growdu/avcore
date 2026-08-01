@@ -7,6 +7,7 @@ pub mod iterate;
 pub mod finetune;
 pub mod render;
 pub mod pipeline;
+pub mod drift;
 
 use chrono::Utc;
 
