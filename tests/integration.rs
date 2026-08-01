@@ -550,6 +550,77 @@ fn ask_without_llm_errors() {
 }
 
 #[test]
+fn ask_with_real_llm_round_trip() {
+    // Phase 1 第一刀：起一个最小 HTTP mock 充当 OpenAI 兼容端点，
+    // 验证 ask 真发出请求并回显 reply。
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::Arc;
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let port = addr.port();
+
+    // 后台 handler：所有请求都返回固定 OpenAI 形状 JSON。
+    let handle = std::thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut buf = [0u8; 8192];
+            let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+            let _ = stream.read(&mut buf);
+            let body = r#"{"choices":[{"message":{"role":"assistant","content":"hello-from-mock"}}]}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(resp.as_bytes());
+            let _ = stream.flush();
+        }
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let config = dir.path().join("config");
+
+    bin().env("XDG_DATA_HOME", &data).env("XDG_CONFIG_HOME", &config).arg("init").output().unwrap();
+
+    // 写 toml：base_url 指本机 mock。
+    std::fs::create_dir_all(config.join("avc")).unwrap();
+    let toml = format!(
+        "[provider.llm.mock]\napi_key = \"sk-test\"\nmodel = \"mock-model\"\nbase_url = \"http://127.0.0.1:{}\"\n",
+        port
+    );
+    std::fs::write(config.join("avc/avc.toml"), toml).unwrap();
+
+    let r = bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .args(["ask", "--yes", "ping"])
+        .output()
+        .unwrap();
+    let _ = handle.join();
+
+    assert!(
+        r.status.success(),
+        "ask 应成功；stderr={}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&r.stdout);
+    assert!(
+        stdout.contains("hello-from-mock"),
+        "应回显 LLM reply；stdout={:?}",
+        stdout
+    );
+    assert!(
+        stdout.contains("mock"),
+        "应包含 provider 名 'mock'；stdout={:?}",
+        stdout
+    );
+
+    let _ = Arc::new(()); // suppress unused import warning
+}
+
+#[test]
 fn render_rejects_missing_version() {
     // Task 3 / Step 1: persona 只有 v1，render 指定 version 99 应被拒绝。
     // 期望：exit 3 (NotFound)；jobs 计数为 0（无悬挂 job）。
