@@ -27,7 +27,44 @@ pub fn dispatch(argv: &[String]) -> AvcResult<()> {
             for (k, _) in cfg.provider.embed.iter() { all.insert(format!("embed.{}", k), json!({})); }
             print(mode, &all)?;
         }
+        "test" => {
+            if argv.len() < 2 {
+                return Err(AvcError::Arg("provider test <dim>.<name>".into()));
+            }
+            let target = &argv[1];
+            let (dim, name) = target.split_once('.').ok_or_else(|| {
+                AvcError::Arg("provider test: 需要形如 llm.openai".into())
+            })?;
+            match dim {
+                "llm" => {
+                    let cfg = Config::load(&Config::default_config_path()?)?;
+                    let provider = crate::provider::real::make_llm(&cfg, name)?;
+                    let msgs = vec![crate::provider::ChatMessage {
+                        role: "user".into(),
+                        content: "ping".into(),
+                    }];
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .map_err(|e| AvcError::Internal(e.to_string()))?;
+                    let reply = rt.block_on(provider.chat(&msgs))?;
+                    let payload = json!({
+                        "provider": target,
+                        "ok": true,
+                        "reply_preview": reply.chars().take(80).collect::<String>(),
+                    });
+                    print(mode, &payload)?;
+                }
+                other => {
+                    return Err(AvcError::Arg(format!(
+                        "provider test.{}: not yet implemented (Phase 1+ scope)",
+                        other
+                    )));
+                }
+            }
+        }
         _ => return Err(AvcError::Arg(format!("provider: unknown verb '{}'", argv[0]))),
     }
     Ok(())
 }
+
