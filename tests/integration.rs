@@ -732,6 +732,60 @@ fn provider_test_embed_unknown() {
 }
 
 #[test]
+fn provider_test_avatar_unknown() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let config = dir.path().join("config");
+    bin().env("XDG_DATA_HOME", &data).env("XDG_CONFIG_HOME", &config).arg("init").output().unwrap();
+    let r = bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .args(["provider", "test", "avatar.ghost"])
+        .output().unwrap();
+    assert!(
+        !r.status.success(),
+        "不存在的 avatar provider 应非 0；stderr={}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+}
+
+#[test]
+fn provider_test_voice_unknown() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let config = dir.path().join("config");
+    bin().env("XDG_DATA_HOME", &data).env("XDG_CONFIG_HOME", &config).arg("init").output().unwrap();
+    let r = bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .args(["provider", "test", "voice.ghost"])
+        .output().unwrap();
+    assert!(
+        !r.status.success(),
+        "不存在的 voice provider 应非 0；stderr={}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+}
+
+#[test]
+fn provider_test_video_unknown() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let config = dir.path().join("config");
+    bin().env("XDG_DATA_HOME", &data).env("XDG_CONFIG_HOME", &config).arg("init").output().unwrap();
+    let r = bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .args(["provider", "test", "video.ghost"])
+        .output().unwrap();
+    assert!(
+        !r.status.success(),
+        "不存在的 video provider 应非 0；stderr={}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+}
+
+#[test]
 fn finetune_drift_eval_requires_voice_embed_on_base() {
     // base version 没有 voice_embed → Conflict
     let dir = tempfile::tempdir().unwrap();
