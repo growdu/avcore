@@ -8,6 +8,7 @@ pub mod finetune;
 pub mod render;
 pub mod pipeline;
 pub mod drift;
+pub mod corpus;
 
 use chrono::Utc;
 
