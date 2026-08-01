@@ -1047,6 +1047,187 @@ fn render_rejects_non_ready_version() {
     assert_eq!(job_count, 0, "jobs 不应有任何条目");
 }
 
+// ---------------------------- Phase 2 (render vendor / export / feedback) ----------------------------
+
+#[test]
+fn job_export_writes_artifacts_to_fs() {
+    // 走 render run 真跑一次 → job export 落 FS → 验证文件数 + 字节数
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let config = dir.path().join("config");
+
+    bin().env("XDG_DATA_HOME", &data).env("XDG_CONFIG_HOME", &config).arg("init").output().unwrap();
+    bin().env("XDG_DATA_HOME", &data).env("XDG_CONFIG_HOME", &config)
+        .args(["persona", "create", "--name", "yu"]).output().unwrap();
+    let r = bin()
+        .env("XDG_DATA_HOME", &data).env("XDG_CONFIG_HOME", &config)
+        .args(["render", "run", "--persona", "yu", "--version", "1", "--topic", "demo"]).output().unwrap();
+    assert!(r.status.success(), "render run: {}", String::from_utf8_lossy(&r.stderr));
+    let job_id = serde_json::from_str::<serde_json::Value>(&String::from_utf8_lossy(&r.stdout)).unwrap()["job_id"].as_str().unwrap().to_string();
+
+    // 1. job show --artifacts 列出 5 条
+    let r = bin()
+        .env("XDG_DATA_HOME", &data).env("XDG_CONFIG_HOME", &config)
+        .args(["job", "show", &job_id, "--artifacts", "--json"]).output().unwrap();
+    assert!(r.status.success(), "show --artifacts: {}", String::from_utf8_lossy(&r.stderr));
+    let v = serde_json::from_str::<serde_json::Value>(&String::from_utf8_lossy(&r.stdout)).unwrap();
+    let arts = v["artifacts"].as_array().unwrap();
+    assert_eq!(arts.len(), 5, "5 个 artifacts；实际={}", arts.len());
+
+    // 2. job export --out /tmp/.../out → 5 个 .bin 落 FS
+    let out_dir = dir.path().join("exported");
+    let r = bin()
+        .env("XDG_DATA_HOME", &data).env("XDG_CONFIG_HOME", &config)
+        .args(["job", "export", &job_id, "--out", out_dir.to_str().unwrap(), "--json"]).output().unwrap();
+    assert!(r.status.success(), "export: {}", String::from_utf8_lossy(&r.stderr));
+    let v = serde_json::from_str::<serde_json::Value>(&String::from_utf8_lossy(&r.stdout)).unwrap();
+    assert_eq!(v["files"].as_i64().unwrap(), 5);
+    let total_bytes = v["bytes"].as_i64().unwrap();
+    assert!(total_bytes > 0, "bytes > 0; 实际={}", total_bytes);
+
+    // 3. FS 上 file_count 跟报数一致
+    let on_fs = std::fs::read_dir(&out_dir).unwrap().count();
+    assert_eq!(on_fs, 5, "FS 上应是 5 个文件；实际={}", on_fs);
+
+    // 4. 每个 .bin 文件 > 0 字节
+    for e in std::fs::read_dir(&out_dir).unwrap() {
+        let e = e.unwrap();
+        let meta = e.metadata().unwrap();
+        assert!(meta.len() > 0, "文件 {} 应 > 0 字节", e.path().display());
+    }
+}
+
+#[test]
+fn job_feedback_writes_sample_with_kind_feedback() {
+    // job feedback --looks-unlike → persona_samples 增 1 行 kind='feedback' source='user_feedback'
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let config = dir.path().join("config");
+
+    bin().env("XDG_DATA_HOME", &data).env("XDG_CONFIG_HOME", &config).arg("init").output().unwrap();
+    bin().env("XDG_DATA_HOME", &data).env("XDG_CONFIG_HOME", &config)
+        .args(["persona", "create", "--name", "yu"]).output().unwrap();
+    let r = bin()
+        .env("XDG_DATA_HOME", &data).env("XDG_CONFIG_HOME", &config)
+        .args(["render", "run", "--persona", "yu", "--version", "1", "--topic", "demo"]).output().unwrap();
+    assert!(r.status.success());
+    let job_id = serde_json::from_str::<serde_json::Value>(&String::from_utf8_lossy(&r.stdout)).unwrap()["job_id"].as_str().unwrap().to_string();
+
+    // 反馈前的 feedback 样本数
+    let db = rusqlite::Connection::open(data.join("avc/avc.db")).unwrap();
+    let pre: i64 = db.query_row(
+        "SELECT COUNT(*) FROM persona_samples WHERE kind='feedback' AND source='user_feedback'",
+        [], |r| r.get(0)).unwrap();
+    assert_eq!(pre, 0);
+
+    // 提交 feedback
+    let r = bin()
+        .env("XDG_DATA_HOME", &data).env("XDG_CONFIG_HOME", &config)
+        .args(["job", "feedback", &job_id, "--looks-unlike", "--reason", "音色不太像", "--json"]).output().unwrap();
+    assert!(r.status.success(), "feedback: {}", String::from_utf8_lossy(&r.stderr));
+    let v = serde_json::from_str::<serde_json::Value>(&String::from_utf8_lossy(&r.stdout)).unwrap();
+    let sample_id = v["sample_id"].as_str().unwrap();
+    assert!(sample_id.starts_with("smp_"), "sample_id 应 smp_<ULID>; 实际={}", sample_id);
+
+    // 反馈后 = 1 行
+    let post: i64 = db.query_row(
+        "SELECT COUNT(*) FROM persona_samples WHERE kind='feedback' AND source='user_feedback'",
+        [], |r| r.get(0)).unwrap();
+    assert_eq!(post, 1, "feedback 后应 1 行；实际={}", post);
+
+    // 验证 reason 落对 + 通过 sample_id 找到
+    let (text, persona_id): (String, String) = db.query_row(
+        "SELECT text, persona_model_id FROM persona_samples WHERE id = ?",
+        [&sample_id], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+    assert_eq!(text, "音色不太像");
+    assert!(persona_id.starts_with("pm_"), "persona_model_id 应 pm_<ULID>; 实际={}", persona_id);
+}
+
+#[test]
+fn job_feedback_without_flag_returns_arg_error() {
+    // 缺 --looks-unlike → exit 2 (Arg)
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let config = dir.path().join("config");
+    bin().env("XDG_DATA_HOME", &data).env("XDG_CONFIG_HOME", &config).arg("init").output().unwrap();
+    let r = bin()
+        .env("XDG_DATA_HOME", &data).env("XDG_CONFIG_HOME", &config)
+        .args(["job", "feedback", "job_does_not_exist", "--looks-unlike"]).output().unwrap();
+    // 缺 --looks-unlike? 不 — flags 在但 job 不存在 → 应该是 NotFound(exit 3)
+    // 测：没 --looks-unlike 旗则 exit 2 (Arg)
+    let r = bin()
+        .env("XDG_DATA_HOME", &data).env("XDG_CONFIG_HOME", &config)
+        .args(["job", "feedback", "job_does_not_exist", "--reason", "x"]).output().unwrap();
+    assert_eq!(r.status.code(), Some(2), "缺 --looks-unlike 应 Arg; 实际={:?}", r.status.code());
+}
+
+#[test]
+fn cli_video_calls_binary_through_real_pipeline() {
+    // Phase 2 端到端：在 avc.toml 里配 binary 指向 mock 脚本，render run 真跑 →
+    // video DAG 节点 spawn 真 binary → 写真 mp4 → artifact BLOB 是真 mp4 内容
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let config = dir.path().join("config");
+
+    bin().env("XDG_DATA_HOME", &data).env("XDG_CONFIG_HOME", &config).arg("init").output().unwrap();
+    bin().env("XDG_DATA_HOME", &data).env("XDG_CONFIG_HOME", &config)
+        .args(["persona", "create", "--name", "yu"]).output().unwrap();
+
+    // 写 mock 视频 binary（KV-flavor stdout）
+    let mock_bin = dir.path().join("mock_video.sh");
+    std::fs::write(&mock_bin, "\
+#!/bin/sh
+set -e
+case \"$1\" in
+  submit) echo \"task_id=mock-pipe-1\" ;;
+  status) echo \"status=done\" ;;
+  fetch)
+    OUT=\"\"
+    while [ \"$#\" -gt 0 ]; do
+      case \"$1\" in
+        --out) OUT=\"$2\"; shift 2;;
+        *) shift;;
+      esac
+    done
+    mkdir -p \"$(dirname \"$OUT\")\"
+    printf 'MOCK_PIPE_MP4_MAGIC' > \"$OUT\"
+    head -c 2048 /dev/urandom >> \"$OUT\"
+    ;;
+  *) echo \"unknown $1\" >&2; exit 2 ;;
+esac
+").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&mock_bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    // 写 avc.toml 加 provider.video.mock + binary 路径
+    let toml_path = config.join("avc/avc.toml");
+    let mut toml = String::from("[provider.video.mock]\nbinary = \"");
+    toml.push_str(mock_bin.to_str().unwrap());
+    toml.push_str("\"\nmodel = \"m\"\n");
+    std::fs::write(&toml_path, toml).unwrap();
+
+    let r = bin()
+        .env("XDG_DATA_HOME", &data).env("XDG_CONFIG_HOME", &config)
+        .args(["render", "run", "--persona", "yu", "--version", "1", "--topic", "pipe-demo"]).output().unwrap();
+    assert!(r.status.success(), "render run: {}", String::from_utf8_lossy(&r.stderr));
+    let job_id = serde_json::from_str::<serde_json::Value>(&String::from_utf8_lossy(&r.stdout)).unwrap()["job_id"].as_str().unwrap().to_string();
+
+    // 验证 artifact BLOB 中含有 MOCK_PIPE_MP4_MAGIC 前缀
+    let db = rusqlite::Connection::open(data.join("avc/avc.db")).unwrap();
+    // i2v 节点的产物：artifact kind='clip', name='i2v'。
+    let (kind, blob): (String, Vec<u8>) = db.query_row(
+        "SELECT kind, content FROM artifacts WHERE job_id = ?1 AND name = 'i2v' AND content IS NOT NULL",
+        [&job_id], |r| Ok((r.get(0)?, r.get(1)?))).expect("i2v BLOB");
+    eprintln!("i2v kind={}, blob_len={}", kind, blob.len());
+    assert!(blob.starts_with(b"MOCK_PIPE_MP4_MAGIC"),
+        "i2v BLOB 应有 MOCK_PIPE_MP4_MAGIC 前缀；实际前 32 bytes: {:?}",
+        &blob[..32.min(blob.len())]);
+    assert!(blob.len() >= 2048, "应有 ≥2048 bytes；实际={}", blob.len());
+}
+
 #[test]
 fn render_run_executes_full_pipeline_and_produces_artifacts() {
     // Wave B：render run 真跑 DAG 五节点，落 artifacts BLOB。

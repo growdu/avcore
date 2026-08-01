@@ -44,6 +44,10 @@ pub struct ProviderCfg {
     /// BTreeMap 让序列化结果稳定，便于 round-trip 测试与人工审阅。
     #[serde(default)]
     pub extra_headers: std::collections::BTreeMap<String, String>,
+    /// Phase 2：vendor CLI 工具路径（用于 video 等 spawn 三段式调用）。
+    /// Phase 1 留 None 时 CliVideoProvider 走占位 mp4 BLOB 保持向后兼容。
+    #[serde(default)]
+    pub binary: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

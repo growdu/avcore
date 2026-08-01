@@ -189,7 +189,7 @@ pub fn run(db: &Db, job_id: &str, spec: &DagSpec, _topic: &str) -> AvcResult<()>
                     let conn = db.conn.lock().unwrap();
                     let id = crate::svc::new_id("art");
                     let mime = out.mime.clone().unwrap_or_else(|| "application/octet-stream".to_string());
-                    let bytes = base64::decode(blob_b64).map_err(|e| AvcError::Internal(format!("b64: {}", e)))?;
+                    let bytes = base64::decode(blob_b64).map_err(|e: base64::DecodeError| AvcError::Internal(format!("b64: {}", e)))?;
                     let byte_size = bytes.len() as i64;
                     let mut h = Sha256::new();
                     h.update(&bytes);
@@ -286,13 +286,60 @@ fn execute_node(
             meta: serde_json::json!({"resolution": "1080p"}),
             artifact_id: None,
         }),
-        "video" => Ok(NodeOutput {
-            kind: "clip".into(),
-            blob: Some(base64::encode(b"\x00\x00\x00\x18ftypMOCK_VIDEO")),
-            mime: Some("video/mp4".into()),
-            meta: serde_json::json!({"duration_ms": 30000}),
-            artifact_id: None,
-        }),
+        "video" => {
+            // Phase 2: 真调 video provider（如 kling-cli 通过 binary 三段式）。
+            // 步骤：load Config → make_video("mock") → 构造 fake Voice/Avatar/Scenes → render().await 同步阻塞。
+            // 若 provider.video.<name> 没配 → 走占位 BLOB（与 Phase 1 兼容）。
+            // XDG-aware 路径：XDG_CONFIG_HOME/avc/avc.toml
+            let cfg_path = std::env::var("XDG_CONFIG_HOME")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_default()
+                .join("avc")
+                .join("avc.toml");
+            let cfg = crate::config::Config::load(&cfg_path).unwrap_or_default();
+            let video_name = node.config.get("video_provider")
+                .and_then(|v| v.as_str())
+                .unwrap_or("mock");
+            let provider = match crate::provider::real::make_video(&cfg, video_name) {
+                Ok(p) => p,
+                Err(_) => {
+                    // 没配 → 用占位 BLOB（Phase 1 行为）
+                    return Ok(NodeOutput {
+                        kind: "clip".into(),
+                        blob: Some(base64::encode(b"\x00\x00\x00\x18ftypMOCK_VIDEO")),
+                        mime: Some("video/mp4".into()),
+                        meta: serde_json::json!({"duration_ms": 30000}),
+                        artifact_id: None,
+                    });
+                }
+            };
+            let voice = crate::provider::Voice {
+                provider: "mock".into(), provider_version: "stub".into(),
+                voice_id_remote: None, sample_wav_b64: String::new(),
+                transcript: None, embed_b64: None, embed_dim: None,
+            };
+            let avatar = crate::provider::Avatar {
+                provider: "mock".into(), provider_version: "stub".into(),
+                model_id: None, primary_png_b64: String::new(),
+                views_zip_b64: None, face_id: None,
+            };
+            let scenes = vec![crate::provider::ScriptSegment {
+                scene_index: 0,
+                text: format!("scene from job {}", _job_id),
+                duration_ms: 30000,
+            }];
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all().build().unwrap();
+            let clip = rt.block_on(provider.render(&voice, &avatar, &scenes))?;
+            let bytes = base64::decode(&clip.mp4_b64).map_err(|e| AvcError::Internal(format!("b64: {}", e)))?;
+            Ok(NodeOutput {
+                kind: "clip".into(),
+                blob: Some(clip.mp4_b64),
+                mime: Some(clip.mime),
+                meta: serde_json::json!({"duration_ms": clip.duration_ms, "bytes": bytes.len()}),
+                artifact_id: None,
+            })
+        }
         "compose" => Ok(NodeOutput {
             kind: "final_video".into(),
             blob: Some(base64::encode(b"\x00\x00\x00\x18ftypMOCK_FINAL_MP4")),

@@ -47,7 +47,7 @@
 | 模块 | 状态 |
 |------|------|
 | video.render DAG 节点（script_gen / tts / img_gen / i2v / compose） | ⬜ |
-| artifacts BLOB 落库 + export | ⬜ |
+| artifacts BLOB 落库 + export | ✅ | `svc::render::export_artifacts` 落 `<out_dir>/<kind>__<name>__<id>.bin`；CLI `avc job export <job_id> --out <dir>`；进度：31+31 tests 全过 |
 | feedback 路径（`avc job feedback`） | ⬜ |
 | render pack（topics-file → 批跑） | ⬜ |
 

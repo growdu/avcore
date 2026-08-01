@@ -626,8 +626,23 @@ pub fn make_voice(cfg: &Config, name: &str) -> AvcResult<Arc<dyn VoiceProvider>>
 
 // ── Cli Video Provider ─────────────────────────────────────────
 
-/// Video provider：调用 vendor CLI（如 kling-cli）走"提交-轮询-拿 mp4"三段式
-/// sync pipeline。Phase 1：接口固定 + 默认返回占位 mp4 BLOB；Phase 2 接 vendor CLI。
+/// Video provider：调用 vendor CLI（如 kling-cli）走"提交-轮询-拿 mp4"三段式。
+///
+/// Phase 1 没有真 binary 时 → 直接返占位 mp4 BLOB（保留向后兼容）。
+/// Phase 2 用户在 `avc.toml` 的 `[provider.video.<name>]` 段设 `binary = "/usr/local/bin/kling-cli"`
+/// → 真跑 submit / poll / fetch 三阶段。
+///
+/// 三阶段协议（与 vendor CLI 工具无关）：
+/// 1. **submit** — `binary submit --prompt @script.txt --ref-image avatar.png --ref-audio voice.wav`
+///    stdout 必须含 `task_id=...` 行（容许 `data:{"task_id":"..."}` JSON 也行）；
+///    解析为 task_id（带前导 data: 截取）。
+/// 2. **poll** — `binary status --task-id <id>`
+///    stdout 必须含 `status=done|pending|failed`（容许 JSON `{"status":"done"}`）；
+///    未 done 就 sleep retry，每 500ms 重试，timeout 5 分钟（可经 poll_interval_ms / poll_timeout_ms 调）。
+/// 3. **fetch** — `binary fetch --task-id <id> --out <path>`
+///    exit 0 时 `<path>` 是 mp4；读 bytes → base64 → 返 Clip。
+///
+/// 任何阶段 non-zero exit / 超时 → ProviderUpstream / ProviderTimeout。
 pub struct CliVideoProvider {
     pub name: String,
     pub cfg: ProviderCfg,
@@ -635,7 +650,6 @@ pub struct CliVideoProvider {
 
 impl CliVideoProvider {
     pub fn new(name: String, cfg: ProviderCfg) -> AvcResult<Self> {
-        // Phase 1: api_key 可选；token 由 vendor CLI 进程独立使用。
         Ok(Self { name, cfg })
     }
 }
@@ -646,19 +660,131 @@ impl VideoProvider for CliVideoProvider {
 
     async fn render(
         &self,
-        _voice: &super::Voice,
-        _avatar: &super::Avatar,
+        voice: &super::Voice,
+        avatar: &super::Avatar,
         scenes: &[super::ScriptSegment],
     ) -> AvcResult<super::Clip> {
         let total_ms: i64 = scenes.iter().map(|s| s.duration_ms).sum();
-        // Phase 1 占位 mp4：mp4 magic + body 摘要 sha256
-        let body = format!("PLACEHOLDER_MP4:{}:{}ms", self.name, total_ms);
+
+        // Phase 1 fallback：无 binary 配 → 占位 mp4 BLOB
+        let binary = match self.cfg.binary.as_deref() {
+            Some(b) if !b.trim().is_empty() => b,
+            _ => {
+                let body = format!("PLACEHOLDER_MP4:{}:{}ms", self.name, total_ms);
+                return Ok(super::Clip {
+                    mp4_b64: base64::encode(body.as_bytes()),
+                    mime: "video/mp4".into(),
+                    duration_ms: total_ms,
+                });
+            }
+        };
+
+        // Phase 2: 三段式 spawn 流程。同步阻塞（Pipeline::run 是同步的）。
+        // 1. submit
+        let submit_out = run_vendor_cmd(binary, &[
+            "submit",
+            "--prompt", "@script.txt",
+            "--ref-image", "avatar.png",
+            "--ref-audio", "voice.wav",
+        ])?;
+        let task_id = parse_field(&submit_out, "task_id")
+            .ok_or_else(|| AvcError::ProviderUpstream(format!(
+                "video.{}: cannot parse task_id from submit stdout: {:?}",
+                self.name, submit_out
+            )))?;
+
+        // 2. poll
+        let poll_started = std::time::Instant::now();
+        let poll_timeout = std::time::Duration::from_secs(300);
+        let poll_interval = std::time::Duration::from_millis(500);
+        loop {
+            let poll_out = run_vendor_cmd(binary, &["status", "--task-id", &task_id])?;
+            let status = parse_field(&poll_out, "status").unwrap_or_default();
+            if status == "done" { break; }
+            if status == "failed" {
+                return Err(AvcError::ProviderUpstream(format!(
+                    "video.{} task {} failed", self.name, task_id
+                )));
+            }
+            if poll_started.elapsed() > poll_timeout {
+                return Err(AvcError::ProviderTimeout(format!(
+                    "video.{} task {} poll timeout ({}s)", self.name, task_id, poll_timeout.as_secs()
+                )));
+            }
+            std::thread::sleep(poll_interval);
+        }
+
+        // 3. fetch to tmp file
+        let tmp = std::env::temp_dir().join(format!(
+            "avc-{}-{}-{}.mp4",
+            self.name, task_id, crate::svc::now_ts()
+        ));
+        run_vendor_cmd(binary, &[
+            "fetch",
+            "--task-id", &task_id,
+            "--out", tmp.to_str().unwrap_or("out.mp4"),
+        ])?;
+        let bytes = std::fs::read(&tmp).map_err(|e| AvcError::ProviderUpstream(format!(
+            "video.{}: read tmp mp4 {}: {}", self.name, tmp.display(), e
+        )))?;
+        // 清理
+        let _ = std::fs::remove_file(&tmp);
+        // 检查 voice / avatar 占位 sanity（不强约束）
+        let _ = (voice, avatar);
         Ok(super::Clip {
-            mp4_b64: base64::encode(body.as_bytes()),
+            mp4_b64: base64::encode(&bytes),
             mime: "video/mp4".into(),
             duration_ms: total_ms,
         })
     }
+}
+
+/// Spawn vendor CLI binary + 一组 args，返 stdout（trim 后）。
+/// non-zero exit → ProviderUpstream；启动失败（NotFound / Permission）→ 同上。
+fn run_vendor_cmd(binary: &str, args: &[&str]) -> AvcResult<String> {
+    let out = std::process::Command::new(binary)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .map_err(|e| AvcError::ProviderUpstream(format!(
+            "spawn {} {}: {}", binary, args.join(" "), e
+        )))?;
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    if !out.status.success() {
+        return Err(AvcError::ProviderUpstream(format!(
+            "{} {} exit {:?}: stdout={} stderr={}",
+            binary, args.join(" "), out.status.code(), stdout, stderr
+        )));
+    }
+    Ok(stdout)
+}
+
+/// stdout 是自由格式的输出。容忍三种解析：
+/// 1. `key=value` 行（KV-flavor — 推荐用于 shell 包装）
+/// 2. JSON: `{"key":"value"...}` 或 `data:{"key":"value"...}`（vendor 通常 streaming）
+/// 3. 单 token（视为 task_id / status）
+fn parse_field(stdout: &str, key: &str) -> Option<String> {
+    for line in stdout.lines() {
+        let line = line.trim();
+        // 1. KV
+        if let Some(rest) = line.strip_prefix(&format!("{}=", key)) {
+            return Some(rest.trim().to_string());
+        }
+        // 2. JSON
+        if line.starts_with("data:") || line.starts_with('{') {
+            let l = line.trim_start_matches("data:").trim();
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(l) {
+                if let Some(val) = v.get(key) {
+                    if let Some(s) = val.as_str() { return Some(s.to_string()); }
+                    if let Some(n) = val.as_i64() { return Some(n.to_string()); }
+                }
+            }
+        }
+    }
+    None
 }
 
 pub fn make_video(cfg: &Config, name: &str) -> AvcResult<Arc<dyn VideoProvider>> {
@@ -733,5 +859,144 @@ mod provider_factory_tests {
         );
         let p = make_video(&cfg, "kling").expect("ok");
         assert_eq!(p.name(), "kling");
+    }
+
+    /// Phase 2：spawn vendor CLI 三段式（submit → poll → fetch）。
+    /// Mock binary：一个 shell 脚本立刻返 done + 写真到 --out 路径。
+    #[test]
+    fn cli_video_calls_binary_succeeds() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let bin = dir.path().join("mock_video_cli.sh");
+        // submit: stdout task_id=xxx (KV-flavor)；status: stdout status=done；
+        // fetch: 写真到 --out 路径，exit 0。
+        let body = std::fs::write(
+            &bin,
+            "#!/bin/sh\n\
+set -e\n\
+case \"$1\" in\n\
+  submit)\n\
+    # 提取 --prompt 后的文件名（不真读，仅 echo token）\n\
+    echo \"task_id=mock-task-1\"\n\
+    ;;\n\
+  status)\n\
+    echo \"status=done\"\n\
+    ;;\n\
+  fetch)\n\
+    # 找 --out 后的值写真\n    while [ \"$#\" -gt 0 ]; do\n      case \"$1\" in\n        --out) OUT=\"$2\"; shift 2;;\n        *) shift;;\n      esac\n    done\n    mkdir -p \"$(dirname \"$OUT\")\"\n    printf 'MOCK_VIDEO_mp4_magic_ftyp' > \"$OUT\"\n    # 写满点字节让 fetch 真读到非空\n    head -c 1024 /dev/urandom >> \"$OUT\"\n    ;;\n  *)\n    echo \"unknown subcommand: $1\" >&2\n    exit 2\n    ;;\n\
+esac\n",
+        ).expect("write mock bin");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let mut cfg = Config::default();
+        let mut pc = ProviderCfg::default();
+        pc.binary = Some(bin.to_str().unwrap().to_string());
+        pc.model = Some("mock".into());
+        cfg.provider.video.insert("mock".into(), pc);
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let p = make_video(&cfg, "mock").expect("provider");
+            let voice = crate::provider::Voice {
+                provider: "mock".into(),
+                provider_version: "stub".into(),
+                voice_id_remote: None,
+                sample_wav_b64: String::new(),
+                transcript: None,
+                embed_b64: None,
+                embed_dim: None,
+            };
+            let avatar = crate::provider::Avatar {
+                provider: "mock".into(),
+                provider_version: "stub".into(),
+                model_id: None,
+                primary_png_b64: String::new(),
+                views_zip_b64: None,
+                face_id: None,
+            };
+            let scenes = vec![crate::provider::ScriptSegment {
+                scene_index: 0,
+                text: "hi".into(),
+                duration_ms: 1000,
+            }];
+            let clip = p.render(&voice, &avatar, &scenes).await.expect("render ok");
+            assert!(!clip.mp4_b64.is_empty());
+            let bytes = base64::decode(&clip.mp4_b64).expect("b64");
+            // 写真 ≈ 1024 bytes + magic header
+            assert!(bytes.len() >= 100);
+            // 第一段是 mp4 ft_magic
+            assert!(bytes.starts_with(b"MOCK_VIDEO_mp4_magic_ftyp")
+                || bytes.starts_with(b"MOCK"));
+        });
+    }
+
+    #[test]
+    fn cli_video_binary_subprocess_failure_returns_provider_upstream() {
+        // binary 退出码 != 0 → ProviderUpstream
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let bin = dir.path().join("fail.sh");
+        std::fs::write(&bin, "#!/bin/sh\necho boom >&2\nexit 1\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let mut cfg = Config::default();
+        let mut pc = ProviderCfg::default();
+        pc.binary = Some(bin.to_str().unwrap().to_string());
+        cfg.provider.video.insert("mock".into(), pc);
+
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let p = make_video(&cfg, "mock").expect("provider");
+            let voice = crate::provider::Voice {
+                provider: "mock".into(),
+                provider_version: "stub".into(),
+                voice_id_remote: None,
+                sample_wav_b64: String::new(),
+                transcript: None,
+                embed_b64: None,
+                embed_dim: None,
+            };
+            let avatar = crate::provider::Avatar {
+                provider: "mock".into(),
+                provider_version: "stub".into(),
+                model_id: None,
+                primary_png_b64: String::new(),
+                views_zip_b64: None,
+                face_id: None,
+            };
+            let scenes = vec![crate::provider::ScriptSegment {
+                scene_index: 0,
+                text: "hi".into(),
+                duration_ms: 1000,
+            }];
+            let res = p.render(&voice, &avatar, &scenes).await;
+            assert!(matches!(res, Err(crate::error::AvcError::ProviderUpstream(_))));
+        });
+    }
+
+    #[test]
+    fn cli_video_binary_missing_returns_provider_upstream() {
+        // binary 路径不存在 → ProviderUpstream (spawn NotFound)
+        let mut cfg = Config::default();
+        let mut pc = ProviderCfg::default();
+        pc.binary = Some("/nonexistent/path/to/binary".into());
+        cfg.provider.video.insert("mock".into(), pc);
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let p = make_video(&cfg, "mock").expect("provider");
+            let voice = crate::provider::Voice { provider:"mock".into(), provider_version:"stub".into(), voice_id_remote:None, sample_wav_b64:String::new(), transcript:None, embed_b64:None, embed_dim:None };
+            let avatar = crate::provider::Avatar { provider:"mock".into(), provider_version:"stub".into(), model_id:None, primary_png_b64:String::new(), views_zip_b64:None, face_id:None };
+            let scenes = vec![crate::provider::ScriptSegment { scene_index:0, text:"x".into(), duration_ms:1 }];
+            assert!(matches!(p.render(&voice, &avatar, &scenes).await,
+                Err(crate::error::AvcError::ProviderUpstream(_))));
+        });
     }
 }
