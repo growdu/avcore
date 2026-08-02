@@ -22,6 +22,7 @@ pub fn dispatch(argv: &[String]) -> AvcResult<()> {
             let mut persona = None;
             let mut version: Option<i64> = None;
             let mut topic: Option<&str> = None;
+            let mut llm_provider: Option<String> = None;
             let mut i = 1;
             while i < argv.len() {
                 match argv[i].as_str() {
@@ -35,6 +36,10 @@ pub fn dispatch(argv: &[String]) -> AvcResult<()> {
                     }
                     "--topic" => {
                         topic = argv.get(i + 1).map(|s| s.as_str());
+                        i += 2;
+                    }
+                    "--llm-provider" => {
+                        llm_provider = argv.get(i + 1).cloned();
                         i += 2;
                     }
                     _ => {
@@ -55,12 +60,11 @@ pub fn dispatch(argv: &[String]) -> AvcResult<()> {
             let job_id = crate::svc::render::create_job(&db, persona, v, topic)?;
             // Wave B：render run 真跑 DAG 五节点 (script_gen → tts+img_gen → i2v → compose)
             // 节点 BLOB 落 artifacts 表；失败 → job status='failed' + error_json。
-            let spec = crate::svc::pipeline::render_publishment_spec();
-            if let Err(e) = crate::svc::pipeline::run(&db, &job_id, &spec, topic) {
-                // 打印到 stderr 但不 exit — 仍返回 job_id，让调用方决定查询 status。
-                eprintln!("error: pipeline failed: {}", e);
-                let _ = e; // suppress unused
+            let mut spec = crate::svc::pipeline::render_publishment_spec();
+            if let Some(provider) = llm_provider {
+                spec.nodes[0].config["llm_provider"] = serde_json::Value::String(provider);
             }
+            crate::svc::pipeline::run(&db, &job_id, &spec, topic)?;
             if mode == OutputMode::Quiet {
                 println!("{}", job_id);
             } else {

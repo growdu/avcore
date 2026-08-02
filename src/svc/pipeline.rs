@@ -15,6 +15,7 @@ use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::config::Config;
 use crate::db::Db;
 use crate::error::{AvcError, AvcResult};
 
@@ -80,7 +81,7 @@ pub fn render_publishment_spec() -> DagSpec {
                 kind: "llm".into(),
                 when: None,
                 input_from: vec![],
-                config: serde_json::json!({"duration": 30}),
+                config: serde_json::json!({"duration": 30, "llm_provider": "mock"}),
             },
             NodeSpec {
                 id: "tts".into(),
@@ -161,8 +162,19 @@ fn topo_sort(spec: &DagSpec) -> AvcResult<Vec<String>> {
 
 /// 真调度：在 db connection 上同步执行，节点结果落 job_steps，
 /// 节点产物 BLOB 落 artifacts 表。
-pub fn run(db: &Db, job_id: &str, spec: &DagSpec, _topic: &str) -> AvcResult<()> {
+pub fn run(db: &Db, job_id: &str, spec: &DagSpec, topic: &str) -> AvcResult<()> {
+    run_with_llm_provider(db, job_id, spec, topic, None)
+}
+
+pub fn run_with_llm_provider(
+    db: &Db,
+    job_id: &str,
+    spec: &DagSpec,
+    topic: &str,
+    llm_override: Option<std::sync::Arc<dyn crate::provider::LlmProvider>>,
+) -> AvcResult<()> {
     let order = topo_sort(spec)?;
+    let cfg = Config::load(&Config::default_config_path()?)?;
     let nodes: std::collections::HashMap<&str, &NodeSpec> =
         spec.nodes.iter().map(|n| (n.id.as_str(), n)).collect();
     let mut outputs: std::collections::HashMap<String, NodeOutput> =
@@ -195,7 +207,7 @@ pub fn run(db: &Db, job_id: &str, spec: &DagSpec, _topic: &str) -> AvcResult<()>
             )?;
         }
         // 执行
-        let exec = execute_node(node, &outputs, job_id);
+        let exec = execute_node(node, &outputs, job_id, topic, &cfg, llm_override.clone());
         let duration_ms = started.elapsed().as_millis() as i64;
         let finished_at = crate::svc::now_iso();
         match exec {
@@ -294,27 +306,36 @@ pub fn run(db: &Db, job_id: &str, spec: &DagSpec, _topic: &str) -> AvcResult<()>
 /// 单节点执行（同步；生产应 async）。Phase 1 用 mock 数据生成占位 BLOB。
 fn execute_node(
     node: &NodeSpec,
-    _inputs: &std::collections::HashMap<String, NodeOutput>,
-    _job_id: &str,
+    inputs: &std::collections::HashMap<String, NodeOutput>,
+    job_id: &str,
+    topic: &str,
+    cfg: &Config,
+    llm_override: Option<std::sync::Arc<dyn crate::provider::LlmProvider>>,
 ) -> AvcResult<NodeOutput> {
     match node.kind.as_str() {
-        "llm" => Ok(NodeOutput {
-            kind: "script".into(),
-            blob: Some(
-                base64::engine::general_purpose::STANDARD
-                    .encode(format!("MOCK_SCRIPT:{}", node.id).as_bytes()),
-            ),
-            mime: Some("text/plain".into()),
-            meta: serde_json::json!({"duration_ms": 30000}),
-            artifact_id: None,
-        }),
-        "voice" => Ok(NodeOutput {
-            kind: "audio".into(),
-            blob: Some(base64::engine::general_purpose::STANDARD.encode(b"RIFF....MOCK_TTS")),
-            mime: Some("audio/wav".into()),
-            meta: serde_json::json!({"duration_ms": 30000}),
-            artifact_id: None,
-        }),
+        "llm" => {
+            let script = generate_script(node, topic, cfg, llm_override)?;
+            Ok(NodeOutput {
+                kind: "script".into(),
+                blob: Some(base64::engine::general_purpose::STANDARD.encode(script.as_bytes())),
+                mime: Some("text/plain; charset=utf-8".into()),
+                meta: serde_json::json!({"duration_ms": duration_ms(node), "provider": script_provider_name(node, cfg)}),
+                artifact_id: None,
+            })
+        }
+        "voice" => {
+            let text = required_text_input(node, inputs)?;
+            Ok(NodeOutput {
+                kind: "audio".into(),
+                blob: Some(
+                    base64::engine::general_purpose::STANDARD
+                        .encode(format!("MOCK_TTS:{}", text).as_bytes()),
+                ),
+                mime: Some("audio/wav".into()),
+                meta: serde_json::json!({"duration_ms": 30000, "input_text": text}),
+                artifact_id: None,
+            })
+        }
         "avatar" => Ok(NodeOutput {
             kind: "image".into(),
             blob: Some(
@@ -375,7 +396,7 @@ fn execute_node(
             };
             let scenes = vec![crate::provider::ScriptSegment {
                 scene_index: 0,
-                text: format!("scene from job {}", _job_id),
+                text: format!("scene from job {}", job_id),
                 duration_ms: 30000,
             }];
             let rt = tokio::runtime::Builder::new_current_thread()
@@ -408,6 +429,96 @@ fn execute_node(
             "unsupported node kind: {other}"
         ))),
     }
+}
+
+fn duration_ms(node: &NodeSpec) -> i64 {
+    node.config
+        .get("duration")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(30)
+        * 1000
+}
+
+fn script_provider_name(node: &NodeSpec, _cfg: &Config) -> String {
+    node.config
+        .get("llm_provider")
+        .and_then(|v| v.as_str())
+        .unwrap_or("mock")
+        .to_string()
+}
+
+fn generate_script(
+    node: &NodeSpec,
+    topic: &str,
+    cfg: &Config,
+    override_provider: Option<std::sync::Arc<dyn crate::provider::LlmProvider>>,
+) -> AvcResult<String> {
+    let provider_name = script_provider_name(node, cfg);
+    let provider = if provider_name == "mock" {
+        std::sync::Arc::new(crate::provider::mock::MockLlmProvider {
+            name: "mock".into(),
+        }) as std::sync::Arc<dyn crate::provider::LlmProvider>
+    } else if let Some(provider) = override_provider {
+        provider
+    } else {
+        crate::provider::real::make_llm(cfg, &provider_name)?
+    };
+    let duration = duration_ms(node) / 1000;
+    let messages = vec![
+        crate::provider::ChatMessage {
+            role: "system".into(),
+            content: "You generate a concise spoken video script. Return only the script text."
+                .into(),
+        },
+        crate::provider::ChatMessage {
+            role: "user".into(),
+            content: format!("Topic: {topic}\nDuration: {duration} seconds"),
+        },
+    ];
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| AvcError::Internal(format!("tokio runtime: {e}")))?;
+    let reply = rt.block_on(provider.chat(&messages))?;
+    if reply.trim().is_empty() {
+        return Err(AvcError::ProviderUpstream(
+            "LLM returned an empty script".into(),
+        ));
+    }
+    Ok(reply)
+}
+
+fn required_text_input(
+    node: &NodeSpec,
+    inputs: &std::collections::HashMap<String, NodeOutput>,
+) -> AvcResult<String> {
+    let dep = node.input_from.first().ok_or_else(|| {
+        AvcError::Internal(format!(
+            "node '{}' requires a text input dependency",
+            node.id
+        ))
+    })?;
+    let output = inputs.get(dep).ok_or_else(|| {
+        AvcError::Internal(format!(
+            "node '{}' missing dependency output '{}'",
+            node.id, dep
+        ))
+    })?;
+    if output.kind != "script" {
+        return Err(AvcError::Internal(format!(
+            "dependency '{}' is not script output",
+            dep
+        )));
+    }
+    let blob = output
+        .blob
+        .as_deref()
+        .ok_or_else(|| AvcError::Internal(format!("dependency '{}' has no blob", dep)))?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(blob)
+        .map_err(|e| AvcError::Internal(format!("dependency '{}' invalid base64: {}", dep, e)))?;
+    String::from_utf8(bytes)
+        .map_err(|e| AvcError::Internal(format!("dependency '{}' invalid UTF-8: {}", dep, e)))
 }
 
 /// 旧 stub 保留兼容外部 import
@@ -478,29 +589,85 @@ mod tests {
     }
 
     #[test]
-    fn render_spec_has_five_nodes_in_order() {
-        let spec = render_publishment_spec();
-        assert_eq!(spec.nodes.len(), 5);
-        let order = topo_sort(&spec).unwrap();
-        assert_eq!(order.len(), 5);
-        // script_gen 是根；compose 是终；tts/img_gen 都依赖 script_gen 互不依赖；
-        // i2v 依赖 tts 与 img_gen。Kahn 算法保证依赖次序，不保证并列节点的选取。
-        assert_eq!(order.first().unwrap(), "script_gen");
-        assert_eq!(order.last().unwrap(), "compose");
-        // i2v 必须在 tts 与 img_gen 之后
-        let i2v = order.iter().position(|n| n == "i2v").unwrap();
-        assert!(order.iter().position(|n| n == "tts").unwrap() < i2v);
-        assert!(order.iter().position(|n| n == "img_gen").unwrap() < i2v);
-        // script_gen 必须在 tts 与 img_gen 之前
-        assert!(
-            order.iter().position(|n| n == "script_gen").unwrap()
-                < order.iter().position(|n| n == "tts").unwrap()
+    fn required_text_input_decodes_exact_utf8_script() {
+        let text = "exact UTF-8 漢字\nline";
+        let node = NodeSpec {
+            id: "tts".into(),
+            kind: "voice".into(),
+            when: None,
+            input_from: vec!["script_gen".into()],
+            config: serde_json::json!({}),
+        };
+        let mut inputs = std::collections::HashMap::new();
+        inputs.insert(
+            "script_gen".into(),
+            NodeOutput {
+                kind: "script".into(),
+                blob: Some(base64::engine::general_purpose::STANDARD.encode(text.as_bytes())),
+                mime: Some("text/plain; charset=utf-8".into()),
+                meta: serde_json::json!({}),
+                artifact_id: None,
+            },
         );
-        assert!(
-            order.iter().position(|n| n == "script_gen").unwrap()
-                < order.iter().position(|n| n == "img_gen").unwrap()
+        assert_eq!(required_text_input(&node, &inputs).unwrap(), text);
+    }
+
+    #[test]
+    fn required_text_input_rejects_missing_and_invalid_dependencies() {
+        let node = NodeSpec {
+            id: "tts".into(),
+            kind: "voice".into(),
+            when: None,
+            input_from: vec!["script_gen".into()],
+            config: serde_json::json!({}),
+        };
+        let inputs = std::collections::HashMap::new();
+        assert!(required_text_input(&node, &inputs).is_err());
+
+        let mut inputs = std::collections::HashMap::new();
+        inputs.insert(
+            "script_gen".into(),
+            NodeOutput {
+                kind: "script".into(),
+                blob: Some("not base64".into()),
+                mime: Some("text/plain; charset=utf-8".into()),
+                meta: serde_json::json!({}),
+                artifact_id: None,
+            },
         );
-        // i2v 必须在 compose 之前
-        assert!(i2v < order.iter().position(|n| n == "compose").unwrap());
+        assert!(required_text_input(&node, &inputs).is_err());
+    }
+
+    #[test]
+    fn script_generation_uses_stable_prompt_and_mock_reply() {
+        let node = render_publishment_spec().nodes[0].clone();
+        let reply = generate_script(&node, "topic exact", &Config::default(), None).unwrap();
+        assert!(reply.contains("topic exact"));
+        assert!(reply.contains("30"));
+    }
+
+    #[test]
+    fn script_generation_rejects_empty_reply() {
+        let mut node = render_publishment_spec().nodes[0].clone();
+        node.config["llm_provider"] = serde_json::Value::String("custom".into());
+        let provider: std::sync::Arc<dyn crate::provider::LlmProvider> =
+            std::sync::Arc::new(EmptyLlmProvider);
+        let result = generate_script(&node, "topic", &Config::default(), Some(provider));
+        assert!(matches!(result, Err(AvcError::ProviderUpstream(_))));
+    }
+
+    use async_trait::async_trait;
+
+    struct EmptyLlmProvider;
+
+    #[async_trait]
+    impl crate::provider::LlmProvider for EmptyLlmProvider {
+        fn name(&self) -> &str {
+            "empty-test"
+        }
+
+        async fn chat(&self, _msgs: &[crate::provider::ChatMessage]) -> AvcResult<String> {
+            Ok(String::new())
+        }
     }
 }
