@@ -2,7 +2,7 @@
 
 All notable changes to AVCore (avc) are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
-Versioning follows [Semantic Versioning](https://semver.org/) — Phase 1 = `0.1.0`.
+Versioning follows [Semantic Versioning](https://semver.org/) — 当前 alpha 阶段（0.x → 1.0）。
 
 ---
 
@@ -26,7 +26,7 @@ Versioning follows [Semantic Versioning](https://semver.org/) — Phase 1 = `0.1
 - `avc render pack <persona> --topics-file <path> [--version <n>]` — batch 批跑 N topics → N jobs，失败不中断 + 返 `(job_ids, errors)` + 任一失败 exit 4 供 CI 探测
 - `svc::render::pack` 服务函数（topics-file 解析：跳过空行 + `#` 注释）
 - `CHANGELOG.md` 入库（Keep a Changelog 风格）
-- 单测 5 个 + 集成 7 个（CliVideoProvider spawn × 3 / job export / job feedback × 2 / render pack × 3）
+- 单测 22 个 + 集成 12 个新增（v0.2.0 delta；累计 60 单测 + 39 集成 = 99）
 
 ### Changed
 - `ProviderCfg` 增 `binary: Option<String>` 字段（vendor CLI 路径，向后兼容 None）

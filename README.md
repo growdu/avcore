@@ -37,7 +37,9 @@ avc shell                                          # 交互模式：可输自然
 avc ask --yes "把 Yu 的 traits 改成严谨务实"          # 非交互 NL：管道里用
 ```
 
-## 当前实现状态（Phase 0）
+## 当前实现状态（v0.2.0 / Phase 2）
+
+**alpha 状态**：接口已稳定，跑得通；切到生产还需补几条（见末尾"已知局限"）。
 
 ```text
 ✓ CLI 三入口路由（CLI / Shell / ask）
@@ -46,21 +48,30 @@ avc ask --yes "把 Yu 的 traits 改成严谨务实"          # 非交互 NL：�
 ✓ iterate apply（refine：纯 SQL UPDATE，80% 路径）
 ✓ finetune start + publish（含漂移兜底 / DELETE 整行事务回退；target 与 job 同一事务创建，重复 target（含并发）→ Conflict）
 ✓ finetune start 校验 base_version 状态（缺失 NotFound / 非 pending·ready Conflict）
-✓ job create / list / show
+✓ job create / list / show / export / feedback
 ✓ render run 校验 version 状态（缺失 NotFound / 非 pending·ready Conflict）
 ✓ config set / get 点号路径 round-trip（set/get 对空 name 段对称拒绝）
 ✓ Provider trait + Mock 实现（无 token 也能跑通流程）
-✓ 15 个集成测试通过
-✗ 真实 Provider 实现（kling / openai / elevenlabs 等）— Phase 1+
-✗ Shell 内 NL 解析（需先配 provider.llm）— Phase 1+
-✗ DAG 引擎真调 Provider SFT 端点 — Phase 1+
+✓ openai_compat 真 Provider：LLM / Embed / Avatar / Voice（任意 OpenAI 兼容端点）
+✓ CliVideoProvider 抽象 + 真 spawn vendor CLI（占位 mp4 BLOB fallback）
+✓ DAG 引擎真调 5 节点（script_gen / tts / img_gen / i2v / compose），artifacts 落库 + 落 FS
+✓ `avc job export` / `avc job feedback` / `avc render pack <persona> --topics-file <path>`
+✓ Shell NL 入口（启发式分类 → atomic 或 ask::dispatch_nl）
+✓ 60 单测 + 39 集成测试全过（合计 99）
 ```
+
+**已知局限（v0.2.0 仍未覆盖）**：
+
+- vendor 视频 CLI 仍需用户自备二进制（mock 脚本即可用），真实 `kling-cli` / `doubao-cli` 等未捆绑
+- avatar / voice SFT 节点仍为 stub，未接 vendor SFT 端点
+- `export` 仅落本地 FS，未接 S3 / 对象存储
+- drift eval 默认走 DB 已有 vector；显式调 embed Provider 时需先配 `[provider.embed.<name>]`
 
 ## 本地构建
 
 ```bash
 cargo build --release            # 单二进制 ./target/release/avc
-cargo test                       # 15 个集成测试
+cargo test                       # 60 单测 + 39 集成 = 99 个测试
 ./target/debug/avc init          # 初始化 ~/.local/share/avc/avc.db
 ./target/debug/avc persona create --name yu --archetype db_kernel_expert
 ./target/debug/avc iterate apply yu --version 1 --set-persona '{"traits":["严谨","务实"]}'
@@ -82,10 +93,10 @@ cargo test                       # 15 个集成测试
    - [人物角色模型迭代与微调](docs/modules/persona-iteration.md) — `iterate-svc` + `finetune-svc`
    - [视频生成](docs/modules/video-generation.md) — `render-svc`
    - [工作流编排](docs/modules/pipeline.md) — `pipeline-svc`
-6. [Provider trait](docs/api/README.md) — Rust crate API + Provider 字段
+7. [Provider trait](docs/api/README.md) — Rust crate API + Provider 字段
 
 ---
 
 ## 许可
 
-待定（倾向 Apache-2.0 / MIT）。
+[Apache-2.0](LICENSE)。

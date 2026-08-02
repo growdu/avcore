@@ -65,34 +65,54 @@
 ## 测试矩阵
 
 ```
-tests/integration.rs           27 tests
+tests/integration.rs           39 tests
 ├── version_and_help
 ├── init_idempotent_guard
 ├── persona_lifecycle_json
 ├── refine_changes_persist
 ├── finetune_creates_v2_then_publish
 ├── finetune_publish_failed_drifts_rollback
-├── finetune_rejects_missing_base_version       [新增] Task 2: 缺失 base → NotFound
-├── finetune_rejects_non_ready_base_version     [新增] Task 2: building → Conflict
-├── finetune_rejects_duplicate_target_version   [新增] Task 1: 重复 target → Conflict，target/job 不重复写入
-├── finetune_concurrent_starts_are_conflicts    [新增] 3×8 并发：每轮 1 成功 + 7 exit 4，无 BUSY/exit 20
-├── render_rejects_missing_version              [新增] Task 3: 缺失 version → NotFound
-├── render_rejects_non_ready_version            [新增] Task 3: building → Conflict
-├── config_set_get_round_trip                   [新增] Task 1: 点号路径 round-trip
-├── config_rejects_empty_provider_name          [新增] Task 1+: set/get 对空 name 对称拒绝
+├── finetune_rejects_missing_base_version       [Phase 0] 缺失 base → NotFound
+├── finetune_rejects_non_ready_base_version     [Phase 0] building → Conflict
+├── finetune_rejects_duplicate_target_version   [Phase 0] 重复 target → Conflict，target/job 不重复写入
+├── finetune_concurrent_starts_are_conflicts    [Phase 0] 3×8 并发：每轮 1 成功 + 7 exit 4，无 BUSY/exit 20
+├── render_rejects_missing_version              [Phase 0] 缺失 version → NotFound
+├── render_rejects_non_ready_version            [Phase 0] building → Conflict
+├── config_set_get_round_trip                   [Phase 0] 点号路径 round-trip
+├── config_rejects_empty_provider_name          [Phase 0] set/get 对空 name 对称拒绝
 ├── ask_without_llm_errors
-├── ask_with_real_llm_round_trip                [新增] Phase 1.1: ask 真发请求到 OpenAI 兼容 LLM（最小 HTTP 端点）
-├── ask_nl_plan_executes_read_only_plan         [新增] Phase 1.3: NL→plan JSON→真执行
-├── provider_test_unknown_llm_name_says_not_configured   [新增] Phase 1.1: provider test 未配置
-├── provider_test_unsupported_dim               [新增] Phase 1.1: avatar/voice/video 暂未实现（已被 B1 替换为真探针）
-├── provider_test_embed_unknown                 [新增] Phase 1.1: 不存在的 embed provider
-├── provider_test_avatar_unknown                [新增] Phase 1.1: 不存在的 avatar provider
-├── provider_test_voice_unknown                  [新增] Phase 1.1: 不存在的 voice provider
-├── provider_test_video_unknown                  [新增] Phase 1.1: 不存在的 video provider
-├── corpus_create_and_search_round_trip         [新增] Phase 1.4: corpus 切 chunk + embed + search
-├── finetune_drift_eval_requires_voice_embed_on_base        [新增] Phase 1.1: drift eval 缺 voice_embed → Conflict
-├── finetune_drift_eval_with_provider_uses_embed_api        [新增] Phase 1.1: drift eval 真发请求到 embed Provider
-└── render_run_executes_full_pipeline_and_produces_artifacts [新增] Phase 1.2: render run 真走 5 节点 DAG + artifacts 落库
+├── ask_with_real_llm_round_trip                [Phase 1] ask 真发请求到 OpenAI 兼容 LLM（最小 HTTP 端点）
+├── ask_nl_plan_executes_read_only_plan         [Phase 1] NL→plan JSON→真执行
+├── provider_test_unknown_llm_name_says_not_configured   [Phase 1] provider test 未配置
+├── provider_test_unsupported_dim               [Phase 1] 已被 B1 替换为真探针
+├── provider_test_embed_unknown                 [Phase 1] 不存在的 embed provider
+├── provider_test_avatar_unknown                [Phase 1] 不存在的 avatar provider
+├── provider_test_voice_unknown                 [Phase 1] 不存在的 voice provider
+├── provider_test_video_unknown                 [Phase 1] 不存在的 video provider
+├── corpus_create_and_search_round_trip         [Phase 1] corpus 切 chunk + embed + search
+├── finetune_drift_eval_requires_voice_embed_on_base        [Phase 1] drift eval 缺 voice_embed → Conflict
+├── finetune_drift_eval_with_provider_uses_embed_api        [Phase 1] drift eval 真发请求到 embed Provider
+├── render_run_executes_full_pipeline_and_produces_artifacts [Phase 1] render run 真走 5 节点 DAG + artifacts 落库
+├── render_avatar_provider_posts_exact_script_and_persists_png          [Phase 2] avatar 真发请求
+├── render_avatar_http_429_fails_img_gen_without_downstream_work         [Phase 2] avatar 429 不污染下游
+├── render_voice_provider_posts_exact_script_and_persists_audio          [Phase 2] voice 真发请求
+├── render_voice_http_429_fails_tts_without_downstream_work              [Phase 2] voice 429 不污染下游
+├── job_export_writes_artifacts_to_fs                                    [Phase 2] job export
+├── job_feedback_writes_sample_with_kind_feedback                        [Phase 2] job feedback
+├── job_feedback_without_flag_returns_arg_error                          [Phase 2] job feedback 参数校验
+├── render_pack_runs_multiple_jobs_from_topics_file                      [Phase 2] render pack 正路
+├── render_pack_skips_empty_topics_file                                  [Phase 2] render pack 空文件
+└── render_pack_requires_topics_file                                     [Phase 2] render pack 缺文件
+
+src/**/[cfg(test)]              60 unit tests
+├── ask::dispatch_nl                                                  4
+├── provider::real (OpenAiCompat LLM/Embed/Avatar/Voice + 解析)        15
+├── shell::dispatch (启发式分类规则)                                  3
+├── svc::corpus (chunk / embed / search)                              3
+├── svc::drift (cosine / eval 工具)                                   4
+└── svc::pipeline (DAG 拓扑 + 节点执行 + outputs + artifacts)         31
+
+合计：99 个测试全过。
 ```
 
 CI：
