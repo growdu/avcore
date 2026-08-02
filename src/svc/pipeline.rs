@@ -164,7 +164,7 @@ fn topo_sort(spec: &DagSpec) -> AvcResult<Vec<String>> {
 /// 真调度：在 db connection 上同步执行，节点结果落 job_steps，
 /// 节点产物 BLOB 落 artifacts 表。
 pub fn run(db: &Db, job_id: &str, spec: &DagSpec, topic: &str) -> AvcResult<()> {
-    run_with_overrides(db, job_id, spec, topic, None, None)
+    run_with_overrides(db, job_id, spec, topic, None, None, None)
 }
 
 pub fn run_with_llm_provider(
@@ -174,7 +174,7 @@ pub fn run_with_llm_provider(
     topic: &str,
     llm_override: Option<std::sync::Arc<dyn crate::provider::LlmProvider>>,
 ) -> AvcResult<()> {
-    run_with_overrides(db, job_id, spec, topic, llm_override, None)
+    run_with_overrides(db, job_id, spec, topic, llm_override, None, None)
 }
 
 pub fn run_with_voice_provider(
@@ -184,10 +184,20 @@ pub fn run_with_voice_provider(
     topic: &str,
     voice_override: Option<std::sync::Arc<dyn crate::provider::VoiceProvider>>,
 ) -> AvcResult<()> {
-    run_with_overrides(db, job_id, spec, topic, None, voice_override)
+    run_with_overrides(db, job_id, spec, topic, None, voice_override, None)
 }
 
-/// 同时接受 LLM + Voice override；单元/集成测试 + 未来 CLI 注入统一入口。
+pub fn run_with_avatar_provider(
+    db: &Db,
+    job_id: &str,
+    spec: &DagSpec,
+    topic: &str,
+    avatar_override: Option<std::sync::Arc<dyn crate::provider::AvatarProvider>>,
+) -> AvcResult<()> {
+    run_with_overrides(db, job_id, spec, topic, None, None, avatar_override)
+}
+
+/// 同时接受 LLM + Voice + Avatar override；单元/集成测试 + 未来 CLI 注入统一入口。
 pub fn run_with_overrides(
     db: &Db,
     job_id: &str,
@@ -195,6 +205,7 @@ pub fn run_with_overrides(
     topic: &str,
     llm_override: Option<std::sync::Arc<dyn crate::provider::LlmProvider>>,
     voice_override: Option<std::sync::Arc<dyn crate::provider::VoiceProvider>>,
+    avatar_override: Option<std::sync::Arc<dyn crate::provider::AvatarProvider>>,
 ) -> AvcResult<()> {
     let order = topo_sort(spec)?;
     let cfg = Config::load(&Config::default_config_path()?)?;
@@ -238,6 +249,7 @@ pub fn run_with_overrides(
             &cfg,
             llm_override.clone(),
             voice_override.clone(),
+            avatar_override.clone(),
         );
         let duration_ms = started.elapsed().as_millis() as i64;
         let finished_at = crate::svc::now_iso();
@@ -335,6 +347,7 @@ pub fn run_with_overrides(
 }
 
 /// 单节点执行（同步；生产应 async）。Phase 1 用 mock 数据生成占位 BLOB。
+#[allow(clippy::too_many_arguments)]
 fn execute_node(
     node: &NodeSpec,
     inputs: &std::collections::HashMap<String, NodeOutput>,
@@ -343,6 +356,7 @@ fn execute_node(
     cfg: &Config,
     llm_override: Option<std::sync::Arc<dyn crate::provider::LlmProvider>>,
     voice_override: Option<std::sync::Arc<dyn crate::provider::VoiceProvider>>,
+    avatar_override: Option<std::sync::Arc<dyn crate::provider::AvatarProvider>>,
 ) -> AvcResult<NodeOutput> {
     match node.kind.as_str() {
         "llm" => {
@@ -390,15 +404,43 @@ fn execute_node(
                 artifact_id: None,
             })
         }
-        "avatar" => Ok(NodeOutput {
-            kind: "image".into(),
-            blob: Some(
-                base64::engine::general_purpose::STANDARD.encode(b"\x89PNG\r\n\x1a\nMOCK_IMG"),
-            ),
-            mime: Some("image/png".into()),
-            meta: serde_json::json!({"resolution": "1080p"}),
-            artifact_id: None,
-        }),
+        "avatar" => {
+            // Wave C: 真调 avatar provider；exact script text → prompt → primary PNG。
+            // - 优先注入的 avatar_override；mock → 内置 MockAvatarProvider（离线默认）；
+            //   其它 → make_avatar(cfg, name)；不存在 → NotFound，节点失败冒泡。
+            // - 失败（429 / Upstream / TokenAuth / Timeout）直接冒泡，job 状态 failed，
+            //   下游 i2v/compose 不再跑。无占位 fallback。
+            // - 持久化精确 base64 解码后的 primary PNG bytes；mime = image/png；
+            //   meta 携带 provider / model_id / bytes / prompt。
+            let script = required_text_input(node, inputs)?;
+            let avatar_name = avatar_provider_name(node);
+            let provider = resolve_avatar_provider(cfg, avatar_override.clone(), &avatar_name)?;
+            let spec = crate::provider::AvatarSpec {
+                prompt: script.clone(),
+                style: None,
+                ref_image_paths: Vec::new(),
+            };
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| AvcError::Internal(format!("tokio runtime: {e}")))?;
+            let avatar = rt.block_on(provider.create(&spec))?;
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(&avatar.primary_png_b64)
+                .map_err(|e| AvcError::Internal(format!("avatar primary_png_b64 decode: {e}")))?;
+            Ok(NodeOutput {
+                kind: "image".into(),
+                blob: Some(avatar.primary_png_b64),
+                mime: Some("image/png".into()),
+                meta: serde_json::json!({
+                    "provider": provider.name(),
+                    "model_id": avatar.model_id,
+                    "bytes": bytes.len(),
+                    "prompt": script,
+                }),
+                artifact_id: None,
+            })
+        }
         "video" => {
             // Phase 2: 真调 video provider（如 kling-cli 通过 binary 三段式）。
             // 步骤：load Config → make_video("mock") → 构造 fake Voice/Avatar/Scenes → render().await 同步阻塞。
@@ -505,6 +547,39 @@ fn script_provider_name(node: &NodeSpec, _cfg: &Config) -> String {
 fn voice_provider_name(node: &NodeSpec) -> String {
     node.config
         .get("voice_provider")
+        .and_then(|v| v.as_str())
+        .unwrap_or("mock")
+        .to_string()
+}
+
+/// 决定 avatar 节点用哪个 `AvatarProvider`：
+/// - 优先用注入的 `avatar_override`（测试 / 显式 Provider 用）
+/// - 否则 name == "mock" 走内置 `MockAvatarProvider`（不读 cfg，离线默认）
+/// - 否则从 cfg.provider.avatar 取真 provider；不存在 → `NotFound`
+///
+/// 出错（NotFound / RateLimited / ProviderUpstream 等）直接返 Err，节点失败冒泡。
+fn resolve_avatar_provider(
+    cfg: &Config,
+    avatar_override: Option<std::sync::Arc<dyn crate::provider::AvatarProvider>>,
+    name: &str,
+) -> AvcResult<std::sync::Arc<dyn crate::provider::AvatarProvider>> {
+    if let Some(p) = avatar_override {
+        return Ok(p);
+    }
+    if name == "mock" || name.is_empty() {
+        return Ok(std::sync::Arc::new(
+            crate::provider::mock::MockAvatarProvider {
+                name: "mock".into(),
+            },
+        ));
+    }
+    crate::provider::real::make_avatar(cfg, name)
+}
+
+/// 解析 avatar 节点 `node.config["avatar_provider"]`；缺省 / 非字符串 → "mock"（保留离线默认）。
+fn avatar_provider_name(node: &NodeSpec) -> String {
+    node.config
+        .get("avatar_provider")
         .and_then(|v| v.as_str())
         .unwrap_or("mock")
         .to_string()
@@ -733,6 +808,7 @@ mod tests {
             &Config::default(),
             None,
             Some(provider),
+            None,
         )
         .unwrap();
 
@@ -758,6 +834,7 @@ mod tests {
             &Config::default(),
             None,
             Some(provider),
+            None,
         );
         assert!(
             matches!(result, Err(AvcError::RateLimited(message)) if message == "deterministic 429")
@@ -887,6 +964,175 @@ mod tests {
             std::sync::Arc::new(EmptyLlmProvider);
         let result = generate_script(&node, "topic", &Config::default(), Some(provider));
         assert!(matches!(result, Err(AvcError::ProviderUpstream(_))));
+    }
+
+    fn avatar_node(config: serde_json::Value) -> NodeSpec {
+        NodeSpec {
+            id: "img_gen".into(),
+            kind: "avatar".into(),
+            when: None,
+            input_from: vec!["script_gen".into()],
+            config,
+        }
+    }
+
+    const TEST_PNG: &[u8] = b"\x89PNG\r\n\x1a\navatar-deterministic-payload";
+
+    struct DeterministicAvatarProvider;
+
+    #[async_trait]
+    impl crate::provider::AvatarProvider for DeterministicAvatarProvider {
+        fn name(&self) -> &str {
+            "injected-avatar"
+        }
+
+        async fn create(
+            &self,
+            spec: &crate::provider::AvatarSpec,
+        ) -> AvcResult<crate::provider::Avatar> {
+            assert_eq!(spec.prompt, "exact script text");
+            Ok(crate::provider::Avatar {
+                provider: "injected-avatar".into(),
+                provider_version: "openai_compat".into(),
+                model_id: Some("dall-e-3".into()),
+                primary_png_b64: base64::engine::general_purpose::STANDARD.encode(TEST_PNG),
+                views_zip_b64: None,
+                face_id: None,
+            })
+        }
+
+        async fn finetune(
+            &self,
+            _base: &crate::provider::Avatar,
+            _ref_images: &[String],
+            _cfg: &crate::provider::FinetuneConfig,
+        ) -> AvcResult<crate::provider::Avatar> {
+            unreachable!("finetune is not used by the render pipeline")
+        }
+    }
+
+    struct FailingAvatarProvider;
+
+    #[async_trait]
+    impl crate::provider::AvatarProvider for FailingAvatarProvider {
+        fn name(&self) -> &str {
+            "failing-avatar"
+        }
+
+        async fn create(
+            &self,
+            _spec: &crate::provider::AvatarSpec,
+        ) -> AvcResult<crate::provider::Avatar> {
+            Err(AvcError::RateLimited("deterministic avatar 429".into()))
+        }
+
+        async fn finetune(
+            &self,
+            _base: &crate::provider::Avatar,
+            _ref_images: &[String],
+            _cfg: &crate::provider::FinetuneConfig,
+        ) -> AvcResult<crate::provider::Avatar> {
+            unreachable!()
+        }
+    }
+
+    #[test]
+    fn avatar_provider_name_supports_default_and_explicit_provider() {
+        assert_eq!(
+            avatar_provider_name(&avatar_node(serde_json::json!({}))),
+            "mock"
+        );
+        assert_eq!(
+            avatar_provider_name(&avatar_node(
+                serde_json::json!({"avatar_provider": "local"})
+            )),
+            "local"
+        );
+    }
+
+    #[test]
+    fn avatar_node_default_uses_mock_provider_and_persists_png_payload() {
+        // 不传 override + config 中无 avatar_provider → 内置 MockAvatarProvider。
+        // - mime = image/png
+        // - blob 是 base64 解码后 = MockAvatarProvider 的 primary PNG bytes
+        // - meta.provider = "mock"
+        // - meta.bytes = 解码后长度
+        // - meta.prompt = 注入的脚本文本
+        // - meta.model_id = Some(...)
+        let output = execute_node(
+            &avatar_node(serde_json::json!({})),
+            &script_inputs("exact script text"),
+            "job-test",
+            "topic",
+            &Config::default(),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(output.blob.unwrap())
+            .unwrap();
+        assert_eq!(output.mime.as_deref(), Some("image/png"));
+        assert!(bytes.starts_with(b"\x89PNG\r\n\x1a\n"));
+        assert_eq!(output.meta["provider"], "mock");
+        assert_eq!(output.meta["bytes"], bytes.len());
+        assert_eq!(output.meta["prompt"], "exact script text");
+        assert!(
+            output.meta["model_id"].is_string(),
+            "mock model_id should be present: {:?}",
+            output.meta["model_id"]
+        );
+    }
+
+    #[test]
+    fn avatar_node_explicit_injected_provider_preserves_exact_png_payload() {
+        // 显式 override：provider 来自注入；不是 mock；与 mock 输出无关。
+        // - 持久化精确 primary PNG bytes（与 override 返回完全一致）
+        // - mime = image/png
+        // - meta = { provider: "injected-avatar", model_id, bytes, prompt: "exact script text" }
+        let provider: std::sync::Arc<dyn crate::provider::AvatarProvider> =
+            std::sync::Arc::new(DeterministicAvatarProvider);
+        let output = execute_node(
+            &avatar_node(serde_json::json!({"avatar_provider": "explicit"})),
+            &script_inputs("exact script text"),
+            "job-test",
+            "topic",
+            &Config::default(),
+            None,
+            None,
+            Some(provider),
+        )
+        .unwrap();
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(output.blob.unwrap())
+            .unwrap();
+        assert_eq!(bytes, TEST_PNG);
+        assert_eq!(output.mime.as_deref(), Some("image/png"));
+        assert_eq!(output.meta["provider"], "injected-avatar");
+        assert_eq!(output.meta["model_id"], "dall-e-3");
+        assert_eq!(output.meta["bytes"], TEST_PNG.len());
+        assert_eq!(output.meta["prompt"], "exact script text");
+    }
+
+    #[test]
+    fn avatar_node_propagates_provider_error() {
+        // provider 报 RateLimited → 节点失败冒泡；下游 i2v/compose 不跑。
+        let provider: std::sync::Arc<dyn crate::provider::AvatarProvider> =
+            std::sync::Arc::new(FailingAvatarProvider);
+        let result = execute_node(
+            &avatar_node(serde_json::json!({})),
+            &script_inputs("exact script text"),
+            "job-test",
+            "topic",
+            &Config::default(),
+            None,
+            None,
+            Some(provider),
+        );
+        assert!(
+            matches!(result, Err(AvcError::RateLimited(message)) if message == "deterministic avatar 429")
+        );
     }
 
     use async_trait::async_trait;

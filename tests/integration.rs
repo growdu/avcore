@@ -1620,6 +1620,234 @@ fn render_voice_http_429_fails_tts_without_downstream_work() {
     assert_eq!(artifacts, 1, "only the script artifact may exist");
 }
 
+fn start_avatar_server(
+    status: u16,
+    response_bytes: &'static [u8],
+) -> (u16, std::thread::JoinHandle<Vec<u8>>) {
+    use base64::Engine;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let handle = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let mut request = Vec::new();
+        let mut buf = [0_u8; 4096];
+        let header_end;
+        loop {
+            let read = stream.read(&mut buf).unwrap();
+            assert!(read > 0, "client closed before complete HTTP headers");
+            request.extend_from_slice(&buf[..read]);
+            if let Some(pos) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                header_end = pos + 4;
+                break;
+            }
+        }
+        let headers = String::from_utf8_lossy(&request[..header_end]);
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().unwrap())
+            })
+            .unwrap_or(0);
+        while request.len() < header_end + content_length {
+            let read = stream.read(&mut buf).unwrap();
+            assert!(read > 0, "client closed before complete HTTP body");
+            request.extend_from_slice(&buf[..read]);
+        }
+        if status == 200 {
+            // OpenAI 兼容 /v1/images/generations：响应是 JSON
+            // {"data":[{"b64_json":"<base64 PNG>"}]}
+            let b64 = base64::engine::general_purpose::STANDARD.encode(response_bytes);
+            let body = format!(r#"{{"data":[{{"b64_json":"{b64}"}}]}}"#);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+            stream.write_all(body.as_bytes()).unwrap();
+            stream.flush().unwrap();
+        } else {
+            let reason = if status == 429 {
+                "Too Many Requests"
+            } else {
+                "Internal Server Error"
+            };
+            let response = format!(
+                "HTTP/1.1 {status} {reason}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                response_bytes.len()
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+            stream.write_all(response_bytes).unwrap();
+            stream.flush().unwrap();
+        }
+        request
+    });
+    (port, handle)
+}
+
+#[test]
+fn render_avatar_provider_posts_exact_script_and_persists_png() {
+    const PNG: &[u8] = b"\x89PNG\r\n\x1a\navatar-cli-deterministic-payload";
+    let (port, server) = start_avatar_server(200, PNG);
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let config = dir.path().join("config");
+    init_render_persona(&data, &config);
+    std::fs::write(
+        config.join("avc/avc.toml"),
+        format!(
+            "[provider.avatar.local]\napi_key = \"test-key\"\nmodel = \"test-img\"\nbase_url = \"http://127.0.0.1:{port}\"\n"
+        ),
+    )
+    .unwrap();
+
+    let output = bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .args([
+            "render",
+            "run",
+            "--persona",
+            "voice-test",
+            "--version",
+            "1",
+            "--topic",
+            "avatar topic",
+            "--avatar-provider",
+            "local",
+        ])
+        .output()
+        .unwrap();
+    let request = server.join().unwrap();
+    assert!(
+        output.status.success(),
+        "render: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let job_id = serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()["job_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let request_text = String::from_utf8(request).unwrap();
+    assert!(
+        request_text.starts_with("POST /images/generations HTTP/1.1\r\n"),
+        "unexpected request line: {:?}",
+        request_text.lines().next()
+    );
+    let body = request_text.split_once("\r\n\r\n").unwrap().1;
+    let body: serde_json::Value = serde_json::from_str(body).unwrap();
+    // Provider 收到的 prompt 必须是上游 llm 节点生成的"exact script text"
+    // (与 voice 节点使用同一脚本依赖项)
+    let expected_script = "[mock echo] Topic: avatar topic\nDuration: 30 seconds";
+    assert_eq!(body["prompt"], expected_script);
+
+    let db = rusqlite::Connection::open(data.join("avc/avc.db")).unwrap();
+    let (content, mime): (Vec<u8>, String) = db
+        .query_row(
+            "SELECT content, mime FROM artifacts WHERE job_id=?1 AND name='img_gen'",
+            [&job_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(content, PNG);
+    assert_eq!(mime, "image/png");
+    let outputs: String = db
+        .query_row(
+            "SELECT outputs_json FROM job_steps WHERE job_id=?1 AND node_id='img_gen'",
+            [&job_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let outputs: serde_json::Value = serde_json::from_str(&outputs).unwrap();
+    assert_eq!(outputs["meta"]["provider"], "local");
+    assert_eq!(outputs["meta"]["model_id"], "test-img");
+    assert_eq!(outputs["meta"]["bytes"], PNG.len());
+    assert_eq!(outputs["meta"]["prompt"], expected_script);
+}
+
+#[test]
+fn render_avatar_http_429_fails_img_gen_without_downstream_work() {
+    let (port, server) = start_avatar_server(429, b"rate limited");
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let config = dir.path().join("config");
+    init_render_persona(&data, &config);
+    std::fs::write(
+        config.join("avc/avc.toml"),
+        format!(
+            "[provider.avatar.local]\napi_key = \"test-key\"\nbase_url = \"http://127.0.0.1:{port}\"\n"
+        ),
+    )
+    .unwrap();
+
+    let output = bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .args([
+            "render",
+            "run",
+            "--persona",
+            "voice-test",
+            "--topic",
+            "avatar failure topic",
+            "--avatar-provider",
+            "local",
+        ])
+        .output()
+        .unwrap();
+    server.join().unwrap();
+    assert!(!output.status.success());
+
+    let db = rusqlite::Connection::open(data.join("avc/avc.db")).unwrap();
+    let (job_id, status, current_step): (String, String, String) = db
+        .query_row(
+            "SELECT id, status, current_step FROM jobs ORDER BY created_at DESC LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(status, "failed");
+    assert_eq!(current_step, "img_gen");
+    let steps: Vec<(String, String)> = {
+        let mut statement = db
+            .prepare("SELECT node_id, status FROM job_steps WHERE job_id=?1 ORDER BY rowid")
+            .unwrap();
+        statement
+            .query_map([&job_id], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    };
+    assert_eq!(
+        steps,
+        vec![
+            ("script_gen".into(), "succeeded".into()),
+            ("tts".into(), "succeeded".into()),
+            ("img_gen".into(), "failed".into())
+        ],
+        "script_gen + tts 必跑；img_gen failed 后 i2v/compose 不应再跑"
+    );
+    let artifacts: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM artifacts WHERE job_id=?1",
+            [&job_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        artifacts, 2,
+        "only script + audio artifacts may exist; avatar 失败后不应落 BLOB"
+    );
+}
+
 #[test]
 fn job_export_writes_artifacts_to_fs() {
     // 走 render run 真跑一次 → job export 落 FS → 验证文件数 + 字节数
