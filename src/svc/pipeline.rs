@@ -101,7 +101,9 @@ pub fn render_publishment_spec() -> DagSpec {
                 id: "i2v".into(),
                 kind: "video".into(),
                 when: None,
-                input_from: vec!["tts".into(), "img_gen".into()],
+                // i2v 依赖 tts（audio WAV）+ img_gen（PNG）+ script_gen（脚本文本 / 时长）。
+                // script_gen 是显式 DAG 依赖：避免从 audio/image 反推（也不准）。
+                input_from: vec!["tts".into(), "img_gen".into(), "script_gen".into()],
                 config: serde_json::json!({}),
             },
             NodeSpec {
@@ -164,7 +166,7 @@ fn topo_sort(spec: &DagSpec) -> AvcResult<Vec<String>> {
 /// 真调度：在 db connection 上同步执行，节点结果落 job_steps，
 /// 节点产物 BLOB 落 artifacts 表。
 pub fn run(db: &Db, job_id: &str, spec: &DagSpec, topic: &str) -> AvcResult<()> {
-    run_with_overrides(db, job_id, spec, topic, None, None, None)
+    run_with_overrides(db, job_id, spec, topic, None, None, None, None)
 }
 
 pub fn run_with_llm_provider(
@@ -174,7 +176,7 @@ pub fn run_with_llm_provider(
     topic: &str,
     llm_override: Option<std::sync::Arc<dyn crate::provider::LlmProvider>>,
 ) -> AvcResult<()> {
-    run_with_overrides(db, job_id, spec, topic, llm_override, None, None)
+    run_with_overrides(db, job_id, spec, topic, llm_override, None, None, None)
 }
 
 pub fn run_with_voice_provider(
@@ -184,7 +186,7 @@ pub fn run_with_voice_provider(
     topic: &str,
     voice_override: Option<std::sync::Arc<dyn crate::provider::VoiceProvider>>,
 ) -> AvcResult<()> {
-    run_with_overrides(db, job_id, spec, topic, None, voice_override, None)
+    run_with_overrides(db, job_id, spec, topic, None, voice_override, None, None)
 }
 
 pub fn run_with_avatar_provider(
@@ -194,10 +196,21 @@ pub fn run_with_avatar_provider(
     topic: &str,
     avatar_override: Option<std::sync::Arc<dyn crate::provider::AvatarProvider>>,
 ) -> AvcResult<()> {
-    run_with_overrides(db, job_id, spec, topic, None, None, avatar_override)
+    run_with_overrides(db, job_id, spec, topic, None, None, avatar_override, None)
 }
 
-/// 同时接受 LLM + Voice + Avatar override；单元/集成测试 + 未来 CLI 注入统一入口。
+pub fn run_with_video_provider(
+    db: &Db,
+    job_id: &str,
+    spec: &DagSpec,
+    topic: &str,
+    video_override: Option<std::sync::Arc<dyn crate::provider::VideoProvider>>,
+) -> AvcResult<()> {
+    run_with_overrides(db, job_id, spec, topic, None, None, None, video_override)
+}
+
+/// 同时接受 LLM + Voice + Avatar + Video override；单元/集成测试 + 未来 CLI 注入统一入口。
+#[allow(clippy::too_many_arguments)]
 pub fn run_with_overrides(
     db: &Db,
     job_id: &str,
@@ -206,6 +219,7 @@ pub fn run_with_overrides(
     llm_override: Option<std::sync::Arc<dyn crate::provider::LlmProvider>>,
     voice_override: Option<std::sync::Arc<dyn crate::provider::VoiceProvider>>,
     avatar_override: Option<std::sync::Arc<dyn crate::provider::AvatarProvider>>,
+    video_override: Option<std::sync::Arc<dyn crate::provider::VideoProvider>>,
 ) -> AvcResult<()> {
     let order = topo_sort(spec)?;
     let cfg = Config::load(&Config::default_config_path()?)?;
@@ -250,6 +264,7 @@ pub fn run_with_overrides(
             llm_override.clone(),
             voice_override.clone(),
             avatar_override.clone(),
+            video_override.clone(),
         );
         let duration_ms = started.elapsed().as_millis() as i64;
         let finished_at = crate::svc::now_iso();
@@ -351,12 +366,13 @@ pub fn run_with_overrides(
 fn execute_node(
     node: &NodeSpec,
     inputs: &std::collections::HashMap<String, NodeOutput>,
-    job_id: &str,
+    _job_id: &str,
     topic: &str,
     cfg: &Config,
     llm_override: Option<std::sync::Arc<dyn crate::provider::LlmProvider>>,
     voice_override: Option<std::sync::Arc<dyn crate::provider::VoiceProvider>>,
     avatar_override: Option<std::sync::Arc<dyn crate::provider::AvatarProvider>>,
+    video_override: Option<std::sync::Arc<dyn crate::provider::VideoProvider>>,
 ) -> AvcResult<NodeOutput> {
     match node.kind.as_str() {
         "llm" => {
@@ -442,72 +458,60 @@ fn execute_node(
             })
         }
         "video" => {
-            // Phase 2: 真调 video provider（如 kling-cli 通过 binary 三段式）。
-            // 步骤：load Config → make_video("mock") → 构造 fake Voice/Avatar/Scenes → render().await 同步阻塞。
-            // 若 provider.video.<name> 没配 → 走占位 BLOB（与 Phase 1 兼容）。
-            // XDG-aware 路径：XDG_CONFIG_HOME/avc/avc.toml
-            let cfg_path = std::env::var("XDG_CONFIG_HOME")
-                .map(std::path::PathBuf::from)
-                .unwrap_or_default()
-                .join("avc")
-                .join("avc.toml");
-            let cfg = crate::config::Config::load(&cfg_path).unwrap_or_default();
-            let video_name = node
-                .config
-                .get("video_provider")
-                .and_then(|v| v.as_str())
-                .unwrap_or("mock");
-            let provider = match crate::provider::real::make_video(&cfg, video_name) {
-                Ok(p) => p,
-                Err(_) => {
-                    // 没配 → 用占位 BLOB（Phase 1 行为）
-                    return Ok(NodeOutput {
-                        kind: "clip".into(),
-                        blob: Some(
-                            base64::engine::general_purpose::STANDARD
-                                .encode(b"\x00\x00\x00\x18ftypMOCK_VIDEO"),
-                        ),
-                        mime: Some("video/mp4".into()),
-                        meta: serde_json::json!({"duration_ms": 30000}),
-                        artifact_id: None,
-                    });
-                }
-            };
+            // Wave C: 真调 video provider；exact script_text + wav_b64 + png_b64 → render()。
+            // - 依赖项：必须从 inputs 取 script_gen (script) / tts (audio) / img_gen (image)
+            //   三个 exact NodeOutput；任意缺失 / kind 不符 / blob 缺失 → 节点失败冒泡。
+            // - 注入优先 video_override；mock → 内置 MockVideoProvider（离线默认）；
+            //   其它 → make_video(cfg, name)；不存在 → NotFound，节点失败冒泡（无占位 fallback）。
+            // - 失败（429 / Upstream / Timeout）直接冒泡，job 状态 failed，
+            //   下游 compose 不再跑。
+            // - 持久化精确 base64 解码后的 mp4 bytes；mime = video/mp4；
+            //   meta 携带 provider / duration_ms / bytes / prompt(脚本 text)。
+            let script_text = required_script_text_input(node, inputs, "script_gen")?;
+            let wav_bytes = required_audio_blob(node, inputs, "tts")?;
+            let png_bytes = required_image_blob(node, inputs, "img_gen")?;
+            let video_name = video_provider_name(node);
+            let provider = resolve_video_provider(cfg, video_override.clone(), &video_name)?;
             let voice = crate::provider::Voice {
-                provider: "mock".into(),
-                provider_version: "stub".into(),
+                provider: provider.name().to_string(),
+                provider_version: "pipeline".into(),
                 voice_id_remote: None,
-                sample_wav_b64: String::new(),
+                sample_wav_b64: base64::engine::general_purpose::STANDARD.encode(&wav_bytes),
                 transcript: None,
                 embed_b64: None,
                 embed_dim: None,
             };
             let avatar = crate::provider::Avatar {
-                provider: "mock".into(),
-                provider_version: "stub".into(),
+                provider: "pipeline".into(),
+                provider_version: "pipeline".into(),
                 model_id: None,
-                primary_png_b64: String::new(),
+                primary_png_b64: base64::engine::general_purpose::STANDARD.encode(&png_bytes),
                 views_zip_b64: None,
                 face_id: None,
             };
             let scenes = vec![crate::provider::ScriptSegment {
                 scene_index: 0,
-                text: format!("scene from job {}", job_id),
-                duration_ms: 30000,
+                text: script_text.clone(),
+                duration_ms: duration_ms(node),
             }];
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
-                .unwrap();
+                .map_err(|e| AvcError::Internal(format!("tokio runtime: {e}")))?;
             let clip = rt.block_on(provider.render(&voice, &avatar, &scenes))?;
             let bytes = base64::engine::general_purpose::STANDARD
                 .decode(&clip.mp4_b64)
-                .map_err(|e| AvcError::Internal(format!("b64: {}", e)))?;
+                .map_err(|e| AvcError::Internal(format!("video mp4_b64 decode: {e}")))?;
             Ok(NodeOutput {
                 kind: "clip".into(),
                 blob: Some(clip.mp4_b64),
                 mime: Some(clip.mime),
-                meta: serde_json::json!({"duration_ms": clip.duration_ms, "bytes": bytes.len()}),
+                meta: serde_json::json!({
+                    "provider": provider.name(),
+                    "duration_ms": clip.duration_ms,
+                    "bytes": bytes.len(),
+                    "prompt": script_text,
+                }),
                 artifact_id: None,
             })
         }
@@ -583,6 +587,39 @@ fn avatar_provider_name(node: &NodeSpec) -> String {
         .and_then(|v| v.as_str())
         .unwrap_or("mock")
         .to_string()
+}
+
+/// 解析 video 节点 `node.config["video_provider"]`；缺省 / 非字符串 → "mock"（保留离线默认）。
+fn video_provider_name(node: &NodeSpec) -> String {
+    node.config
+        .get("video_provider")
+        .and_then(|v| v.as_str())
+        .unwrap_or("mock")
+        .to_string()
+}
+
+/// 决定 video 节点用哪个 `VideoProvider`：
+/// - 优先用注入的 `video_override`（测试 / 显式 Provider 用）
+/// - 否则 name == "mock" 走内置 `MockVideoProvider`（不读 cfg，离线默认）
+/// - 否则从 cfg.provider.video 取真 provider；不存在 → `NotFound`
+///
+/// 出错（NotFound / ProviderUpstream 等）直接返 Err，节点失败冒泡。
+fn resolve_video_provider(
+    cfg: &Config,
+    video_override: Option<std::sync::Arc<dyn crate::provider::VideoProvider>>,
+    name: &str,
+) -> AvcResult<std::sync::Arc<dyn crate::provider::VideoProvider>> {
+    if let Some(p) = video_override {
+        return Ok(p);
+    }
+    if name.is_empty() || (name == "mock" && !cfg.provider.video.contains_key(name)) {
+        return Ok(std::sync::Arc::new(
+            crate::provider::mock::MockVideoProvider {
+                name: "mock".into(),
+            },
+        ));
+    }
+    crate::provider::real::make_video(cfg, name)
 }
 
 /// 决定 tts 节点用哪个 `VoiceProvider`：
@@ -681,6 +718,107 @@ fn required_text_input(
         .map_err(|e| AvcError::Internal(format!("dependency '{}' invalid base64: {}", dep, e)))?;
     String::from_utf8(bytes)
         .map_err(|e| AvcError::Internal(format!("dependency '{}' invalid UTF-8: {}", dep, e)))
+}
+
+/// 强类型：从指定 named 依赖取 script text（kind == "script"，blob 是 base64 文本）。
+/// 用于 video 节点：依赖 script_gen 必须存在且内容完整。
+fn required_script_text_input(
+    node: &NodeSpec,
+    inputs: &std::collections::HashMap<String, NodeOutput>,
+    dep: &str,
+) -> AvcResult<String> {
+    if !node.input_from.iter().any(|d| d == dep) {
+        return Err(AvcError::Internal(format!(
+            "node '{}' missing required DAG dep '{}'",
+            node.id, dep
+        )));
+    }
+    let output = inputs.get(dep).ok_or_else(|| {
+        AvcError::Internal(format!(
+            "node '{}' missing dependency output '{}'",
+            node.id, dep
+        ))
+    })?;
+    if output.kind != "script" {
+        return Err(AvcError::Internal(format!(
+            "dependency '{}' is not script output (kind={})",
+            dep, output.kind
+        )));
+    }
+    let blob = output.blob.as_deref().ok_or_else(|| {
+        AvcError::Internal(format!("dependency '{}' has no blob (text required)", dep))
+    })?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(blob)
+        .map_err(|e| AvcError::Internal(format!("dependency '{}' invalid base64: {}", dep, e)))?;
+    String::from_utf8(bytes)
+        .map_err(|e| AvcError::Internal(format!("dependency '{}' invalid UTF-8: {}", dep, e)))
+}
+
+/// 强类型：从指定 named 依赖取 audio 字节（kind == "audio"，blob 是 base64 WAV）。
+/// 用于 video 节点：依赖 tts 必须存在且 blob 可解码为音频字节。
+fn required_audio_blob(
+    node: &NodeSpec,
+    inputs: &std::collections::HashMap<String, NodeOutput>,
+    dep: &str,
+) -> AvcResult<Vec<u8>> {
+    if !node.input_from.iter().any(|d| d == dep) {
+        return Err(AvcError::Internal(format!(
+            "node '{}' missing required DAG dep '{}'",
+            node.id, dep
+        )));
+    }
+    let output = inputs.get(dep).ok_or_else(|| {
+        AvcError::Internal(format!(
+            "node '{}' missing dependency output '{}'",
+            node.id, dep
+        ))
+    })?;
+    if output.kind != "audio" {
+        return Err(AvcError::Internal(format!(
+            "dependency '{}' is not audio output (kind={})",
+            dep, output.kind
+        )));
+    }
+    let blob = output.blob.as_deref().ok_or_else(|| {
+        AvcError::Internal(format!("dependency '{}' has no blob (audio required)", dep))
+    })?;
+    base64::engine::general_purpose::STANDARD
+        .decode(blob)
+        .map_err(|e| AvcError::Internal(format!("dependency '{}' invalid base64: {}", dep, e)))
+}
+
+/// 强类型：从指定 named 依赖取 image 字节（kind == "image"，blob 是 base64 PNG）。
+/// 用于 video 节点：依赖 img_gen 必须存在且 blob 可解码为图片字节。
+fn required_image_blob(
+    node: &NodeSpec,
+    inputs: &std::collections::HashMap<String, NodeOutput>,
+    dep: &str,
+) -> AvcResult<Vec<u8>> {
+    if !node.input_from.iter().any(|d| d == dep) {
+        return Err(AvcError::Internal(format!(
+            "node '{}' missing required DAG dep '{}'",
+            node.id, dep
+        )));
+    }
+    let output = inputs.get(dep).ok_or_else(|| {
+        AvcError::Internal(format!(
+            "node '{}' missing dependency output '{}'",
+            node.id, dep
+        ))
+    })?;
+    if output.kind != "image" {
+        return Err(AvcError::Internal(format!(
+            "dependency '{}' is not image output (kind={})",
+            dep, output.kind
+        )));
+    }
+    let blob = output.blob.as_deref().ok_or_else(|| {
+        AvcError::Internal(format!("dependency '{}' has no blob (image required)", dep))
+    })?;
+    base64::engine::general_purpose::STANDARD
+        .decode(blob)
+        .map_err(|e| AvcError::Internal(format!("dependency '{}' invalid base64: {}", dep, e)))
 }
 
 /// 旧 stub 保留兼容外部 import
@@ -809,6 +947,7 @@ mod tests {
             None,
             Some(provider),
             None,
+            None,
         )
         .unwrap();
 
@@ -834,6 +973,7 @@ mod tests {
             &Config::default(),
             None,
             Some(provider),
+            None,
             None,
         );
         assert!(
@@ -1068,6 +1208,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
         let bytes = base64::engine::general_purpose::STANDARD
@@ -1102,6 +1243,7 @@ mod tests {
             None,
             None,
             Some(provider),
+            None,
         )
         .unwrap();
         let bytes = base64::engine::general_purpose::STANDARD
@@ -1129,6 +1271,7 @@ mod tests {
             None,
             None,
             Some(provider),
+            None,
         );
         assert!(
             matches!(result, Err(AvcError::RateLimited(message)) if message == "deterministic avatar 429")
@@ -1148,5 +1291,346 @@ mod tests {
         async fn chat(&self, _msgs: &[crate::provider::ChatMessage]) -> AvcResult<String> {
             Ok(String::new())
         }
+    }
+
+    // ─── Video provider 单元测试 ──────────────────────────────────
+
+    const TEST_MP4: &[u8] =
+        b"\x00\x00\x00\x18ftypmp42\x00\x00\x00\x00mp42isomvideo-deterministic-payload";
+    const TEST_MP4_MIME: &str = "video/mp4";
+    const TEST_VIDEO_DURATION_MS: i64 = 30_000;
+
+    /// 通用 fixture：构造 video node + 三依赖 inputs（script/tts/img_gen）+ cfg。
+    fn video_inputs(
+        script_text: &str,
+        wav: &[u8],
+        png: &[u8],
+    ) -> std::collections::HashMap<String, NodeOutput> {
+        let mut inputs = std::collections::HashMap::new();
+        inputs.insert(
+            "script_gen".into(),
+            NodeOutput {
+                kind: "script".into(),
+                blob: Some(
+                    base64::engine::general_purpose::STANDARD.encode(script_text.as_bytes()),
+                ),
+                mime: Some("text/plain; charset=utf-8".into()),
+                meta: serde_json::json!({"duration_ms": 30000}),
+                artifact_id: None,
+            },
+        );
+        inputs.insert(
+            "tts".into(),
+            NodeOutput {
+                kind: "audio".into(),
+                blob: Some(base64::engine::general_purpose::STANDARD.encode(wav)),
+                mime: Some("audio/wav".into()),
+                meta: serde_json::json!({"provider": "mock"}),
+                artifact_id: None,
+            },
+        );
+        inputs.insert(
+            "img_gen".into(),
+            NodeOutput {
+                kind: "image".into(),
+                blob: Some(base64::engine::general_purpose::STANDARD.encode(png)),
+                mime: Some("image/png".into()),
+                meta: serde_json::json!({"provider": "mock"}),
+                artifact_id: None,
+            },
+        );
+        inputs
+    }
+
+    fn video_node(config: serde_json::Value) -> NodeSpec {
+        NodeSpec {
+            id: "i2v".into(),
+            kind: "video".into(),
+            when: None,
+            input_from: vec!["tts".into(), "img_gen".into(), "script_gen".into()],
+            config,
+        }
+    }
+
+    struct DeterministicVideoProvider;
+
+    #[async_trait]
+    impl crate::provider::VideoProvider for DeterministicVideoProvider {
+        fn name(&self) -> &str {
+            "injected-video"
+        }
+
+        async fn render(
+            &self,
+            voice: &crate::provider::Voice,
+            avatar: &crate::provider::Avatar,
+            scenes: &[crate::provider::ScriptSegment],
+        ) -> AvcResult<crate::provider::Clip> {
+            // 必须收到 exact 上游 wav bytes（解码 → 再 base64 → 与 provider 收的相等）
+            let wav_in = base64::engine::general_purpose::STANDARD
+                .decode(&voice.sample_wav_b64)
+                .expect("wav b64");
+            assert_eq!(
+                wav_in, TEST_WAV,
+                "video provider 必须收到 exact 上游 wav bytes"
+            );
+            let png_in = base64::engine::general_purpose::STANDARD
+                .decode(&avatar.primary_png_b64)
+                .expect("png b64");
+            assert_eq!(
+                png_in, TEST_PNG,
+                "video provider 必须收到 exact 上游 png bytes"
+            );
+            // scenes 必须是单段且 text=exact script
+            assert_eq!(scenes.len(), 1);
+            assert_eq!(scenes[0].scene_index, 0);
+            assert_eq!(scenes[0].text, "exact script text");
+            // duration 来自 node.config.duration=30 → 30000 ms（脚本 generation 节点默认 30s）
+            assert_eq!(scenes[0].duration_ms, 30_000);
+            Ok(crate::provider::Clip {
+                mp4_b64: base64::engine::general_purpose::STANDARD.encode(TEST_MP4),
+                mime: TEST_MP4_MIME.into(),
+                duration_ms: TEST_VIDEO_DURATION_MS,
+            })
+        }
+    }
+
+    struct FailingVideoProvider;
+
+    #[async_trait]
+    impl crate::provider::VideoProvider for FailingVideoProvider {
+        fn name(&self) -> &str {
+            "failing-video"
+        }
+
+        async fn render(
+            &self,
+            _voice: &crate::provider::Voice,
+            _avatar: &crate::provider::Avatar,
+            _scenes: &[crate::provider::ScriptSegment],
+        ) -> AvcResult<crate::provider::Clip> {
+            Err(AvcError::ProviderUpstream("deterministic video 502".into()))
+        }
+    }
+
+    #[test]
+    fn video_provider_name_supports_default_and_explicit_provider() {
+        assert_eq!(
+            video_provider_name(&video_node(serde_json::json!({}))),
+            "mock"
+        );
+        assert_eq!(
+            video_provider_name(&video_node(serde_json::json!({"video_provider": "kling"}))),
+            "kling"
+        );
+    }
+
+    #[test]
+    fn video_node_injected_provider_receives_exact_inputs_and_persists_mp4() {
+        // 注入 video provider：必须收到 exact 上游 wav/png/script text；
+        // 持久化 exact MP4 bytes + mime + duration_ms + provider + prompt。
+        let provider: std::sync::Arc<dyn crate::provider::VideoProvider> =
+            std::sync::Arc::new(DeterministicVideoProvider);
+        let output = execute_node(
+            &video_node(serde_json::json!({"video_provider": "explicit"})),
+            &video_inputs("exact script text", TEST_WAV, TEST_PNG),
+            "job-test",
+            "topic",
+            &Config::default(),
+            None,
+            None,
+            None,
+            Some(provider),
+        )
+        .expect("ok");
+
+        // 持久化 = provider 返的 exact mp4 bytes
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(output.blob.expect("blob"))
+            .unwrap();
+        assert_eq!(
+            bytes, TEST_MP4,
+            "video BLOB = provider 返的 exact mp4 bytes"
+        );
+        assert_eq!(output.kind, "clip");
+        assert_eq!(output.mime.as_deref(), Some(TEST_MP4_MIME));
+        assert_eq!(output.meta["provider"], "injected-video");
+        assert_eq!(output.meta["duration_ms"], TEST_VIDEO_DURATION_MS);
+        assert_eq!(output.meta["bytes"], TEST_MP4.len() as i64);
+        assert_eq!(output.meta["prompt"], "exact script text");
+    }
+
+    #[test]
+    fn video_node_default_uses_mock_provider_when_no_override_and_persists_mp4() {
+        // 不传 override + config.video_provider="mock" → 内置 MockVideoProvider
+        // mock 看 scenes 算 duration_ms = 30000 + mp4 magic bytes
+        let output = execute_node(
+            &video_node(serde_json::json!({})),
+            &video_inputs("exact script text", TEST_WAV, TEST_PNG),
+            "job-test",
+            "topic",
+            &Config::default(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("ok");
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(output.blob.expect("blob"))
+            .unwrap();
+        // mock 返回固定的 mp4 占位（见 provider::mock::MockVideoProvider）
+        assert!(
+            bytes.starts_with(b"\x00\x00\x00\x18ftypmock"),
+            "mock video 应以 ftyp mock 开头；actual={:?}",
+            &bytes[..bytes.len().min(16)]
+        );
+        assert_eq!(output.meta["provider"], "mock");
+        assert_eq!(output.meta["duration_ms"], 30_000);
+        assert_eq!(output.meta["prompt"], "exact script text");
+    }
+
+    #[test]
+    fn video_node_propagates_provider_error_and_no_fallback() {
+        // provider 报 ProviderUpstream → 节点失败冒泡；不返占位 mp4。
+        let provider: std::sync::Arc<dyn crate::provider::VideoProvider> =
+            std::sync::Arc::new(FailingVideoProvider);
+        let result = execute_node(
+            &video_node(serde_json::json!({"video_provider": "explicit"})),
+            &video_inputs("exact script text", TEST_WAV, TEST_PNG),
+            "job-test",
+            "topic",
+            &Config::default(),
+            None,
+            None,
+            None,
+            Some(provider),
+        );
+        assert!(
+            matches!(result, Err(AvcError::ProviderUpstream(ref message)) if message == "deterministic video 502"),
+            "provider error 应原样冒泡；actual={:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn video_node_rejects_unknown_provider_name_without_fallback() {
+        // 显式 video_provider="ghost" + 没 override → cfg 没配 → NotFound；
+        // 不再走占位 mp4 路径（Wave C 要求：no named fallback）。
+        let cfg = Config::default();
+        // 确保 cfg 里没有 ghost 这个 video provider
+        assert!(!cfg.provider.video.contains_key("ghost"));
+        let result = execute_node(
+            &video_node(serde_json::json!({"video_provider": "ghost"})),
+            &video_inputs("exact script text", TEST_WAV, TEST_PNG),
+            "job-test",
+            "topic",
+            &cfg,
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(
+            matches!(result, Err(AvcError::NotFound(_))),
+            "未注册的 video provider 名应 NotFound；actual={:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn video_node_rejects_missing_dependency_outputs() {
+        // 缺任意依赖（script_gen / tts / img_gen）→ 节点失败冒泡
+        let base = video_inputs("exact script text", TEST_WAV, TEST_PNG);
+        for missing in ["script_gen", "tts", "img_gen"] {
+            let mut inputs = base.clone();
+            inputs.remove(missing);
+            let result = execute_node(
+                &video_node(serde_json::json!({})),
+                &inputs,
+                "job-test",
+                "topic",
+                &Config::default(),
+                None,
+                None,
+                None,
+                None,
+            );
+            assert!(
+                result.is_err(),
+                "缺 {} 依赖应报错；actual={:?}",
+                missing,
+                result
+            );
+        }
+    }
+
+    #[test]
+    fn video_node_rejects_dependency_with_wrong_kind() {
+        // 依赖 kind 不符（script_gen 不是 script；tts 不是 audio；img_gen 不是 image）
+        // → 节点失败冒泡
+        let mut inputs = video_inputs("exact script text", TEST_WAV, TEST_PNG);
+        // 把 script_gen.kind 改成 audio → 应当 fail
+        inputs.get_mut("script_gen").unwrap().kind = "audio".into();
+        let result = execute_node(
+            &video_node(serde_json::json!({})),
+            &inputs,
+            "job-test",
+            "topic",
+            &Config::default(),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(result.is_err(), "script_gen kind 错应报错");
+    }
+
+    #[test]
+    fn video_node_rejects_node_without_required_dag_dep() {
+        // video 节点 input_from 缺 script_gen → 应报错（不能从 audio/image 反推）
+        let node = NodeSpec {
+            id: "i2v".into(),
+            kind: "video".into(),
+            when: None,
+            input_from: vec!["tts".into(), "img_gen".into()],
+            config: serde_json::json!({}),
+        };
+        let result = execute_node(
+            &node,
+            &video_inputs("exact script text", TEST_WAV, TEST_PNG),
+            "job-test",
+            "topic",
+            &Config::default(),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(result.is_err(), "video 缺 script_gen DAG dep 应报错");
+    }
+
+    #[test]
+    fn video_node_injected_override_overrides_explicit_name() {
+        // 注入 video_override 时，无论 node.config.video_provider 是什么，
+        // 都用注入的 provider（"injected-video"）。
+        let provider: std::sync::Arc<dyn crate::provider::VideoProvider> =
+            std::sync::Arc::new(DeterministicVideoProvider);
+        let output = execute_node(
+            &video_node(serde_json::json!({"video_provider": "ignored-when-overridden"})),
+            &video_inputs("exact script text", TEST_WAV, TEST_PNG),
+            "job-test",
+            "topic",
+            &Config::default(),
+            None,
+            None,
+            None,
+            Some(provider),
+        )
+        .expect("ok");
+        assert_eq!(
+            output.meta["provider"], "injected-video",
+            "override 应覆盖 config 里的 video_provider 名"
+        );
     }
 }

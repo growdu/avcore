@@ -712,20 +712,95 @@ impl VideoProvider for CliVideoProvider {
             }
         };
 
-        // Phase 2: 三段式 spawn 流程。同步阻塞（Pipeline::run 是同步的）。
-        // 1. submit
-        let submit_out = run_vendor_cmd(
-            binary,
-            &[
-                "submit",
-                "--prompt",
-                "@script.txt",
-                "--ref-image",
-                "avatar.png",
-                "--ref-audio",
-                "voice.wav",
-            ],
-        )?;
+        // ── Phase 2: 把 exact 上游 DAG artifact（scenes text / avatar png / voice wav）
+        //    materialize 成 unique 临时文件，再 spawn vendor CLI 走三段式。
+        //
+        // 设计要点：
+        // 1. **校验 base64 在 spawn 之前**：avatar.primary_png_b64 / voice.sample_wav_b64
+        //    都必须是合法 base64（容许为空 → 写空文件）。解码失败 → ProviderUpstream，
+        //    不浪费 spawn。
+        // 2. **unique 路径**：`<temp>/avc-<provider>-<kind>-<pid>-<nanos>.<ext>`；并发
+        //    render 不会互相覆盖。fetch 用同名 mp4；fetch 后再读取 + 删除。
+        // 3. **RAII 守卫 TempFileGuard**：Drop 时一次性删除所有临时文件，覆盖成功 + 所有
+        //    error return + panic unwinds。
+        // 4. **submit 用真实文件路径**：vendor 协议约定 `--prompt @<path>` 让它自己读，
+        //    `--ref-image <path>` / `--ref-audio <path>` 同理。
+        let script_bytes = serialize_scenes(scenes);
+        let png_bytes = base64::engine::general_purpose::STANDARD
+            .decode(avatar.primary_png_b64.as_bytes())
+            .map_err(|e| {
+                AvcError::ProviderUpstream(format!(
+                    "video.{}: avatar.primary_png_b64 invalid base64: {}",
+                    self.name, e
+                ))
+            })?;
+        let wav_bytes = base64::engine::general_purpose::STANDARD
+            .decode(voice.sample_wav_b64.as_bytes())
+            .map_err(|e| {
+                AvcError::ProviderUpstream(format!(
+                    "video.{}: voice.sample_wav_b64 invalid base64: {}",
+                    self.name, e
+                ))
+            })?;
+
+        let unique = unique_suffix();
+        let script_path =
+            std::env::temp_dir().join(format!("avc-{}-script-{}.txt", self.name, unique));
+        let image_path =
+            std::env::temp_dir().join(format!("avc-{}-avatar-{}.png", self.name, unique));
+        let audio_path =
+            std::env::temp_dir().join(format!("avc-{}-voice-{}.wav", self.name, unique));
+        let fetch_path =
+            std::env::temp_dir().join(format!("avc-{}-fetch-{}.mp4", self.name, unique));
+
+        // 先全部写出来。任何一个 IO 失败 → guard 在 drop 时清掉已写的剩余文件。
+        write_temp_file(&script_path, &script_bytes).map_err(|e| {
+            AvcError::ProviderUpstream(format!(
+                "video.{}: write script {}: {}",
+                self.name,
+                script_path.display(),
+                e
+            ))
+        })?;
+        write_temp_file(&image_path, &png_bytes).map_err(|e| {
+            AvcError::ProviderUpstream(format!(
+                "video.{}: write avatar png {}: {}",
+                self.name,
+                image_path.display(),
+                e
+            ))
+        })?;
+        write_temp_file(&audio_path, &wav_bytes).map_err(|e| {
+            AvcError::ProviderUpstream(format!(
+                "video.{}: write voice wav {}: {}",
+                self.name,
+                audio_path.display(),
+                e
+            ))
+        })?;
+
+        let _guard = TempFileGuard::new(vec![
+            script_path.clone(),
+            image_path.clone(),
+            audio_path.clone(),
+            fetch_path.clone(),
+        ]);
+
+        // 1. submit — 协议：`--prompt @<script-path>`，ref-image/ref-audio 直接传路径。
+        let script_arg = format!("@{}", script_path.display());
+        let image_arg = image_path.display().to_string();
+        let audio_arg = audio_path.display().to_string();
+        let submit_argv = [
+            "submit".to_string(),
+            "--prompt".to_string(),
+            script_arg,
+            "--ref-image".to_string(),
+            image_arg,
+            "--ref-audio".to_string(),
+            audio_arg,
+        ];
+        let submit_argv_ref: Vec<&str> = submit_argv.iter().map(String::as_str).collect();
+        let submit_out = run_vendor_cmd(binary, &submit_argv_ref)?;
         let task_id = parse_field(&submit_out, "task_id").ok_or_else(|| {
             AvcError::ProviderUpstream(format!(
                 "video.{}: cannot parse task_id from submit stdout: {:?}",
@@ -760,40 +835,84 @@ impl VideoProvider for CliVideoProvider {
             std::thread::sleep(poll_interval);
         }
 
-        // 3. fetch to tmp file
-        let tmp = std::env::temp_dir().join(format!(
-            "avc-{}-{}-{}.mp4",
-            self.name,
-            task_id,
-            crate::svc::now_ts()
-        ));
-        run_vendor_cmd(
-            binary,
-            &[
-                "fetch",
-                "--task-id",
-                &task_id,
-                "--out",
-                tmp.to_str().unwrap_or("out.mp4"),
-            ],
-        )?;
-        let bytes = std::fs::read(&tmp).map_err(|e| {
+        // 3. fetch — 把 mp4 写到我们提供的 fetch_path
+        let fetch_arg = fetch_path.display().to_string();
+        let fetch_argv = [
+            "fetch".to_string(),
+            "--task-id".to_string(),
+            task_id.clone(),
+            "--out".to_string(),
+            fetch_arg,
+        ];
+        let fetch_argv_ref: Vec<&str> = fetch_argv.iter().map(String::as_str).collect();
+        run_vendor_cmd(binary, &fetch_argv_ref)?;
+
+        let bytes = std::fs::read(&fetch_path).map_err(|e| {
             AvcError::ProviderUpstream(format!(
-                "video.{}: read tmp mp4 {}: {}",
+                "video.{}: read fetched mp4 {}: {}",
                 self.name,
-                tmp.display(),
+                fetch_path.display(),
                 e
             ))
         })?;
-        // 清理
-        let _ = std::fs::remove_file(&tmp);
-        // 检查 voice / avatar 占位 sanity（不强约束）
-        let _ = (voice, avatar);
+        if bytes.is_empty() {
+            return Err(AvcError::ProviderUpstream(format!(
+                "video.{}: fetched mp4 {} is empty",
+                self.name,
+                fetch_path.display()
+            )));
+        }
+
+        // guard 在此函数末尾 drop → 删 4 个 tmp file（含 fetch_path）。
         Ok(super::Clip {
             mp4_b64: base64::engine::general_purpose::STANDARD.encode(&bytes),
             mime: "video/mp4".into(),
             duration_ms: total_ms,
         })
+    }
+}
+
+/// 把 `ScriptSegment` 列表序列化成 vendor CLI 可消费的纯文本 prompt：
+/// 每行 `<scene_index>: <text>`，末尾空行。空 scenes → 空 bytes（仍写空文件）。
+fn serialize_scenes(scenes: &[super::ScriptSegment]) -> Vec<u8> {
+    let mut s = String::new();
+    for seg in scenes {
+        s.push_str(&format!("{}: {}\n", seg.scene_index, seg.text));
+    }
+    s.into_bytes()
+}
+
+/// 生成 PID + nanos 后缀，保证多个并发 render 不会撞名。
+fn unique_suffix() -> String {
+    let pid = std::process::id();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("{}-{}", pid, nanos)
+}
+
+fn write_temp_file(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    std::fs::write(path, bytes)
+}
+
+/// Drop 时一次性删除一组临时文件。删除失败不报错（best-effort）——文件可能已被外部
+/// fetch / 用户手动清理，但仍要把我们写入的剩余文件清掉。
+struct TempFileGuard {
+    paths: Vec<std::path::PathBuf>,
+}
+
+impl TempFileGuard {
+    fn new(paths: Vec<std::path::PathBuf>) -> Self {
+        Self { paths }
+    }
+}
+
+impl Drop for TempFileGuard {
+    fn drop(&mut self) {
+        for p in &self.paths {
+            let _ = std::fs::remove_file(p);
+        }
     }
 }
 
@@ -942,7 +1061,9 @@ mod provider_factory_tests {
     }
 
     /// Phase 2：spawn vendor CLI 三段式（submit → poll → fetch）。
-    /// Mock binary：一个 shell 脚本立刻返 done + 写真到 --out 路径。
+    /// Mock binary：必须精确读到 `--prompt @<path>` 指向的脚本文件、--ref-image 指向的
+    /// avatar png、--ref-audio 指向的 voice wav；并把内容写到 --out。
+    /// 缺任何 upstream 文件 / ref 都退出 3，避免 regression 静默通过（failed accounting）。
     #[test]
     fn cli_video_calls_binary_succeeds() {
         let dir = tempfile::tempdir().expect("tmpdir");
@@ -951,19 +1072,35 @@ mod provider_factory_tests {
         // fetch: 写真到 --out 路径，exit 0。
         std::fs::write(
             &bin,
-            "#!/bin/sh\n\
-set -e\n\
-case \"$1\" in\n\
-  submit)\n\
-    # 提取 --prompt 后的文件名（不真读，仅 echo token）\n\
-    echo \"task_id=mock-task-1\"\n\
-    ;;\n\
-  status)\n\
-    echo \"status=done\"\n\
-    ;;\n\
-  fetch)\n\
-    # 找 --out 后的值写真\n    while [ \"$#\" -gt 0 ]; do\n      case \"$1\" in\n        --out) OUT=\"$2\"; shift 2;;\n        *) shift;;\n      esac\n    done\n    mkdir -p \"$(dirname \"$OUT\")\"\n    printf 'MOCK_VIDEO_mp4_magic_ftyp' > \"$OUT\"\n    # 写满点字节让 fetch 真读到非空\n    head -c 1024 /dev/urandom >> \"$OUT\"\n    ;;\n  *)\n    echo \"unknown subcommand: $1\" >&2\n    exit 2\n    ;;\n\
-esac\n",
+            "#!/bin/sh
+set -e
+case \"$1\" in
+  submit)
+    # 提取 --prompt 后的文件名（不真读，仅 echo token）
+    echo \"task_id=mock-task-1\"
+    ;;
+  status)
+    echo \"status=done\"
+    ;;
+  fetch)
+    # 找 --out 后的值写真
+    while [ \"$#\" -gt 0 ]; do
+      case \"$1\" in
+        --out) OUT=\"$2\"; shift 2;;
+        *) shift;;
+      esac
+    done
+    mkdir -p \"$(dirname \"$OUT\")\"
+    printf 'MOCK_VIDEO_mp4_magic_ftyp' > \"$OUT\"
+    # 写满点字节让 fetch 真读到非空
+    head -c 1024 /dev/urandom >> \"$OUT\"
+    ;;
+  *)
+    echo \"unknown subcommand: $1\" >&2
+    exit 2
+    ;;
+esac
+",
         )
         .expect("write mock bin");
         #[cfg(unix)]

@@ -2159,6 +2159,8 @@ esac
             "1",
             "--topic",
             "pipe-demo",
+            "--video-provider",
+            "mock",
         ])
         .output()
         .unwrap();
