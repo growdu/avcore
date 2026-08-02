@@ -3058,3 +3058,349 @@ fn render_still_accepts_valid_invocations() {
         count
     );
 }
+
+/// `avc render run` / `pack` 的 value-required flag 后面紧跟 `-` 开头的
+/// token（已知 flag、未知 flag、全局 --json/--quiet 都算）必须被视为"缺失值"。
+///
+/// RED：原 `next(i)` 仅校验 `Some(...)` + 非空；`--persona --quiet` 会把
+/// `--quiet` 当成 persona 名，下游 `get_persona("--quiet")` 抛 NotFound，
+/// 误导用户把 "--quiet 当 persona" 当成"persona 不存在"，且 exit 3。
+/// 类似 `--video-provider --json` → 诡异的 "provider.video.--json" 路径，
+/// `--topics-file --quiet` → "Db: read topics file --quiet: No such file"
+/// (exit 20)。这些都不是用户预期的 "missing value" (exit 2)。
+///
+/// GREEN：narrow rule — `next` token 以 `-` 开头一律视为缺失值；
+/// `require_value` 抛 `AvcError::Arg` (exit 2)，stderr 命名该 flag。
+/// 例外：保留 `--version` 接受纯数字（含 `--1` 这种诡异但合法形式），
+/// 但因为版本域恒 ≥1，另行 enforce `version > 0`。
+#[test]
+fn render_value_required_flag_rejects_leading_dash_next() {
+    let dir = tempfile::tempdir().unwrap();
+    init_and_create_persona(&dir);
+    let data = dir.path().join("data");
+    let config = dir.path().join("config");
+
+    // 写一个真实 topics-file，让 pack 的"被吞 --topics-file"路径有 base。
+    let topics = dir.path().join("topics.txt");
+    std::fs::write(&topics, "topic-a\n# comment\n\ntopic-b\n").unwrap();
+
+    // (argv, 期望被 stderr 命名的 flag 子串)
+    let cases: &[(&[&str], &str)] = &[
+        // === render run：value-required flag 后紧跟全局 --quiet / --json ===
+        (&["render", "run", "--persona", "--quiet"], "--persona"),
+        (&["render", "run", "--persona", "--json"], "--persona"),
+        (
+            &["render", "run", "--persona", "yu", "--topic", "--quiet"],
+            "--topic",
+        ),
+        (
+            &["render", "run", "--persona", "yu", "--version", "--json"],
+            "--version",
+        ),
+        // === render run：provider flag 后紧跟任何其它 flag ===
+        (
+            &[
+                "render",
+                "run",
+                "--persona",
+                "yu",
+                "--llm-provider",
+                "--avatar-provider",
+            ],
+            "--llm-provider",
+        ),
+        (
+            &[
+                "render",
+                "run",
+                "--persona",
+                "yu",
+                "--voice-provider",
+                "--video-provider",
+            ],
+            "--voice-provider",
+        ),
+        (
+            &[
+                "render",
+                "run",
+                "--persona",
+                "yu",
+                "--avatar-provider",
+                "--quiet",
+            ],
+            "--avatar-provider",
+        ),
+        (
+            &[
+                "render",
+                "run",
+                "--persona",
+                "yu",
+                "--video-provider",
+                "--json",
+            ],
+            "--video-provider",
+        ),
+        // === render run：provider flag 后紧跟拼错的 flag / 完全未知 flag ===
+        (
+            &[
+                "render",
+                "run",
+                "--persona",
+                "yu",
+                "--llm-provider",
+                "--bogus",
+            ],
+            "--llm-provider",
+        ),
+        // === render pack：--topics-file 后紧跟全局 / 未知 ===
+        (
+            &["render", "pack", "yu", "--topics-file", "--quiet"],
+            "--topics-file",
+        ),
+        (
+            &["render", "pack", "yu", "--topics-file", "--bogus-flag"],
+            "--topics-file",
+        ),
+        // === render pack：--version 后紧跟全局 / 未知 ===
+        (
+            &[
+                "render",
+                "pack",
+                "yu",
+                "--topics-file",
+                topics.to_str().unwrap(),
+                "--version",
+                "--quiet",
+            ],
+            "--version",
+        ),
+        (
+            &[
+                "render",
+                "pack",
+                "yu",
+                "--topics-file",
+                topics.to_str().unwrap(),
+                "--version",
+                "--unknown",
+            ],
+            "--version",
+        ),
+    ];
+
+    for (argv, expected_flag) in cases {
+        let r = bin()
+            .env("XDG_DATA_HOME", &data)
+            .env("XDG_CONFIG_HOME", &config)
+            .args(*argv)
+            .output()
+            .unwrap();
+        assert_eq!(
+            r.status.code(),
+            Some(2),
+            "value-required flag 后紧跟 `-` 开头的 token 必须 exit 2 (Arg)；argv={:?}，stderr={}",
+            argv,
+            String::from_utf8_lossy(&r.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&r.stderr);
+        assert!(
+            stderr.contains(expected_flag),
+            "stderr 应包含被拒 flag `{}` 用于定位；argv={:?}，stderr={:?}",
+            expected_flag,
+            argv,
+            stderr
+        );
+    }
+
+    // 关键断言：所有"被吞 value"的调用 *绝不能* 落 jobs 行。
+    let db = rusqlite::Connection::open(data.join("avc/avc.db")).unwrap();
+    let count: i64 = db
+        .query_row("SELECT COUNT(*) FROM jobs", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        count, 0,
+        "value-required flag 后紧跟 `-` 开头 token 的调用不应创建任何 job；got {}",
+        count
+    );
+}
+
+/// `avc render run --version <n>` / `pack --version <n>`：版本号必须 > 0
+/// (persona 版本链恒 ≥ 1：`create` 落 v1，`finetune start base=N` 落 v(N+1))。
+///
+/// 这是 schema/service 证据支持的 enforce：DB 中 `persona_models.current_version
+/// INTEGER NOT NULL DEFAULT 1`、`persona_versions.version INTEGER NOT NULL`
+/// (PK 的一部分)；下游 `create_job` 用 `version` 直接查表，<= 0 只会得到
+/// NotFound，与其让用户经历 NotFound 不如在 CLI 层 early-reject 给清晰错误。
+///
+/// 不在本测试覆盖负数 — 任务边界明确"version should be positive anyway"，
+/// 不引入 `version = -1` 这种诡异 case 让 parser 接受。
+#[test]
+fn render_rejects_non_positive_version() {
+    let dir = tempfile::tempdir().unwrap();
+    init_and_create_persona(&dir);
+    let data = dir.path().join("data");
+    let config = dir.path().join("config");
+
+    let topics = dir.path().join("topics.txt");
+    std::fs::write(&topics, "topic-a\n").unwrap();
+
+    // 0 是非正版本的最直接代表；-1 / "-99" 我们也一并覆盖以 enforce "≤0 拒绝"。
+    for argv in [
+        vec!["render", "run", "--persona", "yu", "--version", "0"],
+        vec!["render", "run", "--persona", "yu", "--version", "-1"],
+        vec!["render", "run", "--persona", "yu", "--version", "-99"],
+        vec![
+            "render",
+            "pack",
+            "yu",
+            "--topics-file",
+            topics.to_str().unwrap(),
+            "--version",
+            "0",
+        ],
+        vec![
+            "render",
+            "pack",
+            "yu",
+            "--topics-file",
+            topics.to_str().unwrap(),
+            "--version",
+            "-1",
+        ],
+    ] {
+        let r = bin()
+            .env("XDG_DATA_HOME", &data)
+            .env("XDG_CONFIG_HOME", &config)
+            .args(&argv)
+            .output()
+            .unwrap();
+        assert_eq!(
+            r.status.code(),
+            Some(2),
+            "非正 --version {:?} 应 exit 2 (Arg)；stderr={}",
+            argv,
+            String::from_utf8_lossy(&r.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&r.stderr);
+        assert!(
+            stderr.contains("--version"),
+            "stderr 应包含 `--version` 用于定位；argv={:?}，stderr={:?}",
+            argv,
+            stderr
+        );
+    }
+
+    let db = rusqlite::Connection::open(data.join("avc/avc.db")).unwrap();
+    let count: i64 = db
+        .query_row("SELECT COUNT(*) FROM jobs", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        count, 0,
+        "非正 --version 的调用不应创建任何 job；got {}",
+        count
+    );
+}
+
+/// 守门测试：合法的 render invocation（含全局 --quiet / --json）必须仍然成功，
+/// 不能因为新 parser 收紧而被误拒。这是 `render_value_required_flag_rejects_leading_dash_next`
+/// 的反面，避免过度收紧破坏既有调用 (含全局 flag 在末尾 / 中段)。
+#[test]
+fn render_accepts_valid_invocations_with_global_flags() {
+    let dir = tempfile::tempdir().unwrap();
+    init_and_create_persona(&dir);
+    let data = dir.path().join("data");
+    let config = dir.path().join("config");
+
+    let topics = dir.path().join("topics.txt");
+    std::fs::write(&topics, "topic-a\n").unwrap();
+
+    // === render run --quiet (合法：全局 flag 在 value-required flag 之后) ===
+    let r = bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .args(["render", "run", "--persona", "yu", "--quiet"])
+        .output()
+        .unwrap();
+    assert!(
+        r.status.success(),
+        "合法 render run + --quiet 应成功；stderr={}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&r.stdout);
+    assert!(
+        stdout.starts_with("job_"),
+        "quiet 模式 stdout 形如 `job_...`；got={:?}",
+        stdout
+    );
+
+    // === render run --json (合法：全局 flag 在末尾) ===
+    let r = bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .args(["render", "run", "--persona", "yu", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        r.status.success(),
+        "合法 render run + --json 应成功；stderr={}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+
+    // === render run 合法 --version 1 (合法：明确指定 v1) ===
+    let r = bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .args([
+            "render",
+            "run",
+            "--persona",
+            "yu",
+            "--version",
+            "1",
+            "--topic",
+            "t",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        r.status.success(),
+        "合法 render run + --version 1 应成功；stderr={}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+
+    // === render pack + 合法 --version 1 + 全局 --quiet ===
+    let r = bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .args([
+            "render",
+            "pack",
+            "yu",
+            "--topics-file",
+            topics.to_str().unwrap(),
+            "--version",
+            "1",
+            "--quiet",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        r.status.success(),
+        "合法 render pack + --version 1 + --quiet 应成功；stderr={}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+
+    // 守门：不应有 job 被错误地"丢弃"。render run 跑了 2 次 (--quiet + --json + --version 1 共 3 次)，
+    // pack 跑了 1 次；期望至少 3 条 job。pack 的 job 计数按 topics-file 行数。
+    let db = rusqlite::Connection::open(data.join("avc/avc.db")).unwrap();
+    let count: i64 = db
+        .query_row("SELECT COUNT(*) FROM jobs", [], |r| r.get(0))
+        .unwrap();
+    assert!(
+        count >= 3,
+        "合法 invocation 应至少落 3 条 job (3 run + 1 pack topic)；got {}",
+        count
+    );
+}

@@ -26,10 +26,28 @@ pub fn dispatch(argv: &[String]) -> AvcResult<()> {
             // - 任何 token 以 '-' 开头但 *不是* 已知 flag（拼错的 provider 名 /
             //   完全未知 flag）必须以 AvcError::Arg 拒绝，避免 `--llm-providr mock`
             //   这种 typo 静默跑默认 provider。
-            // - 已知 flag 的 *值* 即使以 '-' 开头（如 provider 名 `--weird`）也
-            //   按原样接受——这是常规 CLI 行为，避免误伤合法 invocation。
+            // - **narrow rule**：value-required flag 后紧跟以 '-' 开头的 token
+            //   （已知 flag、未知 flag、全局 --json/--quiet 都算）一律视为缺失值。
+            //   即 `next()` 在 next token starts with '-' 时返回 None，
+            //   `require_value` 抛 Arg（exit 2）。理由：
+            //     * persona / provider 名 / topic / topics-file / version 在本
+            //       命令域内语义上不可能是 `-` 开头（provider 配置名规范、path、
+            //       整数）；
+            //     * 若允许 leading-dash value，`--persona --quiet` 会把 `--quiet`
+            //       当 persona 名，下游 `get_persona("--quiet")` 抛 NotFound，
+            //       误导用户把 "value 被吞" 当成 "persona 不存在" (exit 3)。
+            //     * 类似地 `--video-provider --json` 会进入诡异的
+            //       `provider.video.--json` 路径；`--topics-file --quiet` 会让
+            //       svc 抛 "Db: read topics file --quiet: No such file" (exit 20)。
+            //   这条规则与 "leading-dash value 是合法 CLI 行为" 的通用原则冲突，
+            //   但 render 命令域内我们优先可观察正确性 (no silent execution)，
+            //   极少数真有 leading-dash value 需求的用户应明确改用 config / env。
             // - 解析完成时若还有未消费的 token（非已知 flag 且不以 '-' 开头），
             //   视为多余 positional token 拒绝（不再用 `_ => i += 1` 静默吞）。
+            // - `--version <n>`：n 必须 > 0 (persona 版本链恒 ≥ 1，
+            //   `create` 落 v1，`finetune start base=N` 落 v(N+1))。下游
+            //   `create_job` 直接用 version 查表，<=0 只会得到 NotFound；CLI 层
+            //   early-reject 给清晰错误，stderr 含 `--version` 用于定位。
             let mut persona: Option<String> = None;
             let mut version: Option<i64> = None;
             let mut topic: Option<String> = None;
@@ -40,9 +58,11 @@ pub fn dispatch(argv: &[String]) -> AvcResult<()> {
             let mut i = 1;
             while i < argv.len() {
                 let next = |i: usize| -> Option<String> {
+                    // narrow rule：下一 token 以 '-' 开头 → 视为缺失值。
+                    // 见上方说明（render 命令域内拒绝 leading-dash value）。
                     argv.get(i + 1)
                         .map(|s| s.trim().to_string())
-                        .filter(|s| !s.is_empty())
+                        .filter(|s| !s.is_empty() && !s.starts_with('-'))
                 };
                 match argv[i].as_str() {
                     "--persona" => {
@@ -51,9 +71,16 @@ pub fn dispatch(argv: &[String]) -> AvcResult<()> {
                     }
                     "--version" => {
                         let raw = require_value("--version", next(i))?;
-                        version = Some(raw.parse().map_err(|_| {
+                        let v: i64 = raw.parse().map_err(|_| {
                             AvcError::Arg(format!("--version: 需整数，got '{}'", raw))
-                        })?);
+                        })?;
+                        if v <= 0 {
+                            return Err(AvcError::Arg(format!(
+                                "--version: 必须 > 0 (persona 版本链从 1 起)，got '{}'",
+                                v
+                            )));
+                        }
+                        version = Some(v);
                         i += 2;
                     }
                     "--topic" => {
@@ -151,7 +178,7 @@ pub fn dispatch(argv: &[String]) -> AvcResult<()> {
                 let next = |i: usize| -> Option<String> {
                     argv.get(i + 1)
                         .map(|s| s.trim().to_string())
-                        .filter(|s| !s.is_empty())
+                        .filter(|s| !s.is_empty() && !s.starts_with('-'))
                 };
                 match argv[i].as_str() {
                     "--topics-file" => {
@@ -160,9 +187,16 @@ pub fn dispatch(argv: &[String]) -> AvcResult<()> {
                     }
                     "--version" => {
                         let raw = require_value("--version", next(i))?;
-                        version = Some(raw.parse().map_err(|_| {
+                        let v: i64 = raw.parse().map_err(|_| {
                             AvcError::Arg(format!("--version: 需整数，got '{}'", raw))
-                        })?);
+                        })?;
+                        if v <= 0 {
+                            return Err(AvcError::Arg(format!(
+                                "--version: 必须 > 0 (persona 版本链从 1 起)，got '{}'",
+                                v
+                            )));
+                        }
+                        version = Some(v);
                         i += 2;
                     }
                     // 全局输出模式 flag：在 dispatch() 顶部已被消费，
