@@ -18,11 +18,18 @@ pub fn dispatch(argv: &[String]) -> AvcResult<()> {
     let db = Db::open_default()?;
     match argv[0].as_str() {
         "run" => {
-            // 解析 --persona / --version / --topic
+            // 解析 --persona / --version / --topic / --*-provider
             // - 每个 value-required flag 后必须紧跟一个非空 argv 元素；末尾空 flag
             //   必须以 AvcError::Arg 拒绝（exit 2），避免静默执行整个 render DAG。
             // - 解析器使用 `argv[i+1]` 的存在性 + 非空检查（trim 后非空）；
             //   传入 "--" 这种纯占位也按缺失处理。
+            // - 任何 token 以 '-' 开头但 *不是* 已知 flag（拼错的 provider 名 /
+            //   完全未知 flag）必须以 AvcError::Arg 拒绝，避免 `--llm-providr mock`
+            //   这种 typo 静默跑默认 provider。
+            // - 已知 flag 的 *值* 即使以 '-' 开头（如 provider 名 `--weird`）也
+            //   按原样接受——这是常规 CLI 行为，避免误伤合法 invocation。
+            // - 解析完成时若还有未消费的 token（非已知 flag 且不以 '-' 开头），
+            //   视为多余 positional token 拒绝（不再用 `_ => i += 1` 静默吞）。
             let mut persona: Option<String> = None;
             let mut version: Option<i64> = None;
             let mut topic: Option<String> = None;
@@ -69,8 +76,24 @@ pub fn dispatch(argv: &[String]) -> AvcResult<()> {
                         video_provider = Some(require_value("--video-provider", next(i))?);
                         i += 2;
                     }
-                    _ => {
+                    // 全局输出模式 flag：在 dispatch() 顶部已被消费，
+                    // 这里显式跳过，避免误判为未知 flag。
+                    "--json" | "--quiet" => {
                         i += 1;
+                    }
+                    tok if tok.starts_with('-') => {
+                        // 拼错 / 未知的 flag：显式拒绝，stderr 命名该 token。
+                        return Err(AvcError::Arg(format!(
+                            "render run: 未知选项 '{}'；用法：avc render run --persona <name> [--version <n>] [--topic <text>] [--llm-provider <name>] [--voice-provider <name>] [--avatar-provider <name>] [--video-provider <name>]",
+                            tok
+                        )));
+                    }
+                    _ => {
+                        // 非 '-' 开头的剩余 token = 多余 positional。
+                        return Err(AvcError::Arg(format!(
+                            "render run: 不接受位置参数 '{}'；用法：avc render run --persona <name> [...]",
+                            argv[i]
+                        )));
                     }
                 }
             }
@@ -113,6 +136,10 @@ pub fn dispatch(argv: &[String]) -> AvcResult<()> {
             // - 默认 version = current；可手动覆盖
             // - value-required flag 末尾空值必须以 AvcError::Arg 拒绝（exit 2），
             //   避免 `--topics-file /tmp/x --version` 静默跑整个 pack。
+            // - 任何 token 以 '-' 开头但 *不是* 已知 flag（拼错的 flag 名 /
+            //   完全未知 flag）必须以 AvcError::Arg 拒绝；同样 persona 之后
+            //   出现多个非 '-' 前缀的 positional 视为多余 token 拒绝（不再
+            //   用 `_ => i += 1` 静默吞）。
             let persona = argv
                 .get(1)
                 .ok_or_else(|| AvcError::Arg("render pack <persona> --topics-file <path>".into()))?
@@ -138,8 +165,22 @@ pub fn dispatch(argv: &[String]) -> AvcResult<()> {
                         })?);
                         i += 2;
                     }
-                    _ => {
+                    // 全局输出模式 flag：在 dispatch() 顶部已被消费，
+                    // 这里显式跳过，避免误判为未知 flag。
+                    "--json" | "--quiet" => {
                         i += 1;
+                    }
+                    tok if tok.starts_with('-') => {
+                        return Err(AvcError::Arg(format!(
+                            "render pack: 未知选项 '{}'；用法：avc render pack <persona> --topics-file <path> [--version <n>]",
+                            tok
+                        )));
+                    }
+                    _ => {
+                        return Err(AvcError::Arg(format!(
+                            "render pack: 不接受额外位置参数 '{}'；用法：avc render pack <persona> --topics-file <path> [...]",
+                            argv[i]
+                        )));
                     }
                 }
             }
