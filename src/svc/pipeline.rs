@@ -134,15 +134,16 @@ fn topo_sort(spec: &DagSpec) -> AvcResult<Vec<String>> {
     let mut order = Vec::new();
     // Kahn 算法：重复 "找无前驱 (deps 全部已 drained) 节点"
     while !remaining.is_empty() {
-        let next: Vec<&str> = remaining
+        // Keep execution deterministic by selecting the first ready node in spec order.
+        // This also ensures tts failure stops the render before sibling/downstream work.
+        let next = spec
+            .nodes
             .iter()
-            .filter(|(_, c)| **c == 0)
-            .map(|(k, _)| *k)
-            .collect();
-        if next.is_empty() {
+            .find(|node| remaining.get(node.id.as_str()) == Some(&0))
+            .map(|node| node.id.as_str());
+        let Some(next) = next else {
             return Err(AvcError::Internal("DAG cycle detected".into()));
-        }
-        let next = next[0];
+        };
         remaining.remove(next);
         order.push(next.to_string());
         // next 的执行减少它的"被依赖者"的前驱计数
@@ -163,7 +164,7 @@ fn topo_sort(spec: &DagSpec) -> AvcResult<Vec<String>> {
 /// 真调度：在 db connection 上同步执行，节点结果落 job_steps，
 /// 节点产物 BLOB 落 artifacts 表。
 pub fn run(db: &Db, job_id: &str, spec: &DagSpec, topic: &str) -> AvcResult<()> {
-    run_with_llm_provider(db, job_id, spec, topic, None)
+    run_with_overrides(db, job_id, spec, topic, None, None)
 }
 
 pub fn run_with_llm_provider(
@@ -172,6 +173,28 @@ pub fn run_with_llm_provider(
     spec: &DagSpec,
     topic: &str,
     llm_override: Option<std::sync::Arc<dyn crate::provider::LlmProvider>>,
+) -> AvcResult<()> {
+    run_with_overrides(db, job_id, spec, topic, llm_override, None)
+}
+
+pub fn run_with_voice_provider(
+    db: &Db,
+    job_id: &str,
+    spec: &DagSpec,
+    topic: &str,
+    voice_override: Option<std::sync::Arc<dyn crate::provider::VoiceProvider>>,
+) -> AvcResult<()> {
+    run_with_overrides(db, job_id, spec, topic, None, voice_override)
+}
+
+/// 同时接受 LLM + Voice override；单元/集成测试 + 未来 CLI 注入统一入口。
+pub fn run_with_overrides(
+    db: &Db,
+    job_id: &str,
+    spec: &DagSpec,
+    topic: &str,
+    llm_override: Option<std::sync::Arc<dyn crate::provider::LlmProvider>>,
+    voice_override: Option<std::sync::Arc<dyn crate::provider::VoiceProvider>>,
 ) -> AvcResult<()> {
     let order = topo_sort(spec)?;
     let cfg = Config::load(&Config::default_config_path()?)?;
@@ -207,7 +230,15 @@ pub fn run_with_llm_provider(
             )?;
         }
         // 执行
-        let exec = execute_node(node, &outputs, job_id, topic, &cfg, llm_override.clone());
+        let exec = execute_node(
+            node,
+            &outputs,
+            job_id,
+            topic,
+            &cfg,
+            llm_override.clone(),
+            voice_override.clone(),
+        );
         let duration_ms = started.elapsed().as_millis() as i64;
         let finished_at = crate::svc::now_iso();
         match exec {
@@ -311,6 +342,7 @@ fn execute_node(
     topic: &str,
     cfg: &Config,
     llm_override: Option<std::sync::Arc<dyn crate::provider::LlmProvider>>,
+    voice_override: Option<std::sync::Arc<dyn crate::provider::VoiceProvider>>,
 ) -> AvcResult<NodeOutput> {
     match node.kind.as_str() {
         "llm" => {
@@ -325,14 +357,36 @@ fn execute_node(
         }
         "voice" => {
             let text = required_text_input(node, inputs)?;
+            let voice_name = voice_provider_name(node);
+            let provider = resolve_voice_provider(cfg, voice_override.clone(), &voice_name)?;
+            // 真 Provider（包括 mock）走 synth(voice, text)。WAV BLOB 由 provider 决定；
+            // 不再用"MOCK_TTS:..."占位。失败直接冒泡 → job 状态 failed + 后续节点不跑。
+            let voice_ref = crate::provider::Voice {
+                provider: provider.name().to_string(),
+                provider_version: "openai_compat".into(),
+                voice_id_remote: None,
+                sample_wav_b64: String::new(),
+                transcript: None,
+                embed_b64: None,
+                embed_dim: None,
+            };
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| AvcError::Internal(format!("tokio runtime: {e}")))?;
+            let audio = rt.block_on(provider.synth(&voice_ref, &text))?;
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(&audio.wav_b64)
+                .map_err(|e| AvcError::Internal(format!("voice wav_b64 decode: {e}")))?;
             Ok(NodeOutput {
                 kind: "audio".into(),
-                blob: Some(
-                    base64::engine::general_purpose::STANDARD
-                        .encode(format!("MOCK_TTS:{}", text).as_bytes()),
-                ),
-                mime: Some("audio/wav".into()),
-                meta: serde_json::json!({"duration_ms": 30000, "input_text": text}),
+                blob: Some(audio.wav_b64),
+                mime: Some(audio.mime),
+                meta: serde_json::json!({
+                    "provider": provider.name(),
+                    "bytes": bytes.len(),
+                    "input_text": text,
+                }),
                 artifact_id: None,
             })
         }
@@ -447,6 +501,39 @@ fn script_provider_name(node: &NodeSpec, _cfg: &Config) -> String {
         .to_string()
 }
 
+/// 解析 voice 节点 `node.config["voice_provider"]`；缺省 / 非字符串 → "mock"（保留离线默认）。
+fn voice_provider_name(node: &NodeSpec) -> String {
+    node.config
+        .get("voice_provider")
+        .and_then(|v| v.as_str())
+        .unwrap_or("mock")
+        .to_string()
+}
+
+/// 决定 tts 节点用哪个 `VoiceProvider`：
+/// - 优先用注入的 `voice_override`（测试 / 显式 Provider 用）
+/// - 否则 name == "mock" 走内置 `MockVoiceProvider`（不读 cfg，离线默认）
+/// - 否则从 cfg.provider.voice 取真 provider；不存在 → `NotFound`
+///
+/// 出错（NotFound / ProviderUpstream 等）直接返 Err，节点失败冒泡。
+fn resolve_voice_provider(
+    cfg: &Config,
+    voice_override: Option<std::sync::Arc<dyn crate::provider::VoiceProvider>>,
+    name: &str,
+) -> AvcResult<std::sync::Arc<dyn crate::provider::VoiceProvider>> {
+    if let Some(p) = voice_override {
+        return Ok(p);
+    }
+    if name == "mock" || name.is_empty() {
+        return Ok(std::sync::Arc::new(
+            crate::provider::mock::MockVoiceProvider {
+                name: "mock".into(),
+            },
+        ));
+    }
+    crate::provider::real::make_voice(cfg, name)
+}
+
 fn generate_script(
     node: &NodeSpec,
     topic: &str,
@@ -530,6 +617,152 @@ pub fn execute(dag: &DagSpec) -> AvcResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const TEST_WAV: &[u8] = b"RIFF\x10\x00\x00\x00WAVEdeterministic";
+
+    fn voice_node(config: serde_json::Value) -> NodeSpec {
+        NodeSpec {
+            id: "tts".into(),
+            kind: "voice".into(),
+            when: None,
+            input_from: vec!["script_gen".into()],
+            config,
+        }
+    }
+
+    fn script_inputs(text: &str) -> std::collections::HashMap<String, NodeOutput> {
+        let mut inputs = std::collections::HashMap::new();
+        inputs.insert(
+            "script_gen".into(),
+            NodeOutput {
+                kind: "script".into(),
+                blob: Some(base64::engine::general_purpose::STANDARD.encode(text.as_bytes())),
+                mime: Some("text/plain; charset=utf-8".into()),
+                meta: serde_json::json!({}),
+                artifact_id: None,
+            },
+        );
+        inputs
+    }
+
+    struct DeterministicVoiceProvider;
+
+    #[async_trait]
+    impl crate::provider::VoiceProvider for DeterministicVoiceProvider {
+        fn name(&self) -> &str {
+            "injected"
+        }
+
+        async fn clone(&self, _paths: &[String]) -> AvcResult<crate::provider::Voice> {
+            unreachable!("clone is not used by the render pipeline")
+        }
+
+        async fn synth(
+            &self,
+            _voice: &crate::provider::Voice,
+            text: &str,
+        ) -> AvcResult<crate::provider::Audio> {
+            assert_eq!(text, "exact script text");
+            Ok(crate::provider::Audio {
+                wav_b64: base64::engine::general_purpose::STANDARD.encode(TEST_WAV),
+                mime: "audio/x-test-wav".into(),
+            })
+        }
+
+        async fn finetune(
+            &self,
+            _base: &crate::provider::Voice,
+            _paths: &[String],
+            _cfg: &crate::provider::FinetuneConfig,
+        ) -> AvcResult<crate::provider::Voice> {
+            unreachable!("finetune is not used by the render pipeline")
+        }
+    }
+
+    struct FailingVoiceProvider;
+
+    #[async_trait]
+    impl crate::provider::VoiceProvider for FailingVoiceProvider {
+        fn name(&self) -> &str {
+            "failing"
+        }
+
+        async fn clone(&self, _paths: &[String]) -> AvcResult<crate::provider::Voice> {
+            unreachable!()
+        }
+
+        async fn synth(
+            &self,
+            _voice: &crate::provider::Voice,
+            _text: &str,
+        ) -> AvcResult<crate::provider::Audio> {
+            Err(AvcError::RateLimited("deterministic 429".into()))
+        }
+
+        async fn finetune(
+            &self,
+            _base: &crate::provider::Voice,
+            _paths: &[String],
+            _cfg: &crate::provider::FinetuneConfig,
+        ) -> AvcResult<crate::provider::Voice> {
+            unreachable!()
+        }
+    }
+
+    #[test]
+    fn voice_provider_name_supports_default_and_explicit_provider() {
+        assert_eq!(
+            voice_provider_name(&voice_node(serde_json::json!({}))),
+            "mock"
+        );
+        assert_eq!(
+            voice_provider_name(&voice_node(serde_json::json!({"voice_provider": "local"}))),
+            "local"
+        );
+    }
+
+    #[test]
+    fn voice_node_preserves_exact_injected_wav_mime_and_metadata() {
+        let provider: std::sync::Arc<dyn crate::provider::VoiceProvider> =
+            std::sync::Arc::new(DeterministicVoiceProvider);
+        let output = execute_node(
+            &voice_node(serde_json::json!({"voice_provider": "explicit"})),
+            &script_inputs("exact script text"),
+            "job-test",
+            "topic",
+            &Config::default(),
+            None,
+            Some(provider),
+        )
+        .unwrap();
+
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(output.blob.unwrap())
+            .unwrap();
+        assert_eq!(bytes, TEST_WAV);
+        assert_eq!(output.mime.as_deref(), Some("audio/x-test-wav"));
+        assert_eq!(output.meta["provider"], "injected");
+        assert_eq!(output.meta["bytes"], TEST_WAV.len());
+        assert_eq!(output.meta["input_text"], "exact script text");
+    }
+
+    #[test]
+    fn voice_node_propagates_provider_error() {
+        let provider: std::sync::Arc<dyn crate::provider::VoiceProvider> =
+            std::sync::Arc::new(FailingVoiceProvider);
+        let result = execute_node(
+            &voice_node(serde_json::json!({})),
+            &script_inputs("exact script text"),
+            "job-test",
+            "topic",
+            &Config::default(),
+            None,
+            Some(provider),
+        );
+        assert!(
+            matches!(result, Err(AvcError::RateLimited(message)) if message == "deterministic 429")
+        );
+    }
 
     #[test]
     fn topo_orders_simple_chain() {

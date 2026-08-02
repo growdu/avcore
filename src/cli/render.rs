@@ -23,6 +23,7 @@ pub fn dispatch(argv: &[String]) -> AvcResult<()> {
             let mut version: Option<i64> = None;
             let mut topic: Option<&str> = None;
             let mut llm_provider: Option<String> = None;
+            let mut voice_provider: Option<String> = None;
             let mut i = 1;
             while i < argv.len() {
                 match argv[i].as_str() {
@@ -40,6 +41,10 @@ pub fn dispatch(argv: &[String]) -> AvcResult<()> {
                     }
                     "--llm-provider" => {
                         llm_provider = argv.get(i + 1).cloned();
+                        i += 2;
+                    }
+                    "--voice-provider" => {
+                        voice_provider = argv.get(i + 1).cloned();
                         i += 2;
                     }
                     _ => {
@@ -63,6 +68,9 @@ pub fn dispatch(argv: &[String]) -> AvcResult<()> {
             let mut spec = crate::svc::pipeline::render_publishment_spec();
             if let Some(provider) = llm_provider {
                 spec.nodes[0].config["llm_provider"] = serde_json::Value::String(provider);
+            }
+            if let Some(provider) = voice_provider {
+                spec.nodes[1].config["voice_provider"] = serde_json::Value::String(provider);
             }
             crate::svc::pipeline::run(&db, &job_id, &spec, topic)?;
             if mode == OutputMode::Quiet {

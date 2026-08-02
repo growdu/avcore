@@ -1392,6 +1392,234 @@ fn render_rejects_non_ready_version() {
 
 // ---------------------------- Phase 2 (render vendor / export / feedback) ----------------------------
 
+fn start_voice_server(
+    status: u16,
+    response_bytes: &'static [u8],
+) -> (u16, std::thread::JoinHandle<Vec<u8>>) {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let handle = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let mut request = Vec::new();
+        let mut buf = [0_u8; 4096];
+        let header_end;
+        loop {
+            let read = stream.read(&mut buf).unwrap();
+            assert!(read > 0, "client closed before complete HTTP headers");
+            request.extend_from_slice(&buf[..read]);
+            if let Some(pos) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                header_end = pos + 4;
+                break;
+            }
+        }
+        let headers = String::from_utf8_lossy(&request[..header_end]);
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().unwrap())
+            })
+            .unwrap_or(0);
+        while request.len() < header_end + content_length {
+            let read = stream.read(&mut buf).unwrap();
+            assert!(read > 0, "client closed before complete HTTP body");
+            request.extend_from_slice(&buf[..read]);
+        }
+        let reason = if status == 200 {
+            "OK"
+        } else if status == 429 {
+            "Too Many Requests"
+        } else {
+            "Internal Server Error"
+        };
+        let response = format!(
+            "HTTP/1.1 {status} {reason}\r\nContent-Type: audio/wav\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            response_bytes.len()
+        );
+        stream.write_all(response.as_bytes()).unwrap();
+        stream.write_all(response_bytes).unwrap();
+        stream.flush().unwrap();
+        request
+    });
+    (port, handle)
+}
+
+fn init_render_persona(data: &std::path::Path, config: &std::path::Path) {
+    let init = bin()
+        .env("XDG_DATA_HOME", data)
+        .env("XDG_CONFIG_HOME", config)
+        .arg("init")
+        .output()
+        .unwrap();
+    assert!(
+        init.status.success(),
+        "init: {}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+    let create = bin()
+        .env("XDG_DATA_HOME", data)
+        .env("XDG_CONFIG_HOME", config)
+        .args(["persona", "create", "--name", "voice-test"])
+        .output()
+        .unwrap();
+    assert!(
+        create.status.success(),
+        "create: {}",
+        String::from_utf8_lossy(&create.stderr)
+    );
+}
+
+#[test]
+fn render_voice_provider_posts_exact_script_and_persists_audio() {
+    const WAV: &[u8] = b"RIFF\x18\x00\x00\x00WAVEcli-deterministic";
+    let (port, server) = start_voice_server(200, WAV);
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let config = dir.path().join("config");
+    init_render_persona(&data, &config);
+    std::fs::write(
+        config.join("avc/avc.toml"),
+        format!(
+            "[provider.voice.local]\napi_key = \"test-key\"\nmodel = \"test-tts\"\nbase_url = \"http://127.0.0.1:{port}\"\n"
+        ),
+    )
+    .unwrap();
+
+    let output = bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .args([
+            "render",
+            "run",
+            "--persona",
+            "voice-test",
+            "--version",
+            "1",
+            "--topic",
+            "voice topic",
+            "--voice-provider",
+            "local",
+        ])
+        .output()
+        .unwrap();
+    let request = server.join().unwrap();
+    assert!(
+        output.status.success(),
+        "render: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let job_id = serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()["job_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let request_text = String::from_utf8(request).unwrap();
+    assert!(request_text.starts_with("POST /audio/speech HTTP/1.1\r\n"));
+    let body = request_text.split_once("\r\n\r\n").unwrap().1;
+    let body: serde_json::Value = serde_json::from_str(body).unwrap();
+    let expected_script = "[mock echo] Topic: voice topic\nDuration: 30 seconds";
+    assert_eq!(body["input"], expected_script);
+
+    let db = rusqlite::Connection::open(data.join("avc/avc.db")).unwrap();
+    let (content, mime): (Vec<u8>, String) = db
+        .query_row(
+            "SELECT content, mime FROM artifacts WHERE job_id=?1 AND name='tts'",
+            [&job_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(content, WAV);
+    assert_eq!(mime, "audio/wav");
+    let outputs: String = db
+        .query_row(
+            "SELECT outputs_json FROM job_steps WHERE job_id=?1 AND node_id='tts'",
+            [&job_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let outputs: serde_json::Value = serde_json::from_str(&outputs).unwrap();
+    assert_eq!(outputs["meta"]["provider"], "local");
+    assert_eq!(outputs["meta"]["bytes"], WAV.len());
+    assert_eq!(outputs["meta"]["input_text"], expected_script);
+}
+
+#[test]
+fn render_voice_http_429_fails_tts_without_downstream_work() {
+    let (port, server) = start_voice_server(429, b"rate limited");
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let config = dir.path().join("config");
+    init_render_persona(&data, &config);
+    std::fs::write(
+        config.join("avc/avc.toml"),
+        format!(
+            "[provider.voice.local]\napi_key = \"test-key\"\nbase_url = \"http://127.0.0.1:{port}\"\n"
+        ),
+    )
+    .unwrap();
+
+    let output = bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .args([
+            "render",
+            "run",
+            "--persona",
+            "voice-test",
+            "--topic",
+            "failure topic",
+            "--voice-provider",
+            "local",
+        ])
+        .output()
+        .unwrap();
+    server.join().unwrap();
+    assert!(!output.status.success());
+
+    let db = rusqlite::Connection::open(data.join("avc/avc.db")).unwrap();
+    let (job_id, status, current_step): (String, String, String) = db
+        .query_row(
+            "SELECT id, status, current_step FROM jobs ORDER BY created_at DESC LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(status, "failed");
+    assert_eq!(current_step, "tts");
+    let steps: Vec<(String, String)> = {
+        let mut statement = db
+            .prepare("SELECT node_id, status FROM job_steps WHERE job_id=?1 ORDER BY rowid")
+            .unwrap();
+        statement
+            .query_map([&job_id], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    };
+    assert_eq!(
+        steps,
+        vec![
+            ("script_gen".into(), "succeeded".into()),
+            ("tts".into(), "failed".into())
+        ]
+    );
+    let artifacts: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM artifacts WHERE job_id=?1",
+            [&job_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(artifacts, 1, "only the script artifact may exist");
+}
+
 #[test]
 fn job_export_writes_artifacts_to_fs() {
     // 走 render run 真跑一次 → job export 落 FS → 验证文件数 + 字节数
