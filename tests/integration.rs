@@ -2486,3 +2486,212 @@ fn render_rejects_missing_version() {
         .unwrap();
     assert_eq!(job_count, 0, "jobs 不应有任何条目");
 }
+
+#[test]
+fn compose_consumes_real_i2v_mp4_and_persists_exact_final_video() {
+    // 端到端：render run → i2v 节点 spawn 真 binary 写 mp4 → compose 节点
+    // pass-through → artifacts 表里 i2v 与 compose (final_video) BLOB 必须
+    // 字节完全相等 + mime 相同 + 导出文件内容相同 + final_video 节点
+    // meta 含 source_node/source_provider/source_artifact_id。
+    use base64::Engine as _;
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let config = dir.path().join("config");
+
+    bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .arg("init")
+        .output()
+        .unwrap();
+    bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .args(["persona", "create", "--name", "yu"])
+        .output()
+        .unwrap();
+
+    // 真 i2v binary：fetch 时把 18-byte "MOCK_PIPE_MP4_MAGIC" + 1024 字节随机
+    // 数据写到 --out 路径。compose 必须原样透传这些字节。
+    const PIPE_PREFIX: &[u8] = b"MOCK_PIPE_MP4_MAGIC";
+    const PIPE_RANDOM_LEN: usize = 1024;
+    let mock_bin = dir.path().join("mock_video.sh");
+    std::fs::write(
+        &mock_bin,
+        format!(
+            "\
+#!/bin/sh
+set -e
+case \"$1\" in
+  submit) echo \"task_id=mock-pipe-1\" ;;
+  status) echo \"status=done\" ;;
+  fetch)
+    OUT=\"\"
+    while [ \"$#\" -gt 0 ]; do
+      case \"$1\" in
+        --out) OUT=\"$2\"; shift 2;;
+        *) shift;;
+      esac
+    done
+    mkdir -p \"$(dirname \"$OUT\")\"
+    printf '%s' '{magic}' > \"$OUT\"
+    head -c {randlen} /dev/urandom >> \"$OUT\"
+    ;;
+  *) echo \"unknown $1\" >&2; exit 2 ;;
+esac
+",
+            magic = std::str::from_utf8(PIPE_PREFIX).unwrap(),
+            randlen = PIPE_RANDOM_LEN,
+        ),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&mock_bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let toml_path = config.join("avc/avc.toml");
+    let mut toml = String::from("[provider.video.mock]\nbinary = \"");
+    toml.push_str(mock_bin.to_str().unwrap());
+    toml.push_str("\"\nmodel = \"m\"\n");
+    std::fs::write(&toml_path, toml).unwrap();
+
+    let r = bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .args([
+            "render",
+            "run",
+            "--persona",
+            "yu",
+            "--version",
+            "1",
+            "--topic",
+            "compose-pipe-demo",
+            "--video-provider",
+            "mock",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        r.status.success(),
+        "render run: {}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+    let job_id = serde_json::from_str::<serde_json::Value>(&String::from_utf8_lossy(&r.stdout))
+        .unwrap()["job_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let db = rusqlite::Connection::open(data.join("avc/avc.db")).unwrap();
+
+    // 1) i2v 节点产物：artifacts.kind = node.id ("i2v"), name = "i2v"
+    //    content 必须以 PIPE_PREFIX 开头
+    let (i2v_kind, i2v_blob, i2v_mime, i2v_artifact_id): (String, Vec<u8>, String, String) = db
+        .query_row(
+            "SELECT kind, content, mime, id FROM artifacts
+             WHERE job_id = ?1 AND name = 'i2v' AND content IS NOT NULL",
+            [&job_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .expect("i2v BLOB");
+    assert_eq!(i2v_kind, "i2v", "i2v artifacts.kind = node.id");
+    assert_eq!(i2v_mime, "video/mp4");
+    assert!(
+        i2v_blob.starts_with(PIPE_PREFIX),
+        "i2v BLOB 应以 MOCK_PIPE_MP4_MAGIC 开头；actual[:32]={:?}",
+        &i2v_blob[..32.min(i2v_blob.len())]
+    );
+    assert_eq!(
+        i2v_blob.len(),
+        PIPE_PREFIX.len() + PIPE_RANDOM_LEN,
+        "i2v BLOB 长度 = prefix + 1024"
+    );
+
+    // 2) compose 节点产物：artifacts.kind = node.id ("compose"), name = "compose"。
+    //    NodeOutput.kind = "final_video" 反映在 job_steps.outputs_json.kind。
+    //    BLOB 必须与 i2v BLOB 字节完全相等；mime 必须等于 i2v mime。
+    let (final_kind, final_blob, final_mime, final_id): (String, Vec<u8>, String, String) = db
+        .query_row(
+            "SELECT kind, content, mime, id FROM artifacts
+             WHERE job_id = ?1 AND name = 'compose' AND content IS NOT NULL",
+            [&job_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .expect("final_video BLOB");
+    assert_eq!(final_kind, "compose", "compose artifacts.kind = node.id");
+    assert_eq!(final_mime, i2v_mime, "compose mime 透传 i2v mime");
+    assert_eq!(
+        final_blob, i2v_blob,
+        "compose (final_video) BLOB 必须 = i2v BLOB 字节完全相等"
+    );
+    assert_ne!(
+        final_id, i2v_artifact_id,
+        "compose 自己的 artifact_id ≠ i2v"
+    );
+
+    // 2b) compose 节点 job_steps.outputs_json.kind = "final_video"
+    let compose_outputs: String = db
+        .query_row(
+            "SELECT outputs_json FROM job_steps WHERE job_id = ?1 AND node_id = 'compose'",
+            [&job_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let compose_outputs: serde_json::Value = serde_json::from_str(&compose_outputs).unwrap();
+    assert_eq!(
+        compose_outputs["kind"], "final_video",
+        "compose NodeOutput.kind = final_video"
+    );
+
+    // 3) compose 节点 outputs_json 必须含 source_node/source_provider/source_artifact_id
+    assert_eq!(compose_outputs["meta"]["source_node"], "i2v");
+    assert_eq!(compose_outputs["meta"]["source_provider"], "mock");
+    assert_eq!(
+        compose_outputs["meta"]["source_artifact_id"], i2v_artifact_id,
+        "compose meta.source_artifact_id 必须 = i2v artifact_id"
+    );
+    assert_eq!(compose_outputs["meta"]["bytes"], i2v_blob.len() as i64);
+
+    // 4) job export：写盘后 final_video 落 FS 的字节 = i2v 字节
+    let out_dir = dir.path().join("exported");
+    let r = bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .args(["job", "export", &job_id, "--out", out_dir.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        r.status.success(),
+        "export: {}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+
+    // 找 final_video 落盘文件（kind__name__id.bin）：
+    // artifacts.kind = "compose"（=node.id），artifacts.name = "compose"（=node.id），
+    // 所以落盘文件名为 compose__compose__<id>.bin。
+    // 但 BLOB 在内容上等价于 i2v BLOB（即"final_video" 透传 i2v）。
+    let mut final_file: Option<std::path::PathBuf> = None;
+    for e in std::fs::read_dir(&out_dir).unwrap() {
+        let e = e.unwrap();
+        let n = e.file_name();
+        let s = n.to_string_lossy();
+        if s.starts_with("compose__compose__") && s.ends_with(".bin") {
+            final_file = Some(e.path());
+            break;
+        }
+    }
+    let final_file = final_file.expect("compose (final_video) 落盘文件应存在");
+    let on_disk = std::fs::read(&final_file).unwrap();
+    assert_eq!(
+        on_disk, i2v_blob,
+        "导出文件 compose (final_video) 字节 = i2v BLOB 字节"
+    );
+    // sanity：base64 decode roundtrip check
+    let roundtrip = base64::engine::general_purpose::STANDARD
+        .decode(base64::engine::general_purpose::STANDARD.encode(&i2v_blob))
+        .unwrap();
+    assert_eq!(roundtrip, i2v_blob);
+}

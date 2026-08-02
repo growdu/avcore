@@ -515,16 +515,51 @@ fn execute_node(
                 artifact_id: None,
             })
         }
-        "compose" => Ok(NodeOutput {
-            kind: "final_video".into(),
-            blob: Some(
-                base64::engine::general_purpose::STANDARD
-                    .encode(b"\x00\x00\x00\x18ftypMOCK_FINAL_MP4"),
-            ),
-            mime: Some("video/mp4".into()),
-            meta: serde_json::json!({"duration_ms": 30000}),
-            artifact_id: None,
-        }),
+        "compose" => {
+            // 严格 pass-through：取 i2v 节点的 mp4 BLOB 原样作为 final_video。
+            // - 必须声明 i2v DAG 依赖
+            // - i2v 必须存在 / kind == "clip" / blob 非空 / base64 合法
+            // - mime 透传（i2v.mime 缺省才回退 "video/mp4"）
+            // - meta 携带 source_node / source_provider / duration_ms / bytes /
+            //   source_artifact_id（i2v 节点持久化后的 artifact id），
+            //   让 final_video 可追溯到 i2v。
+            // - 任何缺失/错值都冒泡为节点失败，job 状态 failed，不落 final_video 产物。
+            let (mp4_bytes, src_meta, src_artifact_id) = required_clip_blob(node, inputs, "i2v")?;
+            let mime = src_meta
+                .mime
+                .clone()
+                .unwrap_or_else(|| "video/mp4".to_string());
+            let source_provider = src_meta
+                .meta
+                .get("provider")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let duration_ms = src_meta.meta.get("duration_ms").and_then(|v| v.as_i64());
+            let mut meta = serde_json::json!({
+                "source_node": "i2v",
+                "bytes": mp4_bytes.len() as i64,
+            });
+            if let Some(p) = source_provider {
+                meta["source_provider"] = serde_json::Value::String(p);
+            } else {
+                meta["source_provider"] = serde_json::Value::Null;
+            }
+            meta["duration_ms"] = match duration_ms {
+                Some(d) => serde_json::Value::from(d),
+                None => serde_json::Value::Null,
+            };
+            meta["source_artifact_id"] = match src_artifact_id {
+                Some(id) => serde_json::Value::String(id),
+                None => serde_json::Value::Null,
+            };
+            Ok(NodeOutput {
+                kind: "final_video".into(),
+                blob: Some(base64::engine::general_purpose::STANDARD.encode(&mp4_bytes)),
+                mime: Some(mime),
+                meta,
+                artifact_id: None,
+            })
+        }
         other => Err(AvcError::Internal(format!(
             "unsupported node kind: {other}"
         ))),
@@ -819,6 +854,49 @@ fn required_image_blob(
     base64::engine::general_purpose::STANDARD
         .decode(blob)
         .map_err(|e| AvcError::Internal(format!("dependency '{}' invalid base64: {}", dep, e)))
+}
+
+/// 强类型：从指定 named 依赖取 i2v clip 节点输出（kind == "clip"）。
+/// 返 (decoded bytes, 源 NodeOutput 引用, 源 artifact_id 若有)。
+/// compose 节点专用：要求 i2v 在 input_from / inputs 中存在 / kind 为 "clip" / blob 合法 base64。
+fn required_clip_blob(
+    node: &NodeSpec,
+    inputs: &std::collections::HashMap<String, NodeOutput>,
+    dep: &str,
+) -> AvcResult<(Vec<u8>, NodeOutput, Option<String>)> {
+    if !node.input_from.iter().any(|d| d == dep) {
+        return Err(AvcError::Internal(format!(
+            "node '{}' missing required DAG dep '{}'",
+            node.id, dep
+        )));
+    }
+    let output = inputs.get(dep).ok_or_else(|| {
+        AvcError::Internal(format!(
+            "node '{}' missing dependency output '{}'",
+            node.id, dep
+        ))
+    })?;
+    if output.kind != "clip" {
+        return Err(AvcError::Internal(format!(
+            "dependency '{}' is not clip output (kind={})",
+            dep, output.kind
+        )));
+    }
+    let blob = output.blob.as_deref().ok_or_else(|| {
+        AvcError::Internal(format!("dependency '{}' has no blob (clip required)", dep))
+    })?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(blob)
+        .map_err(|e| AvcError::Internal(format!("dependency '{}' invalid base64: {}", dep, e)))?;
+    // artifact_id 优先取 NodeOutput.artifact_id（落库后填回）；其次 meta.artifact_id。
+    let src_artifact_id = output.artifact_id.clone().or_else(|| {
+        output
+            .meta
+            .get("artifact_id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+    });
+    Ok((bytes, output.clone(), src_artifact_id))
 }
 
 /// 旧 stub 保留兼容外部 import
@@ -1631,6 +1709,283 @@ mod tests {
         assert_eq!(
             output.meta["provider"], "injected-video",
             "override 应覆盖 config 里的 video_provider 名"
+        );
+    }
+
+    // ─── Compose node 单元测试（pass-through 真实 i2v MP4）─────────────────
+
+    /// compose 节点的依赖 fixture：i2v 输出（clip kind）+ source_artifact_id
+    fn compose_inputs(
+        mp4: &[u8],
+        mime: &str,
+        source_artifact_id: Option<&str>,
+    ) -> std::collections::HashMap<String, NodeOutput> {
+        let mut inputs = std::collections::HashMap::new();
+        let mut meta = serde_json::json!({
+            "provider": "mock",
+            "duration_ms": TEST_VIDEO_DURATION_MS,
+            "bytes": mp4.len() as i64,
+            "prompt": "exact script text",
+        });
+        if let Some(aid) = source_artifact_id {
+            meta["artifact_id"] = serde_json::Value::String(aid.to_string());
+        }
+        inputs.insert(
+            "i2v".into(),
+            NodeOutput {
+                kind: "clip".into(),
+                blob: Some(base64::engine::general_purpose::STANDARD.encode(mp4)),
+                mime: Some(mime.into()),
+                meta,
+                artifact_id: source_artifact_id.map(|s| s.to_string()),
+            },
+        );
+        inputs
+    }
+
+    fn compose_node(config: serde_json::Value) -> NodeSpec {
+        NodeSpec {
+            id: "compose".into(),
+            kind: "compose".into(),
+            when: None,
+            input_from: vec!["i2v".into()],
+            config,
+        }
+    }
+
+    /// 默认管线 compose 必须能 pass-through：把 i2v MP4 bytes 原封不动当成
+    /// final_video BLOB；mime 来自 i2v；kind == "final_video"；bytes 严格相等。
+    #[test]
+    fn compose_node_passes_through_i2v_bytes_and_mime() {
+        let output = execute_node(
+            &compose_node(serde_json::json!({})),
+            &compose_inputs(TEST_MP4, TEST_MP4_MIME, None),
+            "job-test",
+            "topic",
+            &Config::default(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("compose should succeed when i2v is valid");
+        assert_eq!(output.kind, "final_video");
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(output.blob.expect("blob"))
+            .unwrap();
+        assert_eq!(
+            bytes, TEST_MP4,
+            "compose 必须把 i2v 的 exact MP4 bytes 透传到 final_video"
+        );
+        assert_eq!(
+            output.mime.as_deref(),
+            Some(TEST_MP4_MIME),
+            "compose 必须透传 i2v 的 mime"
+        );
+    }
+
+    /// compose meta 必须携带 source_node / source_provider / duration_ms / bytes
+    /// （即 i2v 节点的元信息，让 final_video 可追溯）。
+    #[test]
+    fn compose_node_carries_source_node_provider_duration_and_bytes_metadata() {
+        let output = execute_node(
+            &compose_node(serde_json::json!({})),
+            &compose_inputs(TEST_MP4, TEST_MP4_MIME, None),
+            "job-test",
+            "topic",
+            &Config::default(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("ok");
+        assert_eq!(output.meta["source_node"], "i2v");
+        assert_eq!(output.meta["source_provider"], "mock");
+        assert_eq!(output.meta["duration_ms"], TEST_VIDEO_DURATION_MS);
+        assert_eq!(output.meta["bytes"], TEST_MP4.len() as i64);
+    }
+
+    /// i2v 节点输出（被落 DB）后，compose 必须能拿到 source_artifact_id
+    /// 并塞进 final_video 的 meta（保持上下游链接）。
+    #[test]
+    fn compose_node_carries_source_artifact_id_when_i2v_artifact_persisted() {
+        let aid = "art_i2v_deterministic";
+        let output = execute_node(
+            &compose_node(serde_json::json!({})),
+            &compose_inputs(TEST_MP4, TEST_MP4_MIME, Some(aid)),
+            "job-test",
+            "topic",
+            &Config::default(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("ok");
+        assert_eq!(
+            output.meta["source_artifact_id"], aid,
+            "i2v artifact_id 应被传播为 source_artifact_id"
+        );
+    }
+
+    /// compose 缺 i2v 依赖（inputs 空）→ 节点失败冒泡（无 final_video 产物）。
+    #[test]
+    fn compose_node_rejects_missing_i2v_dependency() {
+        let inputs = std::collections::HashMap::<String, NodeOutput>::new();
+        let result = execute_node(
+            &compose_node(serde_json::json!({})),
+            &inputs,
+            "job-test",
+            "topic",
+            &Config::default(),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(result.is_err(), "缺 i2v 依赖应报错；actual={:?}", result);
+    }
+
+    /// i2v 节点 kind 不是 "clip"（比如被人改成 "image"）→ 节点失败冒泡。
+    #[test]
+    fn compose_node_rejects_i2v_with_wrong_kind() {
+        let mut inputs = compose_inputs(TEST_MP4, TEST_MP4_MIME, None);
+        inputs.get_mut("i2v").unwrap().kind = "image".into();
+        let result = execute_node(
+            &compose_node(serde_json::json!({})),
+            &inputs,
+            "job-test",
+            "topic",
+            &Config::default(),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(result.is_err(), "i2v kind 错应报错；actual={:?}", result);
+    }
+
+    /// i2v 节点有 kind/无 blob → 节点失败冒泡。
+    #[test]
+    fn compose_node_rejects_i2v_with_no_blob() {
+        let mut inputs = compose_inputs(TEST_MP4, TEST_MP4_MIME, None);
+        inputs.get_mut("i2v").unwrap().blob = None;
+        let result = execute_node(
+            &compose_node(serde_json::json!({})),
+            &inputs,
+            "job-test",
+            "topic",
+            &Config::default(),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(result.is_err(), "i2v 缺 blob 应报错；actual={:?}", result);
+    }
+
+    /// i2v 节点 blob 不是合法 base64 → 节点失败冒泡。
+    #[test]
+    fn compose_node_rejects_invalid_base64_i2v_blob() {
+        let mut inputs = compose_inputs(TEST_MP4, TEST_MP4_MIME, None);
+        inputs.get_mut("i2v").unwrap().blob = Some("not base64 @@@".into());
+        let result = execute_node(
+            &compose_node(serde_json::json!({})),
+            &inputs,
+            "job-test",
+            "topic",
+            &Config::default(),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(
+            result.is_err(),
+            "i2v blob 非 base64 应报错；actual={:?}",
+            result
+        );
+    }
+
+    /// compose 节点的 input_from 缺 "i2v" → 节点失败冒泡（强制 DAG 声明）。
+    #[test]
+    fn compose_node_rejects_node_without_i2v_dag_dep() {
+        let node = NodeSpec {
+            id: "compose".into(),
+            kind: "compose".into(),
+            when: None,
+            input_from: vec![], // 没声明 i2v
+            config: serde_json::json!({}),
+        };
+        let result = execute_node(
+            &node,
+            &compose_inputs(TEST_MP4, TEST_MP4_MIME, None),
+            "job-test",
+            "topic",
+            &Config::default(),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(
+            result.is_err(),
+            "compose 缺 i2v DAG dep 应报错；actual={:?}",
+            result
+        );
+    }
+
+    /// i2v 的 provider 来自注入（非 "mock"）→ final_video 的 source_provider
+    /// 必须透传同一字符串。
+    #[test]
+    fn compose_node_propagates_non_mock_i2v_provider_name() {
+        let mut inputs = compose_inputs(TEST_MP4, TEST_MP4_MIME, None);
+        inputs.get_mut("i2v").unwrap().meta["provider"] =
+            serde_json::Value::String("injected-video".into());
+        let output = execute_node(
+            &compose_node(serde_json::json!({})),
+            &inputs,
+            "job-test",
+            "topic",
+            &Config::default(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("ok");
+        assert_eq!(output.meta["source_provider"], "injected-video");
+    }
+
+    /// duration_ms 缺省时（i2v.meta 没 duration_ms）→ final_video meta 仍存在
+    /// 但应为 null（不臆造）。
+    #[test]
+    fn compose_node_meta_duration_ms_defaults_to_null_when_i2v_meta_lacks_it() {
+        let mut inputs = compose_inputs(TEST_MP4, TEST_MP4_MIME, None);
+        inputs
+            .get_mut("i2v")
+            .unwrap()
+            .meta
+            .as_object_mut()
+            .unwrap()
+            .remove("duration_ms");
+        let output = execute_node(
+            &compose_node(serde_json::json!({})),
+            &inputs,
+            "job-test",
+            "topic",
+            &Config::default(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("ok");
+        assert!(
+            output.meta["duration_ms"].is_null(),
+            "i2v meta 缺 duration_ms → compose meta 必须是 null；actual={:?}",
+            output.meta["duration_ms"]
         );
     }
 }
