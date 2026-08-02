@@ -6,12 +6,8 @@
 use crate::db::Db;
 use crate::error::AvcResult;
 
-const MIGRATIONS: &[(&str, &str)] = &[
-    (
-        "0001_init",
-        include_str!("../../migrations/0001_init.sql"),
-    ),
-];
+const MIGRATIONS: &[(&str, &str)] =
+    &[("0001_init", include_str!("../../migrations/0001_init.sql"))];
 
 pub fn migrate(db: &Db) -> AvcResult<()> {
     let mut conn = db.conn.lock().unwrap();
@@ -25,11 +21,9 @@ pub fn migrate(db: &Db) -> AvcResult<()> {
 
     for (id, sql) in MIGRATIONS {
         let applied: Option<bool> = conn
-            .query_row(
-                "SELECT 1 FROM schema_migrations WHERE id = ?",
-                [id],
-                |_| Ok(true),
-            )
+            .query_row("SELECT 1 FROM schema_migrations WHERE id = ?", [id], |_| {
+                Ok(true)
+            })
             .optional()?;
         let applied = applied.unwrap_or(false);
 

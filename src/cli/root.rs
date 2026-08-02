@@ -1,9 +1,9 @@
 //! 根命令：init / version / doctor / config
 
-use crate::AvcError;
-use crate::AvcResult;
 use crate::config::Config;
 use crate::db::Db;
+use crate::AvcError;
+use crate::AvcResult;
 
 pub fn cmd_init() -> AvcResult<()> {
     let db_path = Config::default_db_path()?;
@@ -50,8 +50,10 @@ pub fn cmd_doctor() -> AvcResult<()> {
     }
 
     if ok {
-        println!("
-doc: avc init  # 若以上缺失");
+        println!(
+            "
+doc: avc init  # 若以上缺失"
+        );
     }
     Ok(())
 }

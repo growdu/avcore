@@ -160,6 +160,6 @@ impl Config {
             "base_url" => entry.base_url.as_ref(),
             _ => return Err(AvcError::Arg(format!("未知字段: {}", field))),
         };
-        Ok(val.map(|s| s.clone()))
+        Ok(val.cloned())
     }
 }

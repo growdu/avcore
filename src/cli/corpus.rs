@@ -1,10 +1,10 @@
 //! `avc corpus <verb>`
 
-use crate::AvcError;
-use crate::AvcResult;
 use crate::config::Config;
 use crate::db::Db;
 use crate::output::{print, OutputMode};
+use crate::AvcError;
+use crate::AvcResult;
 use serde_json::json;
 use std::path::PathBuf;
 
@@ -59,13 +59,7 @@ pub fn dispatch(argv: &[String]) -> AvcResult<()> {
             let embed_name = embed.ok_or_else(|| AvcError::Arg("--embed <name> 必填".into()))?;
             let cfg = Config::load(&Config::default_config_path()?)?;
             let id = crate::svc::corpus::create_from_file(
-                &db,
-                &cfg,
-                embed_name,
-                name,
-                "upload",
-                lang,
-                &source,
+                &db, &cfg, embed_name, name, "upload", lang, &source,
             )?;
             print(
                 mode,

@@ -1,9 +1,9 @@
 //! `avc sample <verb>`
 
-use crate::AvcError;
-use crate::AvcResult;
 use crate::db::Db;
 use crate::output::{print, OutputMode};
+use crate::AvcError;
+use crate::AvcResult;
 use serde_json::json;
 
 pub fn dispatch(argv: &[String]) -> AvcResult<()> {
@@ -18,7 +18,9 @@ pub fn dispatch(argv: &[String]) -> AvcResult<()> {
 
     let _db = Db::open_default()?;
     match argv[0].as_str() {
-        "list" => { print(mode, &json!([]))?; }
+        "list" => {
+            print(mode, &json!([]))?;
+        }
         _ => return Err(AvcError::Arg(format!("sample: unknown verb '{}'", argv[0]))),
     }
     Ok(())

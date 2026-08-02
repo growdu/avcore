@@ -11,7 +11,8 @@ use rustyline::DefaultEditor;
 use crate::AvcResult;
 
 pub fn run(_args: &[String]) -> AvcResult<()> {
-    let mut rl = DefaultEditor::new().map_err(|e| crate::error::AvcError::Internal(format!("readline init: {}", e)))?;
+    let mut rl = DefaultEditor::new()
+        .map_err(|e| crate::error::AvcError::Internal(format!("readline init: {}", e)))?;
     let history_path = history_path()?;
     let _ = rl.load_history(&history_path);
 
@@ -28,7 +29,9 @@ pub fn run(_args: &[String]) -> AvcResult<()> {
         match readline {
             Ok(line) => {
                 let line = line.trim();
-                if line.is_empty() { continue; }
+                if line.is_empty() {
+                    continue;
+                }
 
                 // 内建
                 match line {
@@ -96,15 +99,44 @@ pub fn run(_args: &[String]) -> AvcResult<()> {
 
 /// 粗粒度启发式：首 token 是已注册 noun 时视为原子。
 const KNOWN_NOUNS: &[&str] = &[
-    "persona", "sample", "iterate", "finetune", "job",
-    "render", "corpus", "provider", "config", "doctor",
-    "version", "init", "shell", "ask",
+    "persona", "sample", "iterate", "finetune", "job", "render", "corpus", "provider", "config",
+    "doctor", "version", "init", "shell", "ask",
 ];
 
 fn looks_atomic(line: &str) -> bool {
     let first = line.split_whitespace().next().unwrap_or("");
     KNOWN_NOUNS.contains(&first)
 }
+
+fn history_path() -> AvcResult<std::path::PathBuf> {
+    let dir = crate::config::Config::default_data_dir()?;
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir.join("shell_history"))
+}
+
+fn print_help() {
+    println!(
+        "Built-ins: help, exit, quit, clear, history
+ Atomic:    <noun> <verb> [--flag ...]
+ NL:        需先在 avc.toml 配置 provider.llm.*
+            直接输自然语言 → LLM 解析 → 自动 dispatch
+
+ Examples:
+   avc> persona list
+   avc> persona show yu
+   avc> version
+   avc> 列出所有角色
+   avc> 把 Yu 的 traits 改成严谨务实
+"
+    );
+}
+
+#[allow(dead_code)]
+fn _suppress_unused2() -> AvcResult<()> {
+    Ok(())
+}
+#[allow(dead_code)]
+fn _suppress_unused3<W: Write>() {}
 
 #[cfg(test)]
 mod tests {
@@ -133,31 +165,3 @@ mod tests {
         assert!(!looks_atomic("   "));
     }
 }
-
-fn history_path() -> AvcResult<std::path::PathBuf> {
-    let dir = crate::config::Config::default_data_dir()?;
-    std::fs::create_dir_all(&dir)?;
-    Ok(dir.join("shell_history"))
-}
-
-fn print_help() {
-    println!(
-        "Built-ins: help, exit, quit, clear, history
- Atomic:    <noun> <verb> [--flag ...]
- NL:        需先在 avc.toml 配置 provider.llm.*
-            直接输自然语言 → LLM 解析 → 自动 dispatch
-
- Examples:
-   avc> persona list
-   avc> persona show yu
-   avc> version
-   avc> 列出所有角色
-   avc> 把 Yu 的 traits 改成严谨务实
-"
-    );
-}
-
-#[allow(dead_code)]
-fn _suppress_unused2() -> AvcResult<()> { Ok(()) }
-#[allow(dead_code)]
-fn _suppress_unused3<W: Write>() {}

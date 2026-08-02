@@ -47,7 +47,7 @@ pub enum AvcError {
 
 impl AvcError {
     pub fn code(&self) -> ExitCode {
-        let c = match self {
+        match self {
             AvcError::Arg(_) => ExitCode::from(2),
             AvcError::NotFound(_) => ExitCode::from(3),
             AvcError::Conflict(_) => ExitCode::from(4),
@@ -61,8 +61,7 @@ impl AvcError {
             AvcError::Db(_) => ExitCode::from(20),
             AvcError::Io(_) => ExitCode::from(21),
             AvcError::Internal(_) => ExitCode::from(99),
-        };
-        c
+        }
     }
 
     pub fn exit_code(&self) -> ExitCode {
@@ -106,4 +105,3 @@ impl From<toml::ser::Error> for AvcError {
 }
 
 pub type AvcResult<T> = Result<T, AvcError>;
-

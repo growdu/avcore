@@ -11,6 +11,7 @@
 
 use std::time::Instant;
 
+use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -74,21 +75,41 @@ impl NodeStatus {
 pub fn render_publishment_spec() -> DagSpec {
     DagSpec {
         nodes: vec![
-            NodeSpec { id: "script_gen".into(), kind: "llm".into(),
-                when: None, input_from: vec![],
-                config: serde_json::json!({"duration": 30}) },
-            NodeSpec { id: "tts".into(), kind: "voice".into(),
-                when: None, input_from: vec!["script_gen".into()],
-                config: serde_json::json!({}) },
-            NodeSpec { id: "img_gen".into(), kind: "avatar".into(),
-                when: None, input_from: vec!["script_gen".into()],
-                config: serde_json::json!({}) },
-            NodeSpec { id: "i2v".into(), kind: "video".into(),
-                when: None, input_from: vec!["tts".into(), "img_gen".into()],
-                config: serde_json::json!({}) },
-            NodeSpec { id: "compose".into(), kind: "compose".into(),
-                when: None, input_from: vec!["i2v".into()],
-                config: serde_json::json!({}) },
+            NodeSpec {
+                id: "script_gen".into(),
+                kind: "llm".into(),
+                when: None,
+                input_from: vec![],
+                config: serde_json::json!({"duration": 30}),
+            },
+            NodeSpec {
+                id: "tts".into(),
+                kind: "voice".into(),
+                when: None,
+                input_from: vec!["script_gen".into()],
+                config: serde_json::json!({}),
+            },
+            NodeSpec {
+                id: "img_gen".into(),
+                kind: "avatar".into(),
+                when: None,
+                input_from: vec!["script_gen".into()],
+                config: serde_json::json!({}),
+            },
+            NodeSpec {
+                id: "i2v".into(),
+                kind: "video".into(),
+                when: None,
+                input_from: vec!["tts".into(), "img_gen".into()],
+                config: serde_json::json!({}),
+            },
+            NodeSpec {
+                id: "compose".into(),
+                kind: "compose".into(),
+                when: None,
+                input_from: vec!["i2v".into()],
+                config: serde_json::json!({}),
+            },
         ],
     }
 }
@@ -97,24 +118,18 @@ pub fn render_publishment_spec() -> DagSpec {
 /// 拓扑排序：按 input_from 顺序入图，检测 cycle。
 fn topo_sort(spec: &DagSpec) -> AvcResult<Vec<String>> {
     // deps[node] = n 的前驱列表（先于 n 执行）
-    let mut deps: std::collections::HashMap<&str, Vec<&str>> =
-        std::collections::HashMap::new();
+    let mut deps: std::collections::HashMap<&str, Vec<&str>> = std::collections::HashMap::new();
     for n in &spec.nodes {
         deps.insert(&n.id, vec![]);
     }
     for n in &spec.nodes {
         for dep in &n.input_from {
-            deps
-                .entry(n.id.as_str())
-                .or_insert_with(Vec::new)
-                .push(dep.as_str());
+            deps.entry(n.id.as_str()).or_default().push(dep.as_str());
         }
     }
     // nodes_to_drain: 尚未处理（前驱都已 push 完成）的节点集合
-    let mut remaining: std::collections::HashMap<&str, usize> = deps
-        .iter()
-        .map(|(k, v)| (*k, v.len()))
-        .collect();
+    let mut remaining: std::collections::HashMap<&str, usize> =
+        deps.iter().map(|(k, v)| (*k, v.len())).collect();
     let mut order = Vec::new();
     // Kahn 算法：重复 "找无前驱 (deps 全部已 drained) 节点"
     while !remaining.is_empty() {
@@ -131,7 +146,7 @@ fn topo_sort(spec: &DagSpec) -> AvcResult<Vec<String>> {
         order.push(next.to_string());
         // next 的执行减少它的"被依赖者"的前驱计数
         for (k, v) in deps.iter() {
-            if v.iter().any(|d| *d == next) {
+            if v.contains(&next) {
                 if let Some(c) = remaining.get_mut(k) {
                     *c -= 1;
                 }
@@ -161,9 +176,10 @@ pub fn run(db: &Db, job_id: &str, spec: &DagSpec, _topic: &str) -> AvcResult<()>
         )?;
     }
     for node_id in order {
-        let node = nodes.get(node_id.as_str()).copied().ok_or_else(|| {
-            AvcError::Internal(format!("node '{}' missing", node_id))
-        })?;
+        let node = nodes
+            .get(node_id.as_str())
+            .copied()
+            .ok_or_else(|| AvcError::Internal(format!("node '{}' missing", node_id)))?;
         let started_at = now.clone();
         let started = Instant::now();
         // 写 step pending → running
@@ -188,8 +204,15 @@ pub fn run(db: &Db, job_id: &str, spec: &DagSpec, _topic: &str) -> AvcResult<()>
                 let artifact_id = if let Some(blob_b64) = &out.blob {
                     let conn = db.conn.lock().unwrap();
                     let id = crate::svc::new_id("art");
-                    let mime = out.mime.clone().unwrap_or_else(|| "application/octet-stream".to_string());
-                    let bytes = base64::decode(blob_b64).map_err(|e: base64::DecodeError| AvcError::Internal(format!("b64: {}", e)))?;
+                    let mime = out
+                        .mime
+                        .clone()
+                        .unwrap_or_else(|| "application/octet-stream".to_string());
+                    let bytes = base64::engine::general_purpose::STANDARD
+                        .decode(blob_b64)
+                        .map_err(|e: base64::DecodeError| {
+                            AvcError::Internal(format!("b64: {}", e))
+                        })?;
                     let byte_size = bytes.len() as i64;
                     let mut h = Sha256::new();
                     h.update(&bytes);
@@ -199,7 +222,15 @@ pub fn run(db: &Db, job_id: &str, spec: &DagSpec, _topic: &str) -> AvcResult<()>
                             (id, job_id, kind, name, content, mime, byte_size, sha256, created_at)
                          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                         rusqlite::params![
-                            &id, job_id, &node.id, &node.id, &bytes, &mime, byte_size, &sha, &finished_at,
+                            &id,
+                            job_id,
+                            &node.id,
+                            &node.id,
+                            &bytes,
+                            &mime,
+                            byte_size,
+                            &sha,
+                            &finished_at,
                         ],
                     )?;
                     let mut out_clone = out.clone();
@@ -216,12 +247,14 @@ pub fn run(db: &Db, job_id: &str, spec: &DagSpec, _topic: &str) -> AvcResult<()>
                     rusqlite::params![job_id, &node.id],
                     |r| r.get(0),
                 )?;
-                let outputs_json = serde_json::to_string(
-                    outputs.get(&node.id).unwrap_or(
-                        &NodeOutput { kind: node.kind.clone(), blob: None, mime: None,
-                            meta: serde_json::json!({}), artifact_id: artifact_id.clone() }
-                    )
-                )?;
+                let outputs_json =
+                    serde_json::to_string(outputs.get(&node.id).unwrap_or(&NodeOutput {
+                        kind: node.kind.clone(),
+                        blob: None,
+                        mime: None,
+                        meta: serde_json::json!({}),
+                        artifact_id: artifact_id.clone(),
+                    }))?;
                 conn.execute(
                     "UPDATE job_steps SET status='succeeded', outputs_json=?1,
                         finished_at=?2, duration_ms=?3
@@ -267,21 +300,26 @@ fn execute_node(
     match node.kind.as_str() {
         "llm" => Ok(NodeOutput {
             kind: "script".into(),
-            blob: Some(base64::encode(format!("MOCK_SCRIPT:{}", node.id).as_bytes())),
+            blob: Some(
+                base64::engine::general_purpose::STANDARD
+                    .encode(format!("MOCK_SCRIPT:{}", node.id).as_bytes()),
+            ),
             mime: Some("text/plain".into()),
             meta: serde_json::json!({"duration_ms": 30000}),
             artifact_id: None,
         }),
         "voice" => Ok(NodeOutput {
             kind: "audio".into(),
-            blob: Some(base64::encode(b"RIFF....MOCK_TTS")),
+            blob: Some(base64::engine::general_purpose::STANDARD.encode(b"RIFF....MOCK_TTS")),
             mime: Some("audio/wav".into()),
             meta: serde_json::json!({"duration_ms": 30000}),
             artifact_id: None,
         }),
         "avatar" => Ok(NodeOutput {
             kind: "image".into(),
-            blob: Some(base64::encode(b"\x89PNG\r\n\x1a\nMOCK_IMG")),
+            blob: Some(
+                base64::engine::general_purpose::STANDARD.encode(b"\x89PNG\r\n\x1a\nMOCK_IMG"),
+            ),
             mime: Some("image/png".into()),
             meta: serde_json::json!({"resolution": "1080p"}),
             artifact_id: None,
@@ -297,7 +335,9 @@ fn execute_node(
                 .join("avc")
                 .join("avc.toml");
             let cfg = crate::config::Config::load(&cfg_path).unwrap_or_default();
-            let video_name = node.config.get("video_provider")
+            let video_name = node
+                .config
+                .get("video_provider")
                 .and_then(|v| v.as_str())
                 .unwrap_or("mock");
             let provider = match crate::provider::real::make_video(&cfg, video_name) {
@@ -306,7 +346,10 @@ fn execute_node(
                     // 没配 → 用占位 BLOB（Phase 1 行为）
                     return Ok(NodeOutput {
                         kind: "clip".into(),
-                        blob: Some(base64::encode(b"\x00\x00\x00\x18ftypMOCK_VIDEO")),
+                        blob: Some(
+                            base64::engine::general_purpose::STANDARD
+                                .encode(b"\x00\x00\x00\x18ftypMOCK_VIDEO"),
+                        ),
                         mime: Some("video/mp4".into()),
                         meta: serde_json::json!({"duration_ms": 30000}),
                         artifact_id: None,
@@ -314,14 +357,21 @@ fn execute_node(
                 }
             };
             let voice = crate::provider::Voice {
-                provider: "mock".into(), provider_version: "stub".into(),
-                voice_id_remote: None, sample_wav_b64: String::new(),
-                transcript: None, embed_b64: None, embed_dim: None,
+                provider: "mock".into(),
+                provider_version: "stub".into(),
+                voice_id_remote: None,
+                sample_wav_b64: String::new(),
+                transcript: None,
+                embed_b64: None,
+                embed_dim: None,
             };
             let avatar = crate::provider::Avatar {
-                provider: "mock".into(), provider_version: "stub".into(),
-                model_id: None, primary_png_b64: String::new(),
-                views_zip_b64: None, face_id: None,
+                provider: "mock".into(),
+                provider_version: "stub".into(),
+                model_id: None,
+                primary_png_b64: String::new(),
+                views_zip_b64: None,
+                face_id: None,
             };
             let scenes = vec![crate::provider::ScriptSegment {
                 scene_index: 0,
@@ -329,9 +379,13 @@ fn execute_node(
                 duration_ms: 30000,
             }];
             let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all().build().unwrap();
+                .enable_all()
+                .build()
+                .unwrap();
             let clip = rt.block_on(provider.render(&voice, &avatar, &scenes))?;
-            let bytes = base64::decode(&clip.mp4_b64).map_err(|e| AvcError::Internal(format!("b64: {}", e)))?;
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(&clip.mp4_b64)
+                .map_err(|e| AvcError::Internal(format!("b64: {}", e)))?;
             Ok(NodeOutput {
                 kind: "clip".into(),
                 blob: Some(clip.mp4_b64),
@@ -342,12 +396,17 @@ fn execute_node(
         }
         "compose" => Ok(NodeOutput {
             kind: "final_video".into(),
-            blob: Some(base64::encode(b"\x00\x00\x00\x18ftypMOCK_FINAL_MP4")),
+            blob: Some(
+                base64::engine::general_purpose::STANDARD
+                    .encode(b"\x00\x00\x00\x18ftypMOCK_FINAL_MP4"),
+            ),
             mime: Some("video/mp4".into()),
             meta: serde_json::json!({"duration_ms": 30000}),
             artifact_id: None,
         }),
-        other => Err(AvcError::Internal(format!("unsupported node kind: {other}"))),
+        other => Err(AvcError::Internal(format!(
+            "unsupported node kind: {other}"
+        ))),
     }
 }
 
@@ -365,9 +424,27 @@ mod tests {
     fn topo_orders_simple_chain() {
         let spec = DagSpec {
             nodes: vec![
-                NodeSpec { id: "a".into(), kind: "llm".into(), when: None, input_from: vec![], config: serde_json::json!({}) },
-                NodeSpec { id: "b".into(), kind: "voice".into(), when: None, input_from: vec!["a".into()], config: serde_json::json!({}) },
-                NodeSpec { id: "c".into(), kind: "compose".into(), when: None, input_from: vec!["b".into()], config: serde_json::json!({}) },
+                NodeSpec {
+                    id: "a".into(),
+                    kind: "llm".into(),
+                    when: None,
+                    input_from: vec![],
+                    config: serde_json::json!({}),
+                },
+                NodeSpec {
+                    id: "b".into(),
+                    kind: "voice".into(),
+                    when: None,
+                    input_from: vec!["a".into()],
+                    config: serde_json::json!({}),
+                },
+                NodeSpec {
+                    id: "c".into(),
+                    kind: "compose".into(),
+                    when: None,
+                    input_from: vec!["b".into()],
+                    config: serde_json::json!({}),
+                },
             ],
         };
         let order = topo_sort(&spec).unwrap();
@@ -381,8 +458,20 @@ mod tests {
     fn topo_detects_cycle() {
         let spec = DagSpec {
             nodes: vec![
-                NodeSpec { id: "a".into(), kind: "llm".into(), when: None, input_from: vec!["b".into()], config: serde_json::json!({}) },
-                NodeSpec { id: "b".into(), kind: "voice".into(), when: None, input_from: vec!["a".into()], config: serde_json::json!({}) },
+                NodeSpec {
+                    id: "a".into(),
+                    kind: "llm".into(),
+                    when: None,
+                    input_from: vec!["b".into()],
+                    config: serde_json::json!({}),
+                },
+                NodeSpec {
+                    id: "b".into(),
+                    kind: "voice".into(),
+                    when: None,
+                    input_from: vec!["a".into()],
+                    config: serde_json::json!({}),
+                },
             ],
         };
         assert!(topo_sort(&spec).is_err());
@@ -403,10 +492,14 @@ mod tests {
         assert!(order.iter().position(|n| n == "tts").unwrap() < i2v);
         assert!(order.iter().position(|n| n == "img_gen").unwrap() < i2v);
         // script_gen 必须在 tts 与 img_gen 之前
-        assert!(order.iter().position(|n| n == "script_gen").unwrap()
-            < order.iter().position(|n| n == "tts").unwrap());
-        assert!(order.iter().position(|n| n == "script_gen").unwrap()
-            < order.iter().position(|n| n == "img_gen").unwrap());
+        assert!(
+            order.iter().position(|n| n == "script_gen").unwrap()
+                < order.iter().position(|n| n == "tts").unwrap()
+        );
+        assert!(
+            order.iter().position(|n| n == "script_gen").unwrap()
+                < order.iter().position(|n| n == "img_gen").unwrap()
+        );
         // i2v 必须在 compose 之前
         assert!(i2v < order.iter().position(|n| n == "compose").unwrap());
     }

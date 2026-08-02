@@ -27,12 +27,16 @@ pub fn apply(db: &Db, name: &str, version: i64, changes: &RefineChanges) -> AvcR
     let conn = db.conn.lock().unwrap();
 
     // 读现有 JSON 列
-    let existing: (Option<String>, Option<String>, Option<String>) = conn.query_row(
-        "SELECT persona_descriptor_json, knowledge_binding_json, manifest_json
+    let existing: (Option<String>, Option<String>, Option<String>) = conn
+        .query_row(
+            "SELECT persona_descriptor_json, knowledge_binding_json, manifest_json
          FROM persona_versions WHERE persona_model_id = ? AND version = ?",
-        rusqlite::params![&p.id, version],
-        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-    ).map_err(|_| crate::error::AvcError::NotFound(format!("persona '{}' v{}", name, version)))?;
+            rusqlite::params![&p.id, version],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .map_err(|_| {
+            crate::error::AvcError::NotFound(format!("persona '{}' v{}", name, version))
+        })?;
 
     let new_persona = merge_json(existing.0.as_deref(), changes.persona_descriptor.clone())?;
     let new_know = merge_json(existing.1.as_deref(), changes.knowledge_binding.clone())?;
@@ -66,7 +70,10 @@ pub fn apply(db: &Db, name: &str, version: i64, changes: &RefineChanges) -> AvcR
     Ok(job_id)
 }
 
-fn merge_json(existing: Option<&str>, patch: Option<serde_json::Value>) -> AvcResult<Option<String>> {
+fn merge_json(
+    existing: Option<&str>,
+    patch: Option<serde_json::Value>,
+) -> AvcResult<Option<String>> {
     let mut base: serde_json::Value = match existing {
         Some(s) => serde_json::from_str(s).unwrap_or_else(|_| json!({})),
         None => json!({}),
@@ -74,16 +81,17 @@ fn merge_json(existing: Option<&str>, patch: Option<serde_json::Value>) -> AvcRe
     if let Some(p) = patch {
         merge_value(&mut base, &p);
     }
-    if base.is_null() { return Ok(None); }
+    if base.is_null() {
+        return Ok(None);
+    }
     Ok(Some(serde_json::to_string(&base)?))
 }
 
 fn merge_value(base: &mut serde_json::Value, patch: &serde_json::Value) {
     if let serde_json::Value::Object(p) = patch {
         // 先取出 entries 以避免借用 base
-        let entries: Vec<(String, serde_json::Value)> = p.iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
+        let entries: Vec<(String, serde_json::Value)> =
+            p.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
         if !base.is_object() {
             *base = serde_json::Value::Object(serde_json::Map::new());
         }

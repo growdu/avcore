@@ -1,9 +1,9 @@
 //! `avc iterate <verb>`
 
-use crate::AvcError;
-use crate::AvcResult;
 use crate::db::Db;
 use crate::output::{print, OutputMode};
+use crate::AvcError;
+use crate::AvcResult;
 use serde_json::json;
 
 pub fn dispatch(argv: &[String]) -> AvcResult<()> {
@@ -21,7 +21,9 @@ pub fn dispatch(argv: &[String]) -> AvcResult<()> {
 
     match argv_ref[0] {
         "list" => {
-            let name = argv_ref.get(1).copied()
+            let name = argv_ref
+                .get(1)
+                .copied()
                 .ok_or_else(|| AvcError::Arg("iterate list <persona>".into()))?;
             let conn = db.conn.lock().unwrap();
             let mut stmt = conn.prepare(
@@ -41,12 +43,15 @@ pub fn dispatch(argv: &[String]) -> AvcResult<()> {
                 }))
             })?;
             let mut out = Vec::new();
-            for r in rows { out.push(r?); }
+            for r in rows {
+                out.push(r?);
+            }
             print(mode, &out)?;
         }
         "apply" => {
-            let name = argv_ref.get(1).copied()
-                .ok_or_else(|| AvcError::Arg("iterate apply <name> --version <v> --set-persona <json>".into()))?;
+            let name = argv_ref.get(1).copied().ok_or_else(|| {
+                AvcError::Arg("iterate apply <name> --version <v> --set-persona <json>".into())
+            })?;
             let mut version: Option<i64> = None;
             let mut set_persona: Option<String> = None;
             let mut set_knowledge: Option<String> = None;
@@ -55,22 +60,24 @@ pub fn dispatch(argv: &[String]) -> AvcResult<()> {
             while i < argv_ref.len() {
                 match argv_ref[i] {
                     "--version" => {
-                        version = argv_ref.get(i+1).and_then(|s| s.parse().ok());
+                        version = argv_ref.get(i + 1).and_then(|s| s.parse().ok());
                         i += 2;
                     }
                     "--set-persona" => {
-                        set_persona = argv_ref.get(i+1).map(|s| s.to_string());
+                        set_persona = argv_ref.get(i + 1).map(|s| s.to_string());
                         i += 2;
                     }
                     "--set-knowledge" => {
-                        set_knowledge = argv_ref.get(i+1).map(|s| s.to_string());
+                        set_knowledge = argv_ref.get(i + 1).map(|s| s.to_string());
                         i += 2;
                     }
                     "--set-manifest" => {
-                        set_manifest = argv_ref.get(i+1).map(|s| s.to_string());
+                        set_manifest = argv_ref.get(i + 1).map(|s| s.to_string());
                         i += 2;
                     }
-                    _ => { i += 1; }
+                    _ => {
+                        i += 1;
+                    }
                 }
             }
             let version = version.ok_or_else(|| AvcError::Arg("--version 必填".into()))?;
@@ -85,9 +92,17 @@ pub fn dispatch(argv: &[String]) -> AvcResult<()> {
                 changes.manifest = serde_json::from_str(&s)?;
             }
             let job_id = crate::svc::iterate::apply(&db, name, version, &changes)?;
-            print(mode, &json!({"iterate_job_id": job_id, "persona": name, "version": version}))?;
+            print(
+                mode,
+                &json!({"iterate_job_id": job_id, "persona": name, "version": version}),
+            )?;
         }
-        _ => return Err(AvcError::Arg(format!("iterate: unknown verb '{}'", argv_ref[0]))),
+        _ => {
+            return Err(AvcError::Arg(format!(
+                "iterate: unknown verb '{}'",
+                argv_ref[0]
+            )))
+        }
     }
     Ok(())
 }

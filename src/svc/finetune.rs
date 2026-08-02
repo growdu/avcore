@@ -131,11 +131,7 @@ pub fn publish(db: &Db, fj_id: &str, drift: &DriftReport) -> AvcResult<()> {
             "UPDATE finetune_jobs SET status = 'succeeded', result_version = target_version,
                 drift_report_json = ?, finished_at = ?
              WHERE id = ?",
-            rusqlite::params![
-                serde_json::to_string(drift)?,
-                crate::svc::now_iso(),
-                fj_id,
-            ],
+            rusqlite::params![serde_json::to_string(drift)?, crate::svc::now_iso(), fj_id,],
         )?;
         // UPDATE persona_versions v(N+1) ready
         tx.execute(

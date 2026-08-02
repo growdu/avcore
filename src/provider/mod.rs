@@ -22,8 +22,8 @@ pub struct Avatar {
     pub provider: String,
     pub provider_version: String,
     pub model_id: Option<String>,
-    pub primary_png_b64: String,         // base64-encoded PNG BLOB
-    pub views_zip_b64: Option<String>,  // base64-encoded multi-view zip
+    pub primary_png_b64: String,       // base64-encoded PNG BLOB
+    pub views_zip_b64: Option<String>, // base64-encoded multi-view zip
     pub face_id: Option<String>,
 }
 

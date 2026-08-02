@@ -55,7 +55,9 @@ pub fn list_personas(db: &Db, status: Option<&str>) -> AvcResult<Vec<PersonaSumm
         })
     })?;
     let mut out = Vec::new();
-    for row in rows { out.push(row?); }
+    for row in rows {
+        out.push(row?);
+    }
     Ok(out)
 }
 
@@ -77,7 +79,8 @@ pub fn get_persona(db: &Db, name: &str) -> AvcResult<PersonaModel> {
                 updated_at: r.get(7)?,
             })
         },
-    ).map_err(|_| AvcError::NotFound(format!("persona '{}'", name)))
+    )
+    .map_err(|_| AvcError::NotFound(format!("persona '{}'", name)))
 }
 
 pub fn list_versions(db: &Db, name: &str) -> AvcResult<Vec<i64>> {
@@ -88,7 +91,9 @@ pub fn list_versions(db: &Db, name: &str) -> AvcResult<Vec<i64>> {
     )?;
     let rows = stmt.query_map([&p.id], |r| r.get::<_, i64>(0))?;
     let mut out = Vec::new();
-    for row in rows { out.push(row?); }
+    for row in rows {
+        out.push(row?);
+    }
     Ok(out)
 }
 
@@ -115,20 +120,28 @@ pub fn get_version(db: &Db, name: &str, version: i64) -> AvcResult<PersonaVersio
                 created_at: r.get(9)?,
             })
         },
-    ).map_err(|_| AvcError::NotFound(format!("persona '{}' v{}", name, version)))
+    )
+    .map_err(|_| AvcError::NotFound(format!("persona '{}' v{}", name, version)))
 }
 
 /// 创建 PersonaModel + v1 初始占位行
-pub fn create(db: &Db, name: &str, archetype: Option<&str>, description: Option<&str>) -> AvcResult<PersonaModel> {
+pub fn create(
+    db: &Db,
+    name: &str,
+    archetype: Option<&str>,
+    description: Option<&str>,
+) -> AvcResult<PersonaModel> {
     let mut conn = db.conn.lock().unwrap();
     let tx = conn.transaction()?;
 
     // 已存在？
-    let exists: Option<bool> = tx.query_row(
-        "SELECT 1 FROM persona_models WHERE name = ?",
-        [name],
-        |_| Ok(true),
-    ).optional()?;
+    let exists: Option<bool> = tx
+        .query_row(
+            "SELECT 1 FROM persona_models WHERE name = ?",
+            [name],
+            |_| Ok(true),
+        )
+        .optional()?;
     let exists = exists.unwrap_or(false);
     if exists {
         return Err(AvcError::Conflict(format!("persona '{}' 已存在", name)));

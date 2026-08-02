@@ -2,13 +2,13 @@
 //!
 //! 详见 docs/modules/。
 
-pub mod persona;
-pub mod iterate;
-pub mod finetune;
-pub mod render;
-pub mod pipeline;
-pub mod drift;
 pub mod corpus;
+pub mod drift;
+pub mod finetune;
+pub mod iterate;
+pub mod persona;
+pub mod pipeline;
+pub mod render;
 
 use chrono::Utc;
 
@@ -21,5 +21,9 @@ pub fn now_iso() -> String {
 }
 
 pub fn new_id(prefix: &str) -> String {
-    format!("{}_{}", prefix, ulid::Ulid::new().to_string().to_lowercase())
+    format!(
+        "{}_{}",
+        prefix,
+        ulid::Ulid::new().to_string().to_lowercase()
+    )
 }

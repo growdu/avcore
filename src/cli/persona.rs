@@ -1,10 +1,10 @@
 //! `avc persona <verb>` 子命令
 
-use crate::AvcError;
-use crate::AvcResult;
 use crate::db::Db;
 use crate::output::{print, OutputMode};
 use crate::svc::persona as svc;
+use crate::AvcError;
+use crate::AvcResult;
 
 pub fn dispatch(argv: &[String]) -> AvcResult<()> {
     if argv.is_empty() {
@@ -21,10 +21,7 @@ pub fn dispatch(argv: &[String]) -> AvcResult<()> {
 
     match verb {
         "list" => {
-            let status = argv.iter()
-                .skip(1)
-                .find(|a| !a.starts_with("--"))
-                .copied();
+            let status = argv.iter().skip(1).find(|a| !a.starts_with("--")).copied();
             let ps = svc::list_personas(&db, status)?;
             print(mode, &ps)?;
         }
@@ -49,10 +46,21 @@ pub fn dispatch(argv: &[String]) -> AvcResult<()> {
             let mut i = 1;
             while i < argv.len() {
                 match argv[i] {
-                    "--archetype" => { archetype = argv.get(i+1).copied(); i += 2; }
-                    "--description" => { description = argv.get(i+1).copied(); i += 2; }
-                    "--name" => { name = argv.get(i+1).copied(); i += 2; }
-                    _ => { i += 1; }
+                    "--archetype" => {
+                        archetype = argv.get(i + 1).copied();
+                        i += 2;
+                    }
+                    "--description" => {
+                        description = argv.get(i + 1).copied();
+                        i += 2;
+                    }
+                    "--name" => {
+                        name = argv.get(i + 1).copied();
+                        i += 2;
+                    }
+                    _ => {
+                        i += 1;
+                    }
                 }
             }
             let name = name.ok_or_else(|| AvcError::Arg("--name <n> 必填".into()))?;

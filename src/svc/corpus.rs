@@ -65,9 +65,8 @@ pub fn create_from_file(
     language: &str,
     path: &Path,
 ) -> AvcResult<String> {
-    let text = std::fs::read_to_string(path).map_err(|e| {
-        AvcError::Io(format!("read {}: {}", path.display(), e))
-    })?;
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| AvcError::Io(format!("read {}: {}", path.display(), e)))?;
     let chunks = split_into_chunks(&text);
     if chunks.is_empty() {
         return Err(AvcError::Arg(format!("file '{}' empty", path.display())));
@@ -81,7 +80,14 @@ pub fn create_from_file(
         "INSERT INTO knowledge_corpora
             (id, name, source_type, language, chunk_count, index_version, created_at)
          VALUES (?, ?, ?, ?, ?, 1, ?)",
-        rusqlite::params![&corpus_id, name, source_type, language, chunks.len() as i64, &now],
+        rusqlite::params![
+            &corpus_id,
+            name,
+            source_type,
+            language,
+            chunks.len() as i64,
+            &now
+        ],
     )?;
     let chunk_id = crate::svc::new_id("chunk");
     // 每 chunk：调 embed → 写 corpus_chunks
@@ -178,7 +184,11 @@ pub async fn search_async(
             });
         }
     }
-    hits.sort_by(|a, b| b.cosine.partial_cmp(&a.cosine).unwrap_or(std::cmp::Ordering::Equal));
+    hits.sort_by(|a, b| {
+        b.cosine
+            .partial_cmp(&a.cosine)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     hits.truncate(topk);
     Ok(hits)
 }

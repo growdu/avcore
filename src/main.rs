@@ -8,13 +8,15 @@
 use std::io::IsTerminal;
 use std::process::ExitCode;
 
-use avc::{cli, shell, ask};
+use avc::{ask, cli, shell};
 
 fn main() -> ExitCode {
     // 初始化 tracing
     let _ = tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")))
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+        )
         .with_target(false)
         .try_init();
 

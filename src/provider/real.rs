@@ -13,10 +13,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use base64::Engine;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
-use super::{AvatarProvider, ChatMessage, EmbedProvider, LlmProvider, VideoProvider, VoiceProvider};
+use super::{
+    AvatarProvider, ChatMessage, EmbedProvider, LlmProvider, VideoProvider, VoiceProvider,
+};
 use crate::config::{Config, ProviderCfg};
 use crate::error::{AvcError, AvcResult};
 
@@ -37,8 +40,7 @@ impl OpenAiCompatLlmProvider {
     pub fn new(name: String, cfg: ProviderCfg) -> AvcResult<Self> {
         let mut headers = reqwest::header::HeaderMap::new();
         if let Some(api_key) = cfg.api_key.as_ref() {
-            if let Ok(v) = reqwest::header::HeaderValue::from_str(&format!("Bearer {}", api_key))
-            {
+            if let Ok(v) = reqwest::header::HeaderValue::from_str(&format!("Bearer {}", api_key)) {
                 headers.insert(reqwest::header::AUTHORIZATION, v);
             }
         }
@@ -110,9 +112,7 @@ impl LlmProvider for OpenAiCompatLlmProvider {
                 AvcError::ProviderTimeout(format!("llm {} POST {}: {}", self.name, url, e))
             })?;
         let status = resp.status();
-        if status == reqwest::StatusCode::UNAUTHORIZED
-            || status == reqwest::StatusCode::FORBIDDEN
-        {
+        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
             return Err(AvcError::TokenAuth(format!(
                 "provider.llm.{}: HTTP {}",
                 self.name, status
@@ -128,9 +128,7 @@ impl LlmProvider for OpenAiCompatLlmProvider {
             let body = resp.text().await.unwrap_or_default();
             return Err(AvcError::ProviderUpstream(format!(
                 "provider.llm.{}: HTTP {} body={}",
-                self.name,
-                status,
-                body
+                self.name, status, body
             )));
         }
         let parsed: ChatResponse = resp.json().await.map_err(|e| {
@@ -149,9 +147,11 @@ impl LlmProvider for OpenAiCompatLlmProvider {
 
 /// Provider 工厂：从 Config + 维度名构造 provider 实例。
 pub fn make_llm(cfg: &Config, name: &str) -> AvcResult<Arc<dyn LlmProvider>> {
-    let pc = cfg.provider.llm.get(name).ok_or_else(|| {
-        AvcError::NotFound(format!("provider.llm.{}", name))
-    })?;
+    let pc = cfg
+        .provider
+        .llm
+        .get(name)
+        .ok_or_else(|| AvcError::NotFound(format!("provider.llm.{}", name)))?;
     Ok(Arc::new(OpenAiCompatLlmProvider::new(
         name.to_string(),
         pc.clone(),
@@ -216,8 +216,7 @@ impl OpenAiCompatEmbedProvider {
     pub fn new(name: String, cfg: ProviderCfg) -> AvcResult<Self> {
         let mut headers = reqwest::header::HeaderMap::new();
         if let Some(api_key) = cfg.api_key.as_ref() {
-            if let Ok(v) = reqwest::header::HeaderValue::from_str(&format!("Bearer {}", api_key))
-            {
+            if let Ok(v) = reqwest::header::HeaderValue::from_str(&format!("Bearer {}", api_key)) {
                 headers.insert(reqwest::header::AUTHORIZATION, v);
             }
         }
@@ -289,9 +288,7 @@ impl EmbedProvider for OpenAiCompatEmbedProvider {
                 AvcError::ProviderTimeout(format!("embed {} POST {}: {}", self.name, url, e))
             })?;
         let status = resp.status();
-        if status == reqwest::StatusCode::UNAUTHORIZED
-            || status == reqwest::StatusCode::FORBIDDEN
-        {
+        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
             return Err(AvcError::TokenAuth(format!(
                 "embed.{}: HTTP {}",
                 self.name, status
@@ -318,9 +315,11 @@ impl EmbedProvider for OpenAiCompatEmbedProvider {
 }
 
 pub fn make_embed(cfg: &Config, name: &str) -> AvcResult<Arc<dyn EmbedProvider>> {
-    let pc = cfg.provider.embed.get(name).ok_or_else(|| {
-        AvcError::NotFound(format!("provider.embed.{}", name))
-    })?;
+    let pc = cfg
+        .provider
+        .embed
+        .get(name)
+        .ok_or_else(|| AvcError::NotFound(format!("provider.embed.{}", name)))?;
     Ok(Arc::new(OpenAiCompatEmbedProvider::new(
         name.to_string(),
         pc.clone(),
@@ -414,42 +413,56 @@ struct ImgResponse {
 struct ImgDatum {
     #[serde(default)]
     b64_json: Option<String>,
+    // OpenAI 支持 `url` 作为 base64 的替代返回；当前实现只走 b64_json 但保留反序列化
     #[serde(default)]
+    #[allow(dead_code)]
     url: Option<String>,
 }
 
 #[async_trait]
 impl AvatarProvider for OpenAiCompatAvatarProvider {
-    fn name(&self) -> &str { &self.name }
+    fn name(&self) -> &str {
+        &self.name
+    }
 
     async fn create(&self, spec: &super::AvatarSpec) -> AvcResult<super::Avatar> {
-        let model = self
-            .cfg
-            .model
-            .as_deref()
-            .unwrap_or("dall-e-3");
-        let url = format!("{}/images/generations", self.base_url().trim_end_matches('/'));
-        let body = ImgRequest { model, prompt: &spec.prompt, size: "1024x1024" };
+        let model = self.cfg.model.as_deref().unwrap_or("dall-e-3");
+        let url = format!(
+            "{}/images/generations",
+            self.base_url().trim_end_matches('/')
+        );
+        let body = ImgRequest {
+            model,
+            prompt: &spec.prompt,
+            size: "1024x1024",
+        };
         let resp = self
             .client
             .post(&url)
             .json(&body)
             .send()
             .await
-            .map_err(|e| AvcError::ProviderTimeout(format!("avatar {} POST {}: {}", self.name, url, e)))?;
+            .map_err(|e| {
+                AvcError::ProviderTimeout(format!("avatar {} POST {}: {}", self.name, url, e))
+            })?;
         let status = resp.status();
-        if status == reqwest::StatusCode::UNAUTHORIZED
-            || status == reqwest::StatusCode::FORBIDDEN
-        {
-            return Err(AvcError::TokenAuth(format!("avatar.{}: HTTP {}", self.name, status)));
+        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+            return Err(AvcError::TokenAuth(format!(
+                "avatar.{}: HTTP {}",
+                self.name, status
+            )));
         }
         if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            return Err(AvcError::RateLimited(format!("avatar.{}: HTTP 429", self.name)));
+            return Err(AvcError::RateLimited(format!(
+                "avatar.{}: HTTP 429",
+                self.name
+            )));
         }
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
             return Err(AvcError::ProviderUpstream(format!(
-                "avatar.{}: HTTP {} body={}", self.name, status, body
+                "avatar.{}: HTTP {} body={}",
+                self.name, status, body
             )));
         }
         let parsed: ImgResponse = resp.json().await.map_err(|e| {
@@ -488,9 +501,11 @@ impl AvatarProvider for OpenAiCompatAvatarProvider {
 }
 
 pub fn make_avatar(cfg: &Config, name: &str) -> AvcResult<Arc<dyn AvatarProvider>> {
-    let pc = cfg.provider.avatar.get(name).ok_or_else(|| {
-        AvcError::NotFound(format!("provider.avatar.{}", name))
-    })?;
+    let pc = cfg
+        .provider
+        .avatar
+        .get(name)
+        .ok_or_else(|| AvcError::NotFound(format!("provider.avatar.{}", name)))?;
     Ok(Arc::new(OpenAiCompatAvatarProvider::new(
         name.to_string(),
         pc.clone(),
@@ -549,7 +564,9 @@ struct SpeechRequest<'a> {
 
 #[async_trait]
 impl VoiceProvider for OpenAiCompatVoiceProvider {
-    fn name(&self) -> &str { &self.name }
+    fn name(&self) -> &str {
+        &self.name
+    }
 
     async fn clone(&self, _ref_audio_paths: &[String]) -> AvcResult<super::Voice> {
         // OpenAI 不提供 clone/finetune（要 ElevenLabs 等 vendor）。
@@ -558,9 +575,10 @@ impl VoiceProvider for OpenAiCompatVoiceProvider {
             provider: self.name.clone(),
             provider_version: "openai_compat".into(),
             voice_id_remote: Some(format!("mock_clone_{}", crate::svc::now_ts())),
-            sample_wav_b64: base64::encode(b"RIFF....CLONE_PLACEHOLDER"),
+            sample_wav_b64: base64::engine::general_purpose::STANDARD
+                .encode(b"RIFF....CLONE_PLACEHOLDER"),
             transcript: Some(String::new()),
-            embed_b64: Some(base64::encode(vec![0u8; 16])),
+            embed_b64: Some(base64::engine::general_purpose::STANDARD.encode(vec![0u8; 16])),
             embed_dim: Some(4),
         })
     }
@@ -574,29 +592,40 @@ impl VoiceProvider for OpenAiCompatVoiceProvider {
             voice: voice.voice_id_remote.as_deref().unwrap_or("alloy"),
             response_format: "wav",
         };
-        let resp = self.client.post(&url).json(&req).send().await.map_err(|e| {
-            AvcError::ProviderTimeout(format!("voice {} POST {}: {}", self.name, url, e))
-        })?;
+        let resp = self
+            .client
+            .post(&url)
+            .json(&req)
+            .send()
+            .await
+            .map_err(|e| {
+                AvcError::ProviderTimeout(format!("voice {} POST {}: {}", self.name, url, e))
+            })?;
         let status = resp.status();
-        if status == reqwest::StatusCode::UNAUTHORIZED
-            || status == reqwest::StatusCode::FORBIDDEN
-        {
-            return Err(AvcError::TokenAuth(format!("voice.{}: HTTP {}", self.name, status)));
+        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+            return Err(AvcError::TokenAuth(format!(
+                "voice.{}: HTTP {}",
+                self.name, status
+            )));
         }
         if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            return Err(AvcError::RateLimited(format!("voice.{}: HTTP 429", self.name)));
+            return Err(AvcError::RateLimited(format!(
+                "voice.{}: HTTP 429",
+                self.name
+            )));
         }
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
             return Err(AvcError::ProviderUpstream(format!(
-                "voice.{}: HTTP {} body={}", self.name, status, body
+                "voice.{}: HTTP {} body={}",
+                self.name, status, body
             )));
         }
         let bytes = resp.bytes().await.map_err(|e| {
             AvcError::ProviderUpstream(format!("voice.{}: read body: {}", self.name, e))
         })?;
         Ok(super::Audio {
-            wav_b64: base64::encode(&bytes),
+            wav_b64: base64::engine::general_purpose::STANDARD.encode(&bytes),
             mime: "audio/wav".into(),
         })
     }
@@ -615,9 +644,11 @@ impl VoiceProvider for OpenAiCompatVoiceProvider {
 }
 
 pub fn make_voice(cfg: &Config, name: &str) -> AvcResult<Arc<dyn VoiceProvider>> {
-    let pc = cfg.provider.voice.get(name).ok_or_else(|| {
-        AvcError::NotFound(format!("provider.voice.{}", name))
-    })?;
+    let pc = cfg
+        .provider
+        .voice
+        .get(name)
+        .ok_or_else(|| AvcError::NotFound(format!("provider.voice.{}", name)))?;
     Ok(Arc::new(OpenAiCompatVoiceProvider::new(
         name.to_string(),
         pc.clone(),
@@ -656,7 +687,9 @@ impl CliVideoProvider {
 
 #[async_trait]
 impl VideoProvider for CliVideoProvider {
-    fn name(&self) -> &str { &self.name }
+    fn name(&self) -> &str {
+        &self.name
+    }
 
     async fn render(
         &self,
@@ -672,7 +705,7 @@ impl VideoProvider for CliVideoProvider {
             _ => {
                 let body = format!("PLACEHOLDER_MP4:{}:{}ms", self.name, total_ms);
                 return Ok(super::Clip {
-                    mp4_b64: base64::encode(body.as_bytes()),
+                    mp4_b64: base64::engine::general_purpose::STANDARD.encode(body.as_bytes()),
                     mime: "video/mp4".into(),
                     duration_ms: total_ms,
                 });
@@ -681,17 +714,24 @@ impl VideoProvider for CliVideoProvider {
 
         // Phase 2: 三段式 spawn 流程。同步阻塞（Pipeline::run 是同步的）。
         // 1. submit
-        let submit_out = run_vendor_cmd(binary, &[
-            "submit",
-            "--prompt", "@script.txt",
-            "--ref-image", "avatar.png",
-            "--ref-audio", "voice.wav",
-        ])?;
-        let task_id = parse_field(&submit_out, "task_id")
-            .ok_or_else(|| AvcError::ProviderUpstream(format!(
+        let submit_out = run_vendor_cmd(
+            binary,
+            &[
+                "submit",
+                "--prompt",
+                "@script.txt",
+                "--ref-image",
+                "avatar.png",
+                "--ref-audio",
+                "voice.wav",
+            ],
+        )?;
+        let task_id = parse_field(&submit_out, "task_id").ok_or_else(|| {
+            AvcError::ProviderUpstream(format!(
                 "video.{}: cannot parse task_id from submit stdout: {:?}",
                 self.name, submit_out
-            )))?;
+            ))
+        })?;
 
         // 2. poll
         let poll_started = std::time::Instant::now();
@@ -700,15 +740,21 @@ impl VideoProvider for CliVideoProvider {
         loop {
             let poll_out = run_vendor_cmd(binary, &["status", "--task-id", &task_id])?;
             let status = parse_field(&poll_out, "status").unwrap_or_default();
-            if status == "done" { break; }
+            if status == "done" {
+                break;
+            }
             if status == "failed" {
                 return Err(AvcError::ProviderUpstream(format!(
-                    "video.{} task {} failed", self.name, task_id
+                    "video.{} task {} failed",
+                    self.name, task_id
                 )));
             }
             if poll_started.elapsed() > poll_timeout {
                 return Err(AvcError::ProviderTimeout(format!(
-                    "video.{} task {} poll timeout ({}s)", self.name, task_id, poll_timeout.as_secs()
+                    "video.{} task {} poll timeout ({}s)",
+                    self.name,
+                    task_id,
+                    poll_timeout.as_secs()
                 )));
             }
             std::thread::sleep(poll_interval);
@@ -717,22 +763,34 @@ impl VideoProvider for CliVideoProvider {
         // 3. fetch to tmp file
         let tmp = std::env::temp_dir().join(format!(
             "avc-{}-{}-{}.mp4",
-            self.name, task_id, crate::svc::now_ts()
+            self.name,
+            task_id,
+            crate::svc::now_ts()
         ));
-        run_vendor_cmd(binary, &[
-            "fetch",
-            "--task-id", &task_id,
-            "--out", tmp.to_str().unwrap_or("out.mp4"),
-        ])?;
-        let bytes = std::fs::read(&tmp).map_err(|e| AvcError::ProviderUpstream(format!(
-            "video.{}: read tmp mp4 {}: {}", self.name, tmp.display(), e
-        )))?;
+        run_vendor_cmd(
+            binary,
+            &[
+                "fetch",
+                "--task-id",
+                &task_id,
+                "--out",
+                tmp.to_str().unwrap_or("out.mp4"),
+            ],
+        )?;
+        let bytes = std::fs::read(&tmp).map_err(|e| {
+            AvcError::ProviderUpstream(format!(
+                "video.{}: read tmp mp4 {}: {}",
+                self.name,
+                tmp.display(),
+                e
+            ))
+        })?;
         // 清理
         let _ = std::fs::remove_file(&tmp);
         // 检查 voice / avatar 占位 sanity（不强约束）
         let _ = (voice, avatar);
         Ok(super::Clip {
-            mp4_b64: base64::encode(&bytes),
+            mp4_b64: base64::engine::general_purpose::STANDARD.encode(&bytes),
             mime: "video/mp4".into(),
             duration_ms: total_ms,
         })
@@ -748,15 +806,19 @@ fn run_vendor_cmd(binary: &str, args: &[&str]) -> AvcResult<String> {
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .output()
-        .map_err(|e| AvcError::ProviderUpstream(format!(
-            "spawn {} {}: {}", binary, args.join(" "), e
-        )))?;
+        .map_err(|e| {
+            AvcError::ProviderUpstream(format!("spawn {} {}: {}", binary, args.join(" "), e))
+        })?;
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
     if !out.status.success() {
         return Err(AvcError::ProviderUpstream(format!(
             "{} {} exit {:?}: stdout={} stderr={}",
-            binary, args.join(" "), out.status.code(), stdout, stderr
+            binary,
+            args.join(" "),
+            out.status.code(),
+            stdout,
+            stderr
         )));
     }
     Ok(stdout)
@@ -778,8 +840,12 @@ fn parse_field(stdout: &str, key: &str) -> Option<String> {
             let l = line.trim_start_matches("data:").trim();
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(l) {
                 if let Some(val) = v.get(key) {
-                    if let Some(s) = val.as_str() { return Some(s.to_string()); }
-                    if let Some(n) = val.as_i64() { return Some(n.to_string()); }
+                    if let Some(s) = val.as_str() {
+                        return Some(s.to_string());
+                    }
+                    if let Some(n) = val.as_i64() {
+                        return Some(n.to_string());
+                    }
                 }
             }
         }
@@ -788,10 +854,15 @@ fn parse_field(stdout: &str, key: &str) -> Option<String> {
 }
 
 pub fn make_video(cfg: &Config, name: &str) -> AvcResult<Arc<dyn VideoProvider>> {
-    let pc = cfg.provider.video.get(name).ok_or_else(|| {
-        AvcError::NotFound(format!("provider.video.{}", name))
-    })?;
-    Ok(Arc::new(CliVideoProvider::new(name.to_string(), pc.clone())?))
+    let pc = cfg
+        .provider
+        .video
+        .get(name)
+        .ok_or_else(|| AvcError::NotFound(format!("provider.video.{}", name)))?;
+    Ok(Arc::new(CliVideoProvider::new(
+        name.to_string(),
+        pc.clone(),
+    )?))
 }
 
 #[cfg(test)]
@@ -801,7 +872,10 @@ mod provider_factory_tests {
     #[test]
     fn avatar_factory_returns_404_for_unknown_name() {
         let cfg = Config::default();
-        assert!(matches!(make_avatar(&cfg, "ghost"), Err(AvcError::NotFound(_))));
+        assert!(matches!(
+            make_avatar(&cfg, "ghost"),
+            Err(AvcError::NotFound(_))
+        ));
     }
 
     #[test]
@@ -822,7 +896,10 @@ mod provider_factory_tests {
     #[test]
     fn voice_factory_returns_404_for_unknown_name() {
         let cfg = Config::default();
-        assert!(matches!(make_voice(&cfg, "ghost"), Err(AvcError::NotFound(_))));
+        assert!(matches!(
+            make_voice(&cfg, "ghost"),
+            Err(AvcError::NotFound(_))
+        ));
     }
 
     #[test]
@@ -843,7 +920,10 @@ mod provider_factory_tests {
     #[test]
     fn video_factory_returns_404_for_unknown_name() {
         let cfg = Config::default();
-        assert!(matches!(make_video(&cfg, "ghost"), Err(AvcError::NotFound(_))));
+        assert!(matches!(
+            make_video(&cfg, "ghost"),
+            Err(AvcError::NotFound(_))
+        ));
     }
 
     #[test]
@@ -865,12 +945,11 @@ mod provider_factory_tests {
     /// Mock binary：一个 shell 脚本立刻返 done + 写真到 --out 路径。
     #[test]
     fn cli_video_calls_binary_succeeds() {
-        use std::io::Write;
         let dir = tempfile::tempdir().expect("tmpdir");
         let bin = dir.path().join("mock_video_cli.sh");
         // submit: stdout task_id=xxx (KV-flavor)；status: stdout status=done；
         // fetch: 写真到 --out 路径，exit 0。
-        let body = std::fs::write(
+        std::fs::write(
             &bin,
             "#!/bin/sh\n\
 set -e\n\
@@ -885,16 +964,19 @@ case \"$1\" in\n\
   fetch)\n\
     # 找 --out 后的值写真\n    while [ \"$#\" -gt 0 ]; do\n      case \"$1\" in\n        --out) OUT=\"$2\"; shift 2;;\n        *) shift;;\n      esac\n    done\n    mkdir -p \"$(dirname \"$OUT\")\"\n    printf 'MOCK_VIDEO_mp4_magic_ftyp' > \"$OUT\"\n    # 写满点字节让 fetch 真读到非空\n    head -c 1024 /dev/urandom >> \"$OUT\"\n    ;;\n  *)\n    echo \"unknown subcommand: $1\" >&2\n    exit 2\n    ;;\n\
 esac\n",
-        ).expect("write mock bin");
+        )
+        .expect("write mock bin");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
         let mut cfg = Config::default();
-        let mut pc = ProviderCfg::default();
-        pc.binary = Some(bin.to_str().unwrap().to_string());
-        pc.model = Some("mock".into());
+        let pc = ProviderCfg {
+            binary: Some(bin.to_str().unwrap().to_string()),
+            model: Some("mock".into()),
+            ..Default::default()
+        };
         cfg.provider.video.insert("mock".into(), pc);
 
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -927,12 +1009,13 @@ esac\n",
             }];
             let clip = p.render(&voice, &avatar, &scenes).await.expect("render ok");
             assert!(!clip.mp4_b64.is_empty());
-            let bytes = base64::decode(&clip.mp4_b64).expect("b64");
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(&clip.mp4_b64)
+                .expect("b64");
             // 写真 ≈ 1024 bytes + magic header
             assert!(bytes.len() >= 100);
             // 第一段是 mp4 ft_magic
-            assert!(bytes.starts_with(b"MOCK_VIDEO_mp4_magic_ftyp")
-                || bytes.starts_with(b"MOCK"));
+            assert!(bytes.starts_with(b"MOCK_VIDEO_mp4_magic_ftyp") || bytes.starts_with(b"MOCK"));
         });
     }
 
@@ -948,11 +1031,16 @@ esac\n",
             std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
         let mut cfg = Config::default();
-        let mut pc = ProviderCfg::default();
-        pc.binary = Some(bin.to_str().unwrap().to_string());
+        let pc = ProviderCfg {
+            binary: Some(bin.to_str().unwrap().to_string()),
+            ..Default::default()
+        };
         cfg.provider.video.insert("mock".into(), pc);
 
-        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
         rt.block_on(async {
             let p = make_video(&cfg, "mock").expect("provider");
             let voice = crate::provider::Voice {
@@ -978,7 +1066,10 @@ esac\n",
                 duration_ms: 1000,
             }];
             let res = p.render(&voice, &avatar, &scenes).await;
-            assert!(matches!(res, Err(crate::error::AvcError::ProviderUpstream(_))));
+            assert!(matches!(
+                res,
+                Err(crate::error::AvcError::ProviderUpstream(_))
+            ));
         });
     }
 
@@ -986,17 +1077,43 @@ esac\n",
     fn cli_video_binary_missing_returns_provider_upstream() {
         // binary 路径不存在 → ProviderUpstream (spawn NotFound)
         let mut cfg = Config::default();
-        let mut pc = ProviderCfg::default();
-        pc.binary = Some("/nonexistent/path/to/binary".into());
+        let pc = ProviderCfg {
+            binary: Some("/nonexistent/path/to/binary".into()),
+            ..Default::default()
+        };
         cfg.provider.video.insert("mock".into(), pc);
-        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
         rt.block_on(async {
             let p = make_video(&cfg, "mock").expect("provider");
-            let voice = crate::provider::Voice { provider:"mock".into(), provider_version:"stub".into(), voice_id_remote:None, sample_wav_b64:String::new(), transcript:None, embed_b64:None, embed_dim:None };
-            let avatar = crate::provider::Avatar { provider:"mock".into(), provider_version:"stub".into(), model_id:None, primary_png_b64:String::new(), views_zip_b64:None, face_id:None };
-            let scenes = vec![crate::provider::ScriptSegment { scene_index:0, text:"x".into(), duration_ms:1 }];
-            assert!(matches!(p.render(&voice, &avatar, &scenes).await,
-                Err(crate::error::AvcError::ProviderUpstream(_))));
+            let voice = crate::provider::Voice {
+                provider: "mock".into(),
+                provider_version: "stub".into(),
+                voice_id_remote: None,
+                sample_wav_b64: String::new(),
+                transcript: None,
+                embed_b64: None,
+                embed_dim: None,
+            };
+            let avatar = crate::provider::Avatar {
+                provider: "mock".into(),
+                provider_version: "stub".into(),
+                model_id: None,
+                primary_png_b64: String::new(),
+                views_zip_b64: None,
+                face_id: None,
+            };
+            let scenes = vec![crate::provider::ScriptSegment {
+                scene_index: 0,
+                text: "x".into(),
+                duration_ms: 1,
+            }];
+            assert!(matches!(
+                p.render(&voice, &avatar, &scenes).await,
+                Err(crate::error::AvcError::ProviderUpstream(_))
+            ));
         });
     }
 }

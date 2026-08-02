@@ -3,15 +3,15 @@
 //! 三种入口（CLI / Shell / ask）的精确命令路径。
 //! 详见 docs/cli.md。
 
-pub mod root;
-pub mod persona;
-pub mod sample;
-pub mod iterate;
-pub mod finetune;
-pub mod job;
-pub mod render;
 pub mod corpus;
+pub mod finetune;
+pub mod iterate;
+pub mod job;
+pub mod persona;
 pub mod provider;
+pub mod render;
+pub mod root;
+pub mod sample;
 
 use crate::AvcError;
 use crate::AvcResult;
@@ -28,7 +28,11 @@ pub fn run(args: &[String]) -> AvcResult<()> {
                 .file_name()
                 .map(|n| n == "avc")
                 .unwrap_or(false);
-        if is_prog { args[1..].to_vec() } else { args.to_vec() }
+        if is_prog {
+            args[1..].to_vec()
+        } else {
+            args.to_vec()
+        }
     } else {
         args.to_vec()
     };

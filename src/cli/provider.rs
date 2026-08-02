@@ -1,10 +1,11 @@
 //! `avc provider <verb>`
 
-use crate::AvcError;
-use crate::AvcResult;
 use crate::config::Config;
 use crate::output::{print, OutputMode};
 use crate::provider::VoiceProvider as VoiceProviderTrait;
+use crate::AvcError;
+use crate::AvcResult;
+use base64::Engine as _;
 use serde_json::json;
 
 pub fn dispatch(argv: &[String]) -> AvcResult<()> {
@@ -21,11 +22,21 @@ pub fn dispatch(argv: &[String]) -> AvcResult<()> {
         "list" => {
             let cfg = Config::load(&Config::default_config_path()?)?;
             let mut all = serde_json::Map::new();
-            for (k, _) in cfg.provider.avatar.iter() { all.insert(format!("avatar.{}", k), json!({})); }
-            for (k, _) in cfg.provider.voice.iter() { all.insert(format!("voice.{}", k), json!({})); }
-            for (k, _) in cfg.provider.llm.iter() { all.insert(format!("llm.{}", k), json!({})); }
-            for (k, _) in cfg.provider.video.iter() { all.insert(format!("video.{}", k), json!({})); }
-            for (k, _) in cfg.provider.embed.iter() { all.insert(format!("embed.{}", k), json!({})); }
+            for (k, _) in cfg.provider.avatar.iter() {
+                all.insert(format!("avatar.{}", k), json!({}));
+            }
+            for (k, _) in cfg.provider.voice.iter() {
+                all.insert(format!("voice.{}", k), json!({}));
+            }
+            for (k, _) in cfg.provider.llm.iter() {
+                all.insert(format!("llm.{}", k), json!({}));
+            }
+            for (k, _) in cfg.provider.video.iter() {
+                all.insert(format!("video.{}", k), json!({}));
+            }
+            for (k, _) in cfg.provider.embed.iter() {
+                all.insert(format!("embed.{}", k), json!({}));
+            }
             print(mode, &all)?;
         }
         "test" => {
@@ -33,9 +44,9 @@ pub fn dispatch(argv: &[String]) -> AvcResult<()> {
                 return Err(AvcError::Arg("provider test <dim>.<name>".into()));
             }
             let target = &argv[1];
-            let (dim, name) = target.split_once('.').ok_or_else(|| {
-                AvcError::Arg("provider test: 需要形如 llm.openai".into())
-            })?;
+            let (dim, name) = target
+                .split_once('.')
+                .ok_or_else(|| AvcError::Arg("provider test: 需要形如 llm.openai".into()))?;
             match dim {
                 "llm" => {
                     let cfg = Config::load(&Config::default_config_path()?)?;
@@ -86,7 +97,8 @@ pub fn dispatch(argv: &[String]) -> AvcResult<()> {
                         .build()
                         .map_err(|e| AvcError::Internal(e.to_string()))?;
                     let avatar = rt.block_on(provider.create(&spec))?;
-                    let png_size = base64::decode(&avatar.primary_png_b64)
+                    let png_size = base64::engine::general_purpose::STANDARD
+                        .decode(&avatar.primary_png_b64)
                         .map(|b| b.len())
                         .unwrap_or(0);
                     let payload = json!({
@@ -106,7 +118,8 @@ pub fn dispatch(argv: &[String]) -> AvcResult<()> {
                         .map_err(|e| AvcError::Internal(e.to_string()))?;
                     // synth 试连真 /audio/speech；失败也返 Ok（Phase 1 mock fallback 由 clone 返占位 WAV）
                     let voice = rt.block_on(VoiceProviderTrait::clone(&*provider, &[]))?;
-                    let wav_size = base64::decode(&voice.sample_wav_b64)
+                    let wav_size = base64::engine::general_purpose::STANDARD
+                        .decode(&voice.sample_wav_b64)
                         .map(|b| b.len())
                         .unwrap_or(0);
                     let payload = json!({
@@ -163,8 +176,12 @@ pub fn dispatch(argv: &[String]) -> AvcResult<()> {
                 }
             }
         }
-        _ => return Err(AvcError::Arg(format!("provider: unknown verb '{}'", argv[0]))),
+        _ => {
+            return Err(AvcError::Arg(format!(
+                "provider: unknown verb '{}'",
+                argv[0]
+            )))
+        }
     }
     Ok(())
 }
-

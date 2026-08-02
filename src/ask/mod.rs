@@ -14,14 +14,20 @@ use std::io::IsTerminal;
 
 use serde::{Deserialize, Serialize};
 
-use crate::AvcError;
-use crate::AvcResult;
 use crate::config::Config;
 use crate::provider::real::make_llm;
 use crate::provider::ChatMessage;
+use crate::AvcError;
+use crate::AvcResult;
 
 /// Allow list of write-action verbs that ask can dispatch.
-const WRITE_VERBS: &[&str] = &["set-traits", "set-catchphrase", "set-render", "commit", "promote"];
+const WRITE_VERBS: &[&str] = &[
+    "set-traits",
+    "set-catchphrase",
+    "set-render",
+    "commit",
+    "promote",
+];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlanStep {
@@ -126,8 +132,14 @@ async fn run_async(args: &[String]) -> AvcResult<()> {
     let llm = make_llm(&cfg, &provider_name)?;
 
     let msgs = vec![
-        ChatMessage { role: "system".into(), content: SYSTEM_PROMPT.into() },
-        ChatMessage { role: "user".into(), content: nl.to_string() },
+        ChatMessage {
+            role: "system".into(),
+            content: SYSTEM_PROMPT.into(),
+        },
+        ChatMessage {
+            role: "user".into(),
+            content: nl.to_string(),
+        },
     ];
 
     let raw_reply = llm.chat(&msgs).await?;
@@ -190,7 +202,10 @@ async fn run_async(args: &[String]) -> AvcResult<()> {
             );
         } else {
             println!("[ask] provider={}", provider_name);
-            println!("intent: {} (read_only={}, no steps)", plan.intent, plan.read_only);
+            println!(
+                "intent: {} (read_only={}, no steps)",
+                plan.intent, plan.read_only
+            );
         }
         return Ok(());
     }
@@ -206,13 +221,24 @@ async fn run_async(args: &[String]) -> AvcResult<()> {
         ));
     }
     if has_write && !plan.read_only && !yes && std::io::stdout().is_terminal() {
-        eprintln!("[plan] intent={} (write, {} steps)", plan.intent, plan.steps.len());
+        eprintln!(
+            "[plan] intent={} (write, {} steps)",
+            plan.intent,
+            plan.steps.len()
+        );
         for (i, s) in plan.steps.iter().enumerate() {
-            eprintln!("  {}. {} {}", i + 1, s.cmd, serde_json::to_string(&s.args).unwrap_or_default());
+            eprintln!(
+                "  {}. {} {}",
+                i + 1,
+                s.cmd,
+                serde_json::to_string(&s.args).unwrap_or_default()
+            );
         }
         eprintln!("run? [y/N]");
         let mut line = String::new();
-        std::io::stdin().read_line(&mut line).map_err(|e| AvcError::Io(e.to_string()))?;
+        std::io::stdin()
+            .read_line(&mut line)
+            .map_err(|e| AvcError::Io(e.to_string()))?;
         if !line.trim().eq_ignore_ascii_case("y") {
             return Err(AvcError::Generic("plan rejected by user".into()));
         }
@@ -223,11 +249,7 @@ async fn run_async(args: &[String]) -> AvcResult<()> {
     for s in plan.steps.iter() {
         // s.cmd 是 "<noun> <verb>" 形式（LLM 输出）；拆成 argv tokens。
         // 带 --flag 形态 args 仍按 "key value" 追加（与 CLI 兼容）。
-        let mut cli_argv: Vec<String> = s
-            .cmd
-            .split_whitespace()
-            .map(String::from)
-            .collect();
+        let mut cli_argv: Vec<String> = s.cmd.split_whitespace().map(String::from).collect();
         if let Some(map) = s.args.as_object() {
             for (k, v) in map.iter() {
                 cli_argv.push(k.clone());
@@ -239,7 +261,9 @@ async fn run_async(args: &[String]) -> AvcResult<()> {
         }
         match crate::cli::run(&cli_argv) {
             Ok(()) => results.push(serde_json::json!({"cmd": s.cmd, "ok": true})),
-            Err(e) => results.push(serde_json::json!({"cmd": s.cmd, "ok": false, "error": e.to_string()})),
+            Err(e) => {
+                results.push(serde_json::json!({"cmd": s.cmd, "ok": false, "error": e.to_string()}))
+            }
         }
         // e went out of scope next iteration
     }
@@ -305,9 +329,8 @@ fn parse_plan(raw: &str) -> AvcResult<Plan> {
     } else {
         s
     };
-    serde_json::from_str::<Plan>(candidate).map_err(|e| {
-        AvcError::Internal(format!("plan json parse failed: {}; raw={}", e, raw))
-    })
+    serde_json::from_str::<Plan>(candidate)
+        .map_err(|e| AvcError::Internal(format!("plan json parse failed: {}; raw={}", e, raw)))
 }
 
 #[cfg(test)]
@@ -316,7 +339,8 @@ mod tests {
 
     #[test]
     fn parse_plan_direct_json() {
-        let raw = r#"{"intent":"list","read_only":true,"steps":[{"cmd":"persona list","args":{}}]}"#;
+        let raw =
+            r#"{"intent":"list","read_only":true,"steps":[{"cmd":"persona list","args":{}}]}"#;
         let p = parse_plan(raw).unwrap();
         assert_eq!(p.intent, "list");
         assert_eq!(p.steps.len(), 1);
@@ -347,6 +371,12 @@ mod tests {
     }
 
     // 辅助 trait 让 test 可读
-    trait Stent { fn stent_count(&self) -> usize; }
-    impl Stent for Plan { fn stent_count(&self) -> usize { self.steps.len() } }
+    trait Stent {
+        fn stent_count(&self) -> usize;
+    }
+    impl Stent for Plan {
+        fn stent_count(&self) -> usize {
+            self.steps.len()
+        }
+    }
 }
