@@ -2695,3 +2695,149 @@ esac
         .unwrap();
     assert_eq!(roundtrip, i2v_blob);
 }
+
+/// Helper: init + persona create so render sub-commands can resolve `--persona yu`.
+fn init_and_create_persona(dir: &tempfile::TempDir) {
+    let data = dir.path().join("data");
+    let config = dir.path().join("config");
+    bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .arg("init")
+        .output()
+        .unwrap();
+    bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .args(["persona", "create", "--name", "yu"])
+        .output()
+        .unwrap();
+}
+
+/// `avc render run --persona yu --topic` (末尾空值) 必须 exit 2 (Arg)，
+/// 且 stderr 含可定位的 `--topic <value>` 提示；不能静默跑整个 DAG 并 exit 0。
+///
+/// RED：在原 render.rs 实现下，`argv.get(i + 1)` 对末尾空 flag 返回 None，
+/// option 被静默丢弃；`topic = topic.unwrap_or("(no topic)")` 把缺失当成默认；
+/// 整个 render pipeline 仍然执行并返回 job_id、exit 0。
+#[test]
+fn render_run_rejects_missing_flag_values() {
+    let dir = tempfile::tempdir().unwrap();
+    init_and_create_persona(&dir);
+    let data = dir.path().join("data");
+    let config = dir.path().join("config");
+
+    let cases: &[&[&str]] = &[
+        &["render", "run", "--persona", "yu", "--topic"],
+        &["render", "run", "--persona", "yu", "--version"],
+        &["render", "run", "--persona", "yu", "--llm-provider"],
+        &["render", "run", "--persona", "yu", "--voice-provider"],
+        &["render", "run", "--persona", "yu", "--avatar-provider"],
+        &["render", "run", "--persona", "yu", "--video-provider"],
+    ];
+
+    for argv in cases {
+        let r = bin()
+            .env("XDG_DATA_HOME", &data)
+            .env("XDG_CONFIG_HOME", &config)
+            .args(*argv)
+            .output()
+            .unwrap();
+        assert_eq!(
+            r.status.code(),
+            Some(2),
+            "missing value for {:?} should exit 2 (Arg); stderr={}",
+            argv,
+            String::from_utf8_lossy(&r.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&r.stderr);
+        let flag = argv.last().unwrap();
+        assert!(
+            stderr.contains(flag) || stderr.contains(&flag[2..]),
+            "stderr 应包含 flag `{}` 用于定位；实际={:?}",
+            flag,
+            stderr
+        );
+    }
+
+    // 关键断言：缺失值的调用 *绝不能* 落库 jobs 行（无静默执行）。
+    let db = rusqlite::Connection::open(data.join("avc/avc.db")).unwrap();
+    let count: i64 = db
+        .query_row("SELECT COUNT(*) FROM jobs", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        count, 0,
+        "缺失 flag 值的调用不应创建任何 job（无静默执行）；got {}",
+        count
+    );
+}
+
+/// `avc render pack yu --topics-file` (末尾空值) 必须 exit 2 (Arg)；
+/// `--topics-file <existing> --version` (末尾空值) 同样必须 exit 2。
+///
+/// RED：原 pack 解析器仅在 `--topics-file` *完全缺失* 时报错；末尾空值时
+/// `argv.get(i + 1)` 返回 None → `topics_file = None` → 已存在的 `--version <v>`
+/// 仍按 default 跑整个 pack（静默执行）。
+#[test]
+fn render_pack_rejects_missing_flag_values() {
+    let dir = tempfile::tempdir().unwrap();
+    init_and_create_persona(&dir);
+    let data = dir.path().join("data");
+    let config = dir.path().join("config");
+
+    // 写一个真实 topics-file 用于测试 `--version` 缺失值的路径。
+    let topics = dir.path().join("topics.txt");
+    std::fs::write(&topics, "topic-a\n# comment\n\ntopic-b\n").unwrap();
+
+    // 1) --topics-file 末尾空值
+    let r = bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .args(["render", "pack", "yu", "--topics-file"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        r.status.code(),
+        Some(2),
+        "pack --topics-file 末尾空值应 exit 2；stderr={}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+
+    // 2) --topics-file <real> --version 末尾空值
+    let r = bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .args([
+            "render",
+            "pack",
+            "yu",
+            "--topics-file",
+            topics.to_str().unwrap(),
+            "--version",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        r.status.code(),
+        Some(2),
+        "pack --version 末尾空值应 exit 2；stderr={}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&r.stderr);
+    assert!(
+        stderr.contains("--version"),
+        "stderr 应包含 `--version` 用于定位；实际={:?}",
+        stderr
+    );
+
+    // 关键断言：两种缺失值调用都不应创建任何 job。
+    let db = rusqlite::Connection::open(data.join("avc/avc.db")).unwrap();
+    let count: i64 = db
+        .query_row("SELECT COUNT(*) FROM jobs", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(
+        count, 0,
+        "pack 缺失 flag 值的调用不应创建任何 job（无静默执行）；got {}",
+        count
+    );
+}

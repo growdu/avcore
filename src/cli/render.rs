@@ -19,42 +19,54 @@ pub fn dispatch(argv: &[String]) -> AvcResult<()> {
     match argv[0].as_str() {
         "run" => {
             // 解析 --persona / --version / --topic
-            let mut persona = None;
+            // - 每个 value-required flag 后必须紧跟一个非空 argv 元素；末尾空 flag
+            //   必须以 AvcError::Arg 拒绝（exit 2），避免静默执行整个 render DAG。
+            // - 解析器使用 `argv[i+1]` 的存在性 + 非空检查（trim 后非空）；
+            //   传入 "--" 这种纯占位也按缺失处理。
+            let mut persona: Option<String> = None;
             let mut version: Option<i64> = None;
-            let mut topic: Option<&str> = None;
+            let mut topic: Option<String> = None;
             let mut llm_provider: Option<String> = None;
             let mut voice_provider: Option<String> = None;
             let mut avatar_provider: Option<String> = None;
             let mut video_provider: Option<String> = None;
             let mut i = 1;
             while i < argv.len() {
+                let next = |i: usize| -> Option<String> {
+                    argv.get(i + 1)
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                };
                 match argv[i].as_str() {
                     "--persona" => {
-                        persona = argv.get(i + 1).map(|s| s.as_str());
+                        persona = Some(require_value("--persona", next(i))?);
                         i += 2;
                     }
                     "--version" => {
-                        version = argv.get(i + 1).and_then(|s| s.parse().ok());
+                        let raw = require_value("--version", next(i))?;
+                        version = Some(raw.parse().map_err(|_| {
+                            AvcError::Arg(format!("--version: 需整数，got '{}'", raw))
+                        })?);
                         i += 2;
                     }
                     "--topic" => {
-                        topic = argv.get(i + 1).map(|s| s.as_str());
+                        topic = Some(require_value("--topic", next(i))?);
                         i += 2;
                     }
                     "--llm-provider" => {
-                        llm_provider = argv.get(i + 1).cloned();
+                        llm_provider = Some(require_value("--llm-provider", next(i))?);
                         i += 2;
                     }
                     "--voice-provider" => {
-                        voice_provider = argv.get(i + 1).cloned();
+                        voice_provider = Some(require_value("--voice-provider", next(i))?);
                         i += 2;
                     }
                     "--avatar-provider" => {
-                        avatar_provider = argv.get(i + 1).cloned();
+                        avatar_provider = Some(require_value("--avatar-provider", next(i))?);
                         i += 2;
                     }
                     "--video-provider" => {
-                        video_provider = argv.get(i + 1).cloned();
+                        video_provider = Some(require_value("--video-provider", next(i))?);
                         i += 2;
                     }
                     _ => {
@@ -63,16 +75,16 @@ pub fn dispatch(argv: &[String]) -> AvcResult<()> {
                 }
             }
             let persona = persona.ok_or_else(|| AvcError::Arg("--persona <name> 必填".into()))?;
-            let topic = topic.unwrap_or("(no topic)");
+            let topic = topic.unwrap_or_else(|| "(no topic)".to_string());
             // version 不指定 = current
             let v = match version {
                 Some(v) => v,
                 None => {
-                    let p = crate::svc::persona::get_persona(&db, persona)?;
+                    let p = crate::svc::persona::get_persona(&db, &persona)?;
                     p.current_version
                 }
             };
-            let job_id = crate::svc::render::create_job(&db, persona, v, topic)?;
+            let job_id = crate::svc::render::create_job(&db, &persona, v, &topic)?;
             // Wave B：render run 真跑 DAG 五节点 (script_gen → tts+img_gen → i2v → compose)
             // 节点 BLOB 落 artifacts 表；失败 → job status='failed' + error_json。
             let mut spec = crate::svc::pipeline::render_publishment_spec();
@@ -88,7 +100,7 @@ pub fn dispatch(argv: &[String]) -> AvcResult<()> {
             if let Some(provider) = video_provider {
                 spec.nodes[3].config["video_provider"] = serde_json::Value::String(provider);
             }
-            crate::svc::pipeline::run(&db, &job_id, &spec, topic)?;
+            crate::svc::pipeline::run(&db, &job_id, &spec, &topic)?;
             if mode == OutputMode::Quiet {
                 println!("{}", job_id);
             } else {
@@ -99,6 +111,8 @@ pub fn dispatch(argv: &[String]) -> AvcResult<()> {
             // avc render pack <persona> --topics-file <path> [--version <n>]
             // - topics-file: 每行一个 topic（`#` 开头 / 空行 跳过）
             // - 默认 version = current；可手动覆盖
+            // - value-required flag 末尾空值必须以 AvcError::Arg 拒绝（exit 2），
+            //   避免 `--topics-file /tmp/x --version` 静默跑整个 pack。
             let persona = argv
                 .get(1)
                 .ok_or_else(|| AvcError::Arg("render pack <persona> --topics-file <path>".into()))?
@@ -107,13 +121,21 @@ pub fn dispatch(argv: &[String]) -> AvcResult<()> {
             let mut version: Option<i64> = None;
             let mut i = 2;
             while i < argv.len() {
+                let next = |i: usize| -> Option<String> {
+                    argv.get(i + 1)
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                };
                 match argv[i].as_str() {
                     "--topics-file" => {
-                        topics_file = argv.get(i + 1).cloned();
+                        topics_file = Some(require_value("--topics-file", next(i))?);
                         i += 2;
                     }
                     "--version" => {
-                        version = argv.get(i + 1).and_then(|s| s.parse().ok());
+                        let raw = require_value("--version", next(i))?;
+                        version = Some(raw.parse().map_err(|_| {
+                            AvcError::Arg(format!("--version: 需整数，got '{}'", raw))
+                        })?);
                         i += 2;
                     }
                     _ => {
@@ -150,4 +172,18 @@ pub fn dispatch(argv: &[String]) -> AvcResult<()> {
         _ => return Err(AvcError::Arg(format!("render: unknown verb '{}'", argv[0]))),
     }
     Ok(())
+}
+
+/// value-required CLI flag 的统一校验器：
+/// - `next(i)` 为 `None` 或 trim 后为空 → `AvcError::Arg` 含 flag 名；
+/// - 否则原样返回 trimmed 值（不规范化空白，让调用方拿到原始输入以便错误信息）。
+/// - 失败 exit 2，避免静默执行后续重操作（render DAG / DB 写入）。
+fn require_value(flag: &str, next: Option<String>) -> AvcResult<String> {
+    match next {
+        Some(v) if !v.is_empty() => Ok(v),
+        _ => Err(AvcError::Arg(format!(
+            "{} 需要值；用法：{} <value>",
+            flag, flag
+        ))),
+    }
 }
