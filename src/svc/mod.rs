@@ -3,6 +3,7 @@
 //! 详见 docs/modules/。
 
 pub mod corpus;
+pub mod daemon;
 pub mod drift;
 pub mod finetune;
 pub mod health;
