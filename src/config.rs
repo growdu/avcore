@@ -17,6 +17,32 @@ pub struct Config {
     pub shell: ShellCfg,
     #[serde(default)]
     pub safety: SafetyCfg,
+    #[serde(default)]
+    pub export: Option<ExportCfg>,
+    #[serde(default)]
+    pub daemon: DaemonCfg,
+}
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct ExportCfg {
+    #[serde(default)]
+    pub s3: Option<S3ExportCfg>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct S3ExportCfg {
+    /// upload_cmd 模板：`{local} {bucket} {prefix} {name}` 占位符在 export 时替换；
+    /// 跑 `sh -c` 整条命令。默认 `aws s3 cp --region us-east-1 {local} s3://{bucket}/{prefix}{name}`。
+    pub upload_cmd: String,
+}
+
+impl Default for S3ExportCfg {
+    fn default() -> Self {
+        Self {
+            upload_cmd: "aws s3 cp --region us-east-1 {local} s3://{bucket}/{prefix}{name}"
+                .to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -78,6 +104,30 @@ impl Default for SafetyCfg {
         Self {
             real_person_enabled: Some(false),
             auto_consume_feedback: Some(true),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DaemonCfg {
+    pub enabled: bool,
+    pub port: u16,
+    pub bind: String,
+    pub ping_interval_s: u64,
+    pub log_level: String,
+    pub auto_record_hook: bool,
+}
+
+impl Default for DaemonCfg {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            port: 7891,
+            bind: "127.0.0.1".into(),
+            ping_interval_s: 60,
+            log_level: "info".into(),
+            auto_record_hook: true,
         }
     }
 }
@@ -161,5 +211,30 @@ impl Config {
             _ => return Err(AvcError::Arg(format!("未知字段: {}", field))),
         };
         Ok(val.cloned())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn daemon_cfg_default_values() {
+        let c = DaemonCfg::default();
+        assert_eq!(c.port, 7891);
+        assert!(c.enabled);
+        assert_eq!(c.bind, "127.0.0.1");
+        assert_eq!(c.ping_interval_s, 60);
+    }
+
+    #[test]
+    fn daemon_cfg_parses_partial_toml() {
+        let toml_str = r#"
+[daemon]
+port = 9000
+"#;
+        let c: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(c.daemon.port, 9000);
+        assert!(c.daemon.enabled);
     }
 }
