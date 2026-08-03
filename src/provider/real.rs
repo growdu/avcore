@@ -358,6 +358,8 @@ impl EmbedProvider for OpenAiCompatEmbedProvider {
     }
 
     async fn embed(&self, texts: &[&str]) -> AvcResult<Vec<Vec<f32>>> {
+        let provider_key = format!("embed.{}", self.name);
+        let started = Instant::now();
         let model = self
             .cfg
             .model
@@ -375,16 +377,47 @@ impl EmbedProvider for OpenAiCompatEmbedProvider {
             .send()
             .await
             .map_err(|e| {
-                AvcError::ProviderTimeout(format!("embed {} POST {}: {}", self.name, url, e))
+                let msg = format!("embed {} POST {}: {}", self.name, url, e);
+                hook_record(
+                    &provider_key,
+                    Status::Timeout,
+                    Some(started.elapsed().as_millis() as i64),
+                    "timeout",
+                );
+                AvcError::ProviderTimeout(msg)
             })?;
         let status = resp.status();
         if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+            hook_record(
+                &provider_key,
+                Status::Auth,
+                Some(started.elapsed().as_millis() as i64),
+                "auth",
+            );
             return Err(AvcError::TokenAuth(format!(
                 "embed.{}: HTTP {}",
                 self.name, status
             )));
         }
         if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            let retry_after_s = resp
+                .headers()
+                .get("retry-after")
+                .and_then(|h| h.to_str().ok())
+                .and_then(parse_retry_after);
+            let until_ts = retry_after_s.map(|s| {
+                use chrono::Utc;
+                (Utc::now() + chrono::Duration::seconds(s))
+                    .format("%Y-%m-%dT%H:%M:%SZ")
+                    .to_string()
+            });
+            hook_record(
+                &provider_key,
+                Status::RateLimited,
+                Some(started.elapsed().as_millis() as i64),
+                "rate",
+            );
+            hook_rate_limit_upsert(&provider_key, retry_after_s, until_ts.as_deref());
             return Err(AvcError::RateLimited(format!(
                 "embed.{}: HTTP 429",
                 self.name
@@ -392,13 +425,26 @@ impl EmbedProvider for OpenAiCompatEmbedProvider {
         }
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
+            hook_record(
+                &provider_key,
+                Status::UpstreamError,
+                Some(started.elapsed().as_millis() as i64),
+                "upstream",
+            );
             return Err(AvcError::ProviderUpstream(format!(
                 "embed.{}: HTTP {} body={}",
                 self.name, status, body
             )));
         }
         let parsed: EmbedResponse = resp.json().await.map_err(|e| {
-            AvcError::ProviderUpstream(format!("embed.{}: bad json: {}", self.name, e))
+            let msg = format!("embed.{}: bad json: {}", self.name, e);
+            hook_record(
+                &provider_key,
+                Status::UpstreamError,
+                Some(started.elapsed().as_millis() as i64),
+                "upstream",
+            );
+            AvcError::ProviderUpstream(msg)
         })?;
         Ok(parsed.data.into_iter().map(|d| d.embedding).collect())
     }
@@ -516,6 +562,8 @@ impl AvatarProvider for OpenAiCompatAvatarProvider {
     }
 
     async fn create(&self, spec: &super::AvatarSpec) -> AvcResult<super::Avatar> {
+        let provider_key = format!("avatar.{}", self.name);
+        let started = Instant::now();
         let model = self.cfg.model.as_deref().unwrap_or("dall-e-3");
         let url = format!(
             "{}/images/generations",
@@ -533,16 +581,47 @@ impl AvatarProvider for OpenAiCompatAvatarProvider {
             .send()
             .await
             .map_err(|e| {
-                AvcError::ProviderTimeout(format!("avatar {} POST {}: {}", self.name, url, e))
+                let msg = format!("avatar {} POST {}: {}", self.name, url, e);
+                hook_record(
+                    &provider_key,
+                    Status::Timeout,
+                    Some(started.elapsed().as_millis() as i64),
+                    "timeout",
+                );
+                AvcError::ProviderTimeout(msg)
             })?;
         let status = resp.status();
         if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+            hook_record(
+                &provider_key,
+                Status::Auth,
+                Some(started.elapsed().as_millis() as i64),
+                "auth",
+            );
             return Err(AvcError::TokenAuth(format!(
                 "avatar.{}: HTTP {}",
                 self.name, status
             )));
         }
         if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            let retry_after_s = resp
+                .headers()
+                .get("retry-after")
+                .and_then(|h| h.to_str().ok())
+                .and_then(parse_retry_after);
+            let until_ts = retry_after_s.map(|s| {
+                use chrono::Utc;
+                (Utc::now() + chrono::Duration::seconds(s))
+                    .format("%Y-%m-%dT%H:%M:%SZ")
+                    .to_string()
+            });
+            hook_record(
+                &provider_key,
+                Status::RateLimited,
+                Some(started.elapsed().as_millis() as i64),
+                "rate",
+            );
+            hook_rate_limit_upsert(&provider_key, retry_after_s, until_ts.as_deref());
             return Err(AvcError::RateLimited(format!(
                 "avatar.{}: HTTP 429",
                 self.name
@@ -550,18 +629,43 @@ impl AvatarProvider for OpenAiCompatAvatarProvider {
         }
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
+            hook_record(
+                &provider_key,
+                Status::UpstreamError,
+                Some(started.elapsed().as_millis() as i64),
+                "upstream",
+            );
             return Err(AvcError::ProviderUpstream(format!(
                 "avatar.{}: HTTP {} body={}",
                 self.name, status, body
             )));
         }
         let parsed: ImgResponse = resp.json().await.map_err(|e| {
-            AvcError::ProviderUpstream(format!("avatar.{}: bad json: {}", self.name, e))
+            let msg = format!("avatar.{}: bad json: {}", self.name, e);
+            hook_record(
+                &provider_key,
+                Status::UpstreamError,
+                Some(started.elapsed().as_millis() as i64),
+                "upstream",
+            );
+            AvcError::ProviderUpstream(msg)
         })?;
         let datum = parsed.data.into_iter().next().ok_or_else(|| {
+            hook_record(
+                &provider_key,
+                Status::UpstreamError,
+                Some(started.elapsed().as_millis() as i64),
+                "upstream",
+            );
             AvcError::ProviderUpstream(format!("avatar.{}: empty data", self.name))
         })?;
         let primary_b64 = datum.b64_json.ok_or_else(|| {
+            hook_record(
+                &provider_key,
+                Status::UpstreamError,
+                Some(started.elapsed().as_millis() as i64),
+                "upstream",
+            );
             AvcError::ProviderUpstream(format!(
                 "avatar.{}: no b64_json (URL not supported in Phase 1)",
                 self.name
@@ -698,6 +802,8 @@ impl VoiceProvider for OpenAiCompatVoiceProvider {
     }
 
     async fn synth(&self, voice: &super::Voice, text: &str) -> AvcResult<super::Audio> {
+        let provider_key = format!("voice.{}", self.name);
+        let started = Instant::now();
         let model = self.cfg.model.as_deref().unwrap_or("tts-1");
         let url = format!("{}/audio/speech", self.base_url().trim_end_matches('/'));
         let req = SpeechRequest {
@@ -713,16 +819,47 @@ impl VoiceProvider for OpenAiCompatVoiceProvider {
             .send()
             .await
             .map_err(|e| {
-                AvcError::ProviderTimeout(format!("voice {} POST {}: {}", self.name, url, e))
+                let msg = format!("voice {} POST {}: {}", self.name, url, e);
+                hook_record(
+                    &provider_key,
+                    Status::Timeout,
+                    Some(started.elapsed().as_millis() as i64),
+                    "timeout",
+                );
+                AvcError::ProviderTimeout(msg)
             })?;
         let status = resp.status();
         if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+            hook_record(
+                &provider_key,
+                Status::Auth,
+                Some(started.elapsed().as_millis() as i64),
+                "auth",
+            );
             return Err(AvcError::TokenAuth(format!(
                 "voice.{}: HTTP {}",
                 self.name, status
             )));
         }
         if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            let retry_after_s = resp
+                .headers()
+                .get("retry-after")
+                .and_then(|h| h.to_str().ok())
+                .and_then(parse_retry_after);
+            let until_ts = retry_after_s.map(|s| {
+                use chrono::Utc;
+                (Utc::now() + chrono::Duration::seconds(s))
+                    .format("%Y-%m-%dT%H:%M:%SZ")
+                    .to_string()
+            });
+            hook_record(
+                &provider_key,
+                Status::RateLimited,
+                Some(started.elapsed().as_millis() as i64),
+                "rate",
+            );
+            hook_rate_limit_upsert(&provider_key, retry_after_s, until_ts.as_deref());
             return Err(AvcError::RateLimited(format!(
                 "voice.{}: HTTP 429",
                 self.name
@@ -730,13 +867,26 @@ impl VoiceProvider for OpenAiCompatVoiceProvider {
         }
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
+            hook_record(
+                &provider_key,
+                Status::UpstreamError,
+                Some(started.elapsed().as_millis() as i64),
+                "upstream",
+            );
             return Err(AvcError::ProviderUpstream(format!(
                 "voice.{}: HTTP {} body={}",
                 self.name, status, body
             )));
         }
         let bytes = resp.bytes().await.map_err(|e| {
-            AvcError::ProviderUpstream(format!("voice.{}: read body: {}", self.name, e))
+            let msg = format!("voice.{}: read body: {}", self.name, e);
+            hook_record(
+                &provider_key,
+                Status::UpstreamError,
+                Some(started.elapsed().as_millis() as i64),
+                "upstream",
+            );
+            AvcError::ProviderUpstream(msg)
         })?;
         Ok(super::Audio {
             wav_b64: base64::engine::general_purpose::STANDARD.encode(&bytes),
