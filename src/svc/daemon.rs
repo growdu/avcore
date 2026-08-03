@@ -5,8 +5,11 @@
 //! T13 adds pidfile/lockfile helpers. T14-T18 add HTTP server, ping loop, and CLI.
 
 use std::path::PathBuf;
+use std::time::Duration;
 
+use crate::config::Config;
 use crate::error::{AvcError, AvcResult};
+use crate::provider::probe;
 
 /// Returns the pidfile path: `<data_dir>/avc.pid`
 pub fn pid_path() -> AvcResult<PathBuf> {
@@ -232,6 +235,19 @@ pub async fn run_http(
     Ok(())
 }
 
+/// 周期 ping 所有 provider；间隔由 `cfg.daemon.ping_interval_s` 决定（最小 5s）
+pub async fn run_ping_loop(cfg: Config, conn: Arc<Mutex<rusqlite::Connection>>) {
+    let interval = Duration::from_secs(cfg.daemon.ping_interval_s.max(5));
+    loop {
+        let conn_guard = conn.lock().await;
+        if let Err(e) = probe::probe_all(&cfg, &conn_guard).await {
+            tracing::warn!("probe_all error: {}", e);
+        }
+        drop(conn_guard);
+        tokio::time::sleep(interval).await;
+    }
+}
+
 #[cfg(test)]
 mod http_tests {
     use super::*;
@@ -264,5 +280,37 @@ mod http_tests {
             .await
             .unwrap();
         assert_eq!(resp.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn ping_loop_runs_once_then_cancels() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let sqls = [
+            include_str!("../../migrations/0001_init.sql"),
+            include_str!("../../migrations/0002_drift_dimensions.sql"),
+            include_str!("../../migrations/0003_provider_health.sql"),
+        ];
+        for s in sqls {
+            conn.execute_batch(s).unwrap();
+        }
+        let conn = Arc::new(Mutex::new(conn));
+        let mut cfg = Config::default();
+        cfg.daemon.ping_interval_s = 60; // 测试期间不会再次跑
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let handle = tokio::task::spawn_local(run_ping_loop(cfg, conn.clone()));
+                // 等 200ms 让第一次 ping 跑完
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                handle.abort();
+            })
+            .await;
+        // 验证：conn 里没有错误状态（空 config 应该写 0 条）
+        let count: i64 = conn
+            .lock()
+            .await
+            .query_row("SELECT COUNT(*) FROM provider_health", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
     }
 }
