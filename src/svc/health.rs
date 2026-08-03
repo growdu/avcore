@@ -201,6 +201,31 @@ pub fn rate_limit_all(conn: &Connection) -> AvcResult<Vec<RateLimitRow>> {
     Ok(rows)
 }
 
+/// 解析 HTTP `Retry-After` header：
+///   - 整数秒 → 立刻返回
+///   - RFC 7231 HTTP-date → 计算与现在的差值（秒）
+///   - 其它 → None
+pub fn parse_retry_after(value: &str) -> Option<i64> {
+    let v = value.trim();
+    if v.is_empty() {
+        return None;
+    }
+    if let Ok(s) = v.parse::<i64>() {
+        if s >= 0 {
+            return Some(s);
+        }
+        return None;
+    }
+    // HTTP-date
+    if let Ok(d) = chrono::DateTime::parse_from_rfc2822(v) {
+        let delta = d.timestamp() - chrono::Utc::now().timestamp();
+        if delta > 0 {
+            return Some(delta);
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -333,6 +358,24 @@ mod tests {
         let keys: Vec<&str> = all.iter().map(|r| r.provider_key.as_str()).collect();
         assert!(keys.contains(&"llm.openai"));
         assert!(keys.contains(&"embed.openai"));
+    }
+
+    #[test]
+    fn parse_retry_after_seconds_int() {
+        assert_eq!(parse_retry_after("120"), Some(120));
+    }
+
+    #[test]
+    fn parse_retry_after_http_date() {
+        // RFC 7231 格式；本测试用固定日期检查 +delta
+        let got = parse_retry_after("Wed, 21 Oct 2026 07:28:00 GMT");
+        assert!(got.unwrap() > 0);
+    }
+
+    #[test]
+    fn parse_retry_after_invalid_returns_none() {
+        assert_eq!(parse_retry_after("garbage"), None);
+        assert_eq!(parse_retry_after(""), None);
     }
 }
 
