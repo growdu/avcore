@@ -3,6 +3,7 @@
 //! 详见 docs/api/README.md。
 
 pub mod mock;
+pub mod probe;
 pub mod real;
 
 use async_trait::async_trait;
