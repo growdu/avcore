@@ -10,7 +10,7 @@
 //! - 其它非 2xx → `ProviderUpstream`（exit 11）；超时 → `ProviderTimeout`（exit 12）
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use base64::Engine;
@@ -22,6 +22,41 @@ use super::{
 };
 use crate::config::{Config, ProviderCfg};
 use crate::error::{AvcError, AvcResult};
+use crate::svc::health::{parse_retry_after, rate_limit_upsert, record, Status};
+
+// ── Passive health/rate-limit hooks (best-effort) ────────────────
+//
+// Provider hook 层在 chat() / embed() / create() 等返回 error 时**被动**写
+// `provider_health` / `provider_rate_limit` 表，供 daemon 健康探测和前端查询。
+// 设计要点：
+// - 第一次调用时懒打开默认 DB；失败 → 用 in-memory DB fallback（best-effort）。
+// - 写失败一律 `.ok()` 吞掉，绝不影响主调用方 error 返回与 exit code。
+// - 业务错误的原 `Err(...)` 必须原样保留（不改 variant，不改 exit code）。
+fn db_conn() -> &'static std::sync::Mutex<rusqlite::Connection> {
+    use std::sync::{Mutex, OnceLock};
+    static POOL: OnceLock<Mutex<rusqlite::Connection>> = OnceLock::new();
+    POOL.get_or_init(|| {
+        let conn = crate::db::open_default().unwrap_or_else(|_| {
+            // Fall back to in-memory so hooks don't crash the main process.
+            rusqlite::Connection::open_in_memory().expect("in-mem")
+        });
+        Mutex::new(conn)
+    })
+}
+
+/// Best-effort record wrapper：拿不到锁 / 写失败一律静默吞掉，绝不影响主调用方。
+fn hook_record(key: &str, status: Status, latency_ms: Option<i64>, err_msg: &str) {
+    if let Ok(conn) = db_conn().lock() {
+        let _ = record(&conn, key, status, latency_ms, Some(err_msg), "hook");
+    }
+}
+
+/// Best-effort rate_limit_upsert wrapper。
+fn hook_rate_limit_upsert(key: &str, retry_after_s: Option<i64>, until_ts: Option<&str>) {
+    if let Ok(conn) = db_conn().lock() {
+        let _ = rate_limit_upsert(&conn, key, retry_after_s, until_ts);
+    }
+}
 
 // ── OpenAI 兼容 LLM ──────────────────────────────────────────────
 
@@ -94,6 +129,8 @@ impl LlmProvider for OpenAiCompatLlmProvider {
     }
 
     async fn chat(&self, msgs: &[ChatMessage]) -> AvcResult<String> {
+        let provider_key = format!("llm.{}", self.name);
+        let started = Instant::now();
         let model = self.cfg.model.as_deref().unwrap_or("gpt-4o-mini");
         let url = format!("{}/chat/completions", self.base_url().trim_end_matches('/'));
 
@@ -109,16 +146,48 @@ impl LlmProvider for OpenAiCompatLlmProvider {
             .send()
             .await
             .map_err(|e| {
-                AvcError::ProviderTimeout(format!("llm {} POST {}: {}", self.name, url, e))
+                let msg = format!("llm {} POST {}: {}", self.name, url, e);
+                hook_record(
+                    &provider_key,
+                    Status::Timeout,
+                    Some(started.elapsed().as_millis() as i64),
+                    "timeout",
+                );
+                AvcError::ProviderTimeout(msg)
             })?;
         let status = resp.status();
         if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+            hook_record(
+                &provider_key,
+                Status::Auth,
+                Some(started.elapsed().as_millis() as i64),
+                "auth",
+            );
             return Err(AvcError::TokenAuth(format!(
                 "provider.llm.{}: HTTP {}",
                 self.name, status
             )));
         }
         if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            // 被动 hook：尝试解析 Retry-After 头算 until_ts
+            let retry_after_s = resp
+                .headers()
+                .get("retry-after")
+                .and_then(|h| h.to_str().ok())
+                .and_then(parse_retry_after);
+            let until_ts = retry_after_s.map(|s| {
+                use chrono::Utc;
+                (Utc::now() + chrono::Duration::seconds(s))
+                    .format("%Y-%m-%dT%H:%M:%SZ")
+                    .to_string()
+            });
+            hook_record(
+                &provider_key,
+                Status::RateLimited,
+                Some(started.elapsed().as_millis() as i64),
+                "rate",
+            );
+            hook_rate_limit_upsert(&provider_key, retry_after_s, until_ts.as_deref());
             return Err(AvcError::RateLimited(format!(
                 "provider.llm.{}: HTTP 429",
                 self.name
@@ -126,22 +195,43 @@ impl LlmProvider for OpenAiCompatLlmProvider {
         }
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
+            hook_record(
+                &provider_key,
+                Status::UpstreamError,
+                Some(started.elapsed().as_millis() as i64),
+                "upstream",
+            );
             return Err(AvcError::ProviderUpstream(format!(
                 "provider.llm.{}: HTTP {} body={}",
                 self.name, status, body
             )));
         }
         let parsed: ChatResponse = resp.json().await.map_err(|e| {
-            AvcError::ProviderUpstream(format!("provider.llm.{}: bad json: {}", self.name, e))
+            let msg = format!("provider.llm.{}: bad json: {}", self.name, e);
+            hook_record(
+                &provider_key,
+                Status::UpstreamError,
+                Some(started.elapsed().as_millis() as i64),
+                "upstream",
+            );
+            AvcError::ProviderUpstream(msg)
         })?;
-        parsed
-            .choices
-            .into_iter()
-            .next()
-            .map(|c| c.message.content)
-            .ok_or_else(|| {
-                AvcError::ProviderUpstream(format!("provider.llm.{}: empty choices", self.name))
-            })
+        let content = parsed.choices.into_iter().next().map(|c| c.message.content);
+        match content {
+            Some(c) => Ok(c),
+            None => {
+                hook_record(
+                    &provider_key,
+                    Status::UpstreamError,
+                    Some(started.elapsed().as_millis() as i64),
+                    "upstream",
+                );
+                Err(AvcError::ProviderUpstream(format!(
+                    "provider.llm.{}: empty choices",
+                    self.name
+                )))
+            }
+        }
     }
 }
 
@@ -490,13 +580,37 @@ impl AvatarProvider for OpenAiCompatAvatarProvider {
     async fn finetune(
         &self,
         _base: &super::Avatar,
-        _ref_images: &[String],
+        ref_images: &[String],
         _cfg: &super::FinetuneConfig,
     ) -> AvcResult<super::Avatar> {
-        Err(AvcError::Internal(format!(
-            "avatar.{} finetune not supported via OpenAI provider; use vendor SFT endpoint",
-            self.name
-        )))
+        // Avatar SFT 没有 OpenAI 兼容的远端端点（DALL-E / wanx / CogView 都是 create
+        // 而非 finetune）。要 finetune 就走 vendor CLI：把 cfg.binary 配成 kling-cli /
+        // doubao-cli / 自家 SFT 工具；二进制读 --ref-image 列表，submit → poll → fetch
+        // 出一张 PNG。
+        let binary = match self.cfg.binary.as_deref() {
+            Some(b) if !b.trim().is_empty() => b,
+            _ => {
+                return Err(AvcError::Internal(format!(
+                    "avatar.{} finetune requires a vendor CLI binary; configure                      [provider.avatar.{}] binary = \"...\" in avc.toml",
+                    self.name, self.name
+                )));
+            }
+        };
+        let png_bytes = run_finetune_vendor_pipeline(
+            &format!("avatar.{}", self.name),
+            binary,
+            "--ref-image",
+            ref_images,
+            "png",
+        )?;
+        Ok(super::Avatar {
+            provider: self.name.clone(),
+            provider_version: "vendor-sft".into(),
+            model_id: Some(format!("sft-{}", self.name)),
+            primary_png_b64: base64::engine::general_purpose::STANDARD.encode(&png_bytes),
+            views_zip_b64: None,
+            face_id: Some(format!("sft-{}", self.name)),
+        })
     }
 }
 
@@ -633,13 +747,38 @@ impl VoiceProvider for OpenAiCompatVoiceProvider {
     async fn finetune(
         &self,
         _base: &super::Voice,
-        _ref_audio: &[String],
+        ref_audio: &[String],
         _cfg: &super::FinetuneConfig,
     ) -> AvcResult<super::Voice> {
-        Err(AvcError::Internal(format!(
-            "voice.{} finetune not supported via OpenAI provider; use vendor endpoint",
-            self.name
-        )))
+        // Voice SFT 没有 OpenAI 兼容的远端端点（tts-1 仅 synth，不接 clone）。要
+        // finetune 就走 vendor CLI：把 cfg.binary 配成 elevenlabs-clone /
+        // doubao-voice-clone / 自家工具；二进制读 --ref-audio 列表，submit → poll
+        // → fetch 出一段 WAV。embed 由 svc::finetune::run 后续通过 embed Provider 补算。
+        let binary = match self.cfg.binary.as_deref() {
+            Some(b) if !b.trim().is_empty() => b,
+            _ => {
+                return Err(AvcError::Internal(format!(
+                    "voice.{} finetune requires a vendor CLI binary; configure                      [provider.voice.{}] binary = \"...\" in avc.toml",
+                    self.name, self.name
+                )));
+            }
+        };
+        let wav_bytes = run_finetune_vendor_pipeline(
+            &format!("voice.{}", self.name),
+            binary,
+            "--ref-audio",
+            ref_audio,
+            "wav",
+        )?;
+        Ok(super::Voice {
+            provider: self.name.clone(),
+            provider_version: "vendor-sft".into(),
+            voice_id_remote: Some(format!("sft-{}", self.name)),
+            sample_wav_b64: base64::engine::general_purpose::STANDARD.encode(&wav_bytes),
+            transcript: None,
+            embed_b64: None,
+            embed_dim: None,
+        })
     }
 }
 
@@ -972,6 +1111,122 @@ fn parse_field(stdout: &str, key: &str) -> Option<String> {
     None
 }
 
+/// 走 vendor CLI SFT 协议（`finetune submit / status / fetch` 三段式）。
+///
+/// 协议与 CliVideoProvider 的 `submit / status / fetch` 一致，仅多了一层
+/// `finetune` 子命令命名空间（避免与 video 渲染 `submit` 撞名）：
+///
+/// 1. `binary finetune submit --<ref_flag> <ref_path_1> [<ref_path_2> ...]`
+///    stdout 必须含 `task_id=...`（KV-flavor）；也容许 `data:{"task_id":"..."}` JSON。
+/// 2. `binary finetune status --task-id <id>`
+///    stdout 必须含 `status=done|pending|failed`；未 done 就 sleep 500ms 重试，
+///    5 min 超时。
+/// 3. `binary finetune fetch --task-id <id> --out <output_path>`
+///    exit 0 时 `<output_path>` 是结果文件（avatar 走 `png`、voice 走 `wav`）。
+///    读 bytes 返 Vec<u8>；调用方负责 base64 编码。
+///
+/// `ref_flag` 是 submit 那一阶段用于标 ref 素材的开关名：
+///   - 调 avatar.finetune 时是 `"--ref-image"`
+///   - 调 voice.finetune 时是 `"--ref-audio"`
+///
+/// 临时文件命名：`<temp>/avc-<provider>-finetune-<kind>-<pid>-<nanos>.<ext>`，
+/// 并发跑不会撞；返回的字节来自 `--out` 路径，fetch 后由 guard 在 drop 时清掉。
+fn run_finetune_vendor_pipeline(
+    provider_name: &str,
+    binary: &str,
+    ref_flag: &str,
+    ref_paths: &[String],
+    output_ext: &str,
+) -> AvcResult<Vec<u8>> {
+    if ref_paths.is_empty() {
+        return Err(AvcError::ProviderUpstream(format!(
+            "{}.finetune: no ref paths provided ({} must be non-empty)",
+            provider_name, ref_flag
+        )));
+    }
+    let unique = unique_suffix();
+    let out_path = std::env::temp_dir().join(format!(
+        "avc-{}-finetune-{}-{}.{}",
+        provider_name,
+        ref_flag.trim_start_matches("--"),
+        unique,
+        output_ext
+    ));
+    let _guard = TempFileGuard::new(vec![out_path.clone()]);
+
+    // 1. submit
+    let mut submit_argv: Vec<String> = vec!["finetune".into(), "submit".into()];
+    submit_argv.push(ref_flag.to_string());
+    for p in ref_paths {
+        submit_argv.push(p.clone());
+    }
+    let submit_refs: Vec<&str> = submit_argv.iter().map(String::as_str).collect();
+    let submit_out = run_vendor_cmd(binary, &submit_refs)?;
+    let task_id = parse_field(&submit_out, "task_id").ok_or_else(|| {
+        AvcError::ProviderUpstream(format!(
+            "{}.finetune: cannot parse task_id from submit stdout: {:?}",
+            provider_name, submit_out
+        ))
+    })?;
+
+    // 2. poll
+    let poll_started = std::time::Instant::now();
+    let poll_timeout = std::time::Duration::from_secs(300);
+    let poll_interval = std::time::Duration::from_millis(500);
+    loop {
+        let poll_out = run_vendor_cmd(binary, &["finetune", "status", "--task-id", &task_id])?;
+        let status = parse_field(&poll_out, "status").unwrap_or_default();
+        if status == "done" {
+            break;
+        }
+        if status == "failed" {
+            return Err(AvcError::ProviderUpstream(format!(
+                "{}.finetune task {} failed",
+                provider_name, task_id
+            )));
+        }
+        if poll_started.elapsed() > poll_timeout {
+            return Err(AvcError::ProviderTimeout(format!(
+                "{}.finetune task {} poll timeout ({}s)",
+                provider_name,
+                task_id,
+                poll_timeout.as_secs()
+            )));
+        }
+        std::thread::sleep(poll_interval);
+    }
+
+    // 3. fetch
+    let fetch_argv = [
+        "finetune".to_string(),
+        "fetch".to_string(),
+        "--task-id".to_string(),
+        task_id.clone(),
+        "--out".to_string(),
+        out_path.display().to_string(),
+    ];
+    let fetch_refs: Vec<&str> = fetch_argv.iter().map(String::as_str).collect();
+    run_vendor_cmd(binary, &fetch_refs)?;
+
+    let bytes = std::fs::read(&out_path).map_err(|e| {
+        AvcError::ProviderUpstream(format!(
+            "{}.finetune: read fetched {} {}: {}",
+            provider_name,
+            output_ext,
+            out_path.display(),
+            e
+        ))
+    })?;
+    if bytes.is_empty() {
+        return Err(AvcError::ProviderUpstream(format!(
+            "{}.finetune: fetched {} is empty",
+            provider_name, output_ext
+        )));
+    }
+    // guard 在此函数末尾 drop → 删 fetch 出的 output 文件
+    Ok(bytes)
+}
+
 pub fn make_video(cfg: &Config, name: &str) -> AvcResult<Arc<dyn VideoProvider>> {
     let pc = cfg
         .provider
@@ -1249,6 +1504,416 @@ esac
             }];
             assert!(matches!(
                 p.render(&voice, &avatar, &scenes).await,
+                Err(crate::error::AvcError::ProviderUpstream(_))
+            ));
+        });
+    }
+
+    // ── avatar vendor finetune ─────────────────────────────────────
+
+    /// avatar finetune 走 vendor CLI：mock binary 接受 `--ref-image <path>` 列表，
+    /// submit 输出 task_id=...，status 输出 status=done，fetch 把 PNG 写到 --out。
+    #[test]
+    fn cli_avatar_finetune_calls_binary_succeeds() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let bin = dir.path().join("mock_avatar_finetune.sh");
+        std::fs::write(
+            &bin,
+            "#!/bin/sh
+set -e
+case \"$1\" in
+  finetune)
+    case \"$2\" in
+      submit)
+        # 第三个 token 必为 --ref-image（avatar 协议）
+        if [ \"$3\" != \"--ref-image\" ]; then
+          echo \"avatar finetune submit: expected --ref-image, got $3\" >&2
+          exit 2
+        fi
+        # 至少要 1 个 ref-image 路径（参 caller 传的非空切片）
+        if [ \"$#\" -lt 4 ]; then
+          echo \"avatar finetune submit: --ref-image requires at least 1 path\" >&2
+          exit 2
+        fi
+        echo \"task_id=mock-avatar-ft-1\"
+        ;;
+      status)
+        echo \"status=done\"
+        ;;
+      fetch)
+        OUT=\"\"
+        while [ \"$#\" -gt 0 ]; do
+          case \"$1\" in
+            --out) OUT=\"$2\"; shift 2;;
+            *) shift;;
+          esac
+        done
+        mkdir -p \"$(dirname \"$OUT\")\"
+        printf 'MOCK_AVATAR_SFT_PNG_ftyp' > \"$OUT\"
+        head -c 256 /dev/urandom >> \"$OUT\"
+        ;;
+      *) echo \"unknown finetune sub: $2\" >&2; exit 2 ;;
+    esac
+    ;;
+  *) echo \"unknown sub: $1\" >&2; exit 2 ;;
+esac
+",
+        )
+        .expect("write mock bin");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let mut cfg = Config::default();
+        let pc = ProviderCfg {
+            binary: Some(bin.to_str().unwrap().to_string()),
+            ..Default::default()
+        };
+        cfg.provider.avatar.insert("mock".into(), pc);
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let p = make_avatar(&cfg, "mock").expect("provider");
+            let base = crate::provider::Avatar {
+                provider: "mock".into(),
+                provider_version: "stub".into(),
+                model_id: None,
+                primary_png_b64: String::new(),
+                views_zip_b64: None,
+                face_id: None,
+            };
+            // 写 2 个空 ref 文件 mock vendor 看得到的训练素材
+            let ref1 = dir.path().join("ref1.png");
+            let ref2 = dir.path().join("ref2.png");
+            std::fs::write(&ref1, b"ref1").unwrap();
+            std::fs::write(&ref2, b"ref2").unwrap();
+            let refs = vec![
+                ref1.to_str().unwrap().to_string(),
+                ref2.to_str().unwrap().to_string(),
+            ];
+            let out = p
+                .finetune(
+                    &base,
+                    &refs,
+                    &super::super::FinetuneConfig {
+                        full_retrain: false,
+                        epochs: 1,
+                        consistency_threshold: 0.85,
+                    },
+                )
+                .await
+                .expect("finetune ok");
+            assert_eq!(out.provider, "mock");
+            assert_eq!(out.provider_version, "vendor-sft");
+            assert!(out.primary_png_b64.len() > 50);
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(&out.primary_png_b64)
+                .expect("b64");
+            assert!(bytes.starts_with(b"MOCK_AVATAR_SFT_PNG_ftyp"));
+            assert!(bytes.len() >= 256);
+        });
+    }
+
+    /// avatar finetune 但没配 binary → 明确报 "requires a vendor CLI binary"，
+    /// 不静默走 OpenAI 端点（OpenAI 没有 SFT 端点）。
+    #[test]
+    fn cli_avatar_finetune_no_binary_returns_internal() {
+        let mut cfg = Config::default();
+        cfg.provider.avatar.insert(
+            "kling".into(),
+            ProviderCfg {
+                api_key: Some("sk".into()),
+                ..Default::default()
+            },
+        );
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let p = make_avatar(&cfg, "kling").expect("provider");
+            let base = crate::provider::Avatar {
+                provider: "kling".into(),
+                provider_version: "stub".into(),
+                model_id: None,
+                primary_png_b64: String::new(),
+                views_zip_b64: None,
+                face_id: None,
+            };
+            let refs = vec!["/tmp/r.png".to_string()];
+            let res = p
+                .finetune(
+                    &base,
+                    &refs,
+                    &super::super::FinetuneConfig {
+                        full_retrain: false,
+                        epochs: 1,
+                        consistency_threshold: 0.85,
+                    },
+                )
+                .await;
+            assert!(
+                matches!(res, Err(crate::error::AvcError::Internal(_))),
+                "expected Internal, got {:?}",
+                res.map(|_| "ok")
+            );
+        });
+    }
+
+    /// avatar finetune 但 ref_images 为空 → ProviderUpstream（mock shell 看 --ref-image
+    /// 后跟路径数；空切片不应 spawn）。
+    #[test]
+    fn cli_avatar_finetune_empty_refs_returns_provider_upstream() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let bin = dir.path().join("mock_avatar_finetune.sh");
+        std::fs::write(&bin, "#!/bin/sh\nexit 99\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let mut cfg = Config::default();
+        let pc = ProviderCfg {
+            binary: Some(bin.to_str().unwrap().to_string()),
+            ..Default::default()
+        };
+        cfg.provider.avatar.insert("mock".into(), pc);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let p = make_avatar(&cfg, "mock").expect("provider");
+            let base = crate::provider::Avatar {
+                provider: "mock".into(),
+                provider_version: "stub".into(),
+                model_id: None,
+                primary_png_b64: String::new(),
+                views_zip_b64: None,
+                face_id: None,
+            };
+            let res = p
+                .finetune(
+                    &base,
+                    &[],
+                    &super::super::FinetuneConfig {
+                        full_retrain: false,
+                        epochs: 1,
+                        consistency_threshold: 0.85,
+                    },
+                )
+                .await;
+            assert!(
+                matches!(res, Err(crate::error::AvcError::ProviderUpstream(_))),
+                "expected ProviderUpstream, got {:?}",
+                res.map(|_| "ok")
+            );
+        });
+    }
+
+    // ── voice vendor finetune ──────────────────────────────────────
+
+    /// voice finetune 走 vendor CLI：mock binary 接受 `--ref-audio <path>` 列表，
+    /// submit 输出 task_id=...，fetch 把 WAV 写到 --out。
+    #[test]
+    fn cli_voice_finetune_calls_binary_succeeds() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let bin = dir.path().join("mock_voice_finetune.sh");
+        std::fs::write(
+            &bin,
+            "#!/bin/sh
+set -e
+case \"$1\" in
+  finetune)
+    case \"$2\" in
+      submit)
+        if [ \"$3\" != \"--ref-audio\" ]; then
+          echo \"voice finetune submit: expected --ref-audio, got $3\" >&2
+          exit 2
+        fi
+        if [ \"$#\" -lt 4 ]; then
+          echo \"voice finetune submit: --ref-audio requires at least 1 path\" >&2
+          exit 2
+        fi
+        echo \"task_id=mock-voice-ft-1\"
+        ;;
+      status)
+        echo \"status=done\"
+        ;;
+      fetch)
+        OUT=\"\"
+        while [ \"$#\" -gt 0 ]; do
+          case \"$1\" in
+            --out) OUT=\"$2\"; shift 2;;
+            *) shift;;
+          esac
+        done
+        mkdir -p \"$(dirname \"$OUT\")\"
+        printf 'MOCK_VOICE_SFT_WAV_RIFF' > \"$OUT\"
+        head -c 256 /dev/urandom >> \"$OUT\"
+        ;;
+      *) echo \"unknown finetune sub: $2\" >&2; exit 2 ;;
+    esac
+    ;;
+  *) echo \"unknown sub: $1\" >&2; exit 2 ;;
+esac
+",
+        )
+        .expect("write mock bin");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let mut cfg = Config::default();
+        let pc = ProviderCfg {
+            binary: Some(bin.to_str().unwrap().to_string()),
+            ..Default::default()
+        };
+        cfg.provider.voice.insert("mock".into(), pc);
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let p = make_voice(&cfg, "mock").expect("provider");
+            let base = crate::provider::Voice {
+                provider: "mock".into(),
+                provider_version: "stub".into(),
+                voice_id_remote: None,
+                sample_wav_b64: String::new(),
+                transcript: None,
+                embed_b64: None,
+                embed_dim: None,
+            };
+            let ref1 = dir.path().join("ref1.wav");
+            let ref2 = dir.path().join("ref2.wav");
+            std::fs::write(&ref1, b"ref1").unwrap();
+            std::fs::write(&ref2, b"ref2").unwrap();
+            let refs = vec![
+                ref1.to_str().unwrap().to_string(),
+                ref2.to_str().unwrap().to_string(),
+            ];
+            let out = p
+                .finetune(
+                    &base,
+                    &refs,
+                    &super::super::FinetuneConfig {
+                        full_retrain: false,
+                        epochs: 1,
+                        consistency_threshold: 0.85,
+                    },
+                )
+                .await
+                .expect("finetune ok");
+            assert_eq!(out.provider, "mock");
+            assert_eq!(out.provider_version, "vendor-sft");
+            assert!(out.voice_id_remote.is_some());
+            assert!(out.sample_wav_b64.len() > 50);
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(&out.sample_wav_b64)
+                .expect("b64");
+            assert!(bytes.starts_with(b"MOCK_VOICE_SFT_WAV_RIFF"));
+        });
+    }
+
+    /// voice finetune 没配 binary → Internal（"requires a vendor CLI binary"）。
+    #[test]
+    fn cli_voice_finetune_no_binary_returns_internal() {
+        let mut cfg = Config::default();
+        cfg.provider.voice.insert(
+            "elevenlabs".into(),
+            ProviderCfg {
+                api_key: Some("sk".into()),
+                ..Default::default()
+            },
+        );
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let p = make_voice(&cfg, "elevenlabs").expect("provider");
+            let base = crate::provider::Voice {
+                provider: "elevenlabs".into(),
+                provider_version: "stub".into(),
+                voice_id_remote: None,
+                sample_wav_b64: String::new(),
+                transcript: None,
+                embed_b64: None,
+                embed_dim: None,
+            };
+            let refs = vec!["/tmp/r.wav".to_string()];
+            let res = p
+                .finetune(
+                    &base,
+                    &refs,
+                    &super::super::FinetuneConfig {
+                        full_retrain: false,
+                        epochs: 1,
+                        consistency_threshold: 0.85,
+                    },
+                )
+                .await;
+            assert!(
+                matches!(res, Err(crate::error::AvcError::Internal(_))),
+                "expected Internal, got {:?}",
+                res.map(|_| "ok")
+            );
+        });
+    }
+
+    /// voice finetune binary exit != 0 → ProviderUpstream。
+    #[test]
+    fn cli_voice_finetune_binary_failure_returns_provider_upstream() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let bin = dir.path().join("fail.sh");
+        std::fs::write(&bin, "#!/bin/sh\necho boom >&2\nexit 1\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let mut cfg = Config::default();
+        let pc = ProviderCfg {
+            binary: Some(bin.to_str().unwrap().to_string()),
+            ..Default::default()
+        };
+        cfg.provider.voice.insert("mock".into(), pc);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let p = make_voice(&cfg, "mock").expect("provider");
+            let base = crate::provider::Voice {
+                provider: "mock".into(),
+                provider_version: "stub".into(),
+                voice_id_remote: None,
+                sample_wav_b64: String::new(),
+                transcript: None,
+                embed_b64: None,
+                embed_dim: None,
+            };
+            let refs = vec!["/tmp/r.wav".to_string()];
+            let res = p
+                .finetune(
+                    &base,
+                    &refs,
+                    &super::super::FinetuneConfig {
+                        full_retrain: false,
+                        epochs: 1,
+                        consistency_threshold: 0.85,
+                    },
+                )
+                .await;
+            assert!(matches!(
+                res,
                 Err(crate::error::AvcError::ProviderUpstream(_))
             ));
         });

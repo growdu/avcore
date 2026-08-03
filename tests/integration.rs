@@ -898,6 +898,96 @@ fn provider_test_unknown_llm_name_says_not_configured() {
     );
 }
 
+/// 验证 Task 10（被动 hook）：`OpenAiCompatLlmProvider::chat` 在 token 鉴权失败
+/// (HTTP 401/403) 时**不**改变原有的 exit code / Err variant，但又 best-effort
+/// 把一条 status='auth' source='hook' 的记录落到 provider_health 表。
+#[test]
+fn hook_records_auth_on_real_401() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    let handle = std::thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+            let mut buf = [0u8; 8192];
+            let _ = stream.read(&mut buf);
+            // 返 401 Unauthorized（带 retry-after 检查不存在的副 header）
+            let resp =
+                "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            let _ = stream.write_all(resp.as_bytes());
+            let _ = stream.flush();
+        }
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let config = dir.path().join("config");
+
+    bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .arg("init")
+        .output()
+        .unwrap();
+
+    std::fs::create_dir_all(config.join("avc")).unwrap();
+    let toml = format!(
+        "[provider.llm.testhook]\napi_key = \"sk-bad\"\nmodel = \"fake\"\nbase_url = \"http://127.0.0.1:{}\"\n",
+        port
+    );
+    std::fs::write(config.join("avc/avc.toml"), toml).unwrap();
+
+    let r = bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .args(["provider", "test", "llm.testhook"])
+        .output()
+        .unwrap();
+    let _ = handle.join();
+
+    // 1. exit code 必须非 0（TokenAuth → 5）
+    assert!(
+        !r.status.success(),
+        "401 chat 必须非 0；status={:?} stderr={}",
+        r.status.code(),
+        String::from_utf8_lossy(&r.stderr)
+    );
+
+    // 2. 必须没有 panic 日志（hook 失败要 silently .ok()）。
+    let stderr = String::from_utf8_lossy(&r.stderr);
+    assert!(
+        !stderr.contains("panicked") && !stderr.contains("RUST_BACKTRACE"),
+        "hook 失败时不能 panic；stderr={:?}",
+        stderr
+    );
+
+    // 3. hook 应写一条 provider_health：status='auth', source='hook'
+    //    （XDG_DATA_HOME 已隔离；DB 默认路径是 $data/avc/avc.db）
+    let db_path = data.join("avc").join("avc.db");
+    assert!(
+        db_path.exists(),
+        "默认 DB 应存在；path={}",
+        db_path.display()
+    );
+    // 用 rusqlite 直接开只读 DB 取最新一条 llm.testhook 的 status / source
+    let conn = rusqlite::Connection::open(&db_path).expect("open db");
+    // 至少一条 hook + status='auth'
+    let row: (String, String) = conn
+        .query_row(
+            "SELECT status, source FROM provider_health
+             WHERE provider_key = 'llm.testhook'
+             ORDER BY id DESC LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("hook should have recorded an auth row");
+    assert_eq!(row.0, "auth", "status 必须是 auth");
+    assert_eq!(row.1, "hook", "source 必须是 hook");
+}
+
 #[test]
 fn provider_test_unsupported_dim() {
     let dir = tempfile::tempdir().unwrap();
@@ -1254,6 +1344,29 @@ fn finetune_drift_eval_with_provider_uses_embed_api() {
         .collect();
     db.execute(
         "UPDATE persona_versions SET voice_embed = ?1, voice_embed_dim = ?2
+         WHERE persona_model_id = (SELECT id FROM persona_models WHERE name = 'yu')
+           AND version = 1",
+        rusqlite::params![&blob, 3i64],
+    )
+    .unwrap();
+    // 把 [1,0,0] 写入 base v1 voice_embed。直接走 rusqlite。
+    let db_path = data.join("avc/avc.db");
+    let db = rusqlite::Connection::open(&db_path).unwrap();
+    let blob: Vec<u8> = [1.0f32, 0.0, 0.0]
+        .iter()
+        .flat_map(|f| f.to_le_bytes())
+        .collect();
+    db.execute(
+        "UPDATE persona_versions SET voice_embed = ?1, voice_embed_dim = ?2
+         WHERE persona_model_id = (SELECT id FROM persona_models WHERE name = 'yu')
+           AND version = 1",
+        rusqlite::params![&blob, 3i64],
+    )
+    .unwrap();
+
+    // 同样把 [1,0,0] 写入 style_embed (v0.3.1+ 三维 drift 都要求 base 有 embed)
+    db.execute(
+        "UPDATE persona_versions SET style_embed = ?1, style_embed_dim = ?2
          WHERE persona_model_id = (SELECT id FROM persona_models WHERE name = 'yu')
            AND version = 1",
         rusqlite::params![&blob, 3i64],
@@ -3403,4 +3516,2117 @@ fn render_accepts_valid_invocations_with_global_flags() {
         "合法 invocation 应至少落 3 条 job (3 run + 1 pack topic)；got {}",
         count
     );
+}
+
+#[test]
+fn finetune_run_via_vendor_cli_writes_target_and_publishes() {
+    // 端到端：finetune start + vendor CLI SFT + embed 真算 drift + publish。
+    // 1. init + create persona yu
+    // 2. 直接 UPDATE v1 写 voice_provider/voice_embed = [1,0,0]（base 已有 embedding）
+    // 3. INSERT 一条 audio sample 进 persona_samples（blob 字段存 wav bytes）
+    // 4. avc.toml 配 [provider.voice.mock] binary=mock_vendor.sh + [provider.embed.mock]
+    //    base_url=本地 HTTP 端点（永远返 [1,0,0]）
+    // 5. finetune start yu --scope voice --base-version 1
+    // 6. finetune run <fj_id> --embed mock → exit 0
+    // 7. 验证：target v2 voice_provider='mock'、voice_sample 含 MOCK_SFT_WAV_MAGIC、
+    //    finetune_jobs.status='succeeded'、voice_embed 被补算为 [1,0,0]
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    // 1. mock embed HTTP server（永远返 [1,0,0]，与 base 同）。
+    // v0.3.1+ 三维 drift（face / voice / style）= 3 次 HTTP 请求；server 跑 6 次
+    // accept 循环后退出（防慢收尾）。每个连接返同样的 [1,0,0] 向量。
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let embed_port = listener.local_addr().unwrap().port();
+    let embed_handle = std::thread::spawn(move || {
+        for _ in 0..2 {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let mut buf = [0u8; 8192];
+                    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+                    let _ = stream.read(&mut buf);
+                    let body = r#"{"data":[{"embedding":[1.0,0.0,0.0]}]}"#;
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(resp.as_bytes());
+                    let _ = stream.flush();
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let config = dir.path().join("config");
+
+    bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .arg("init")
+        .output()
+        .unwrap();
+    bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .args(["persona", "create", "--name", "yu"])
+        .output()
+        .unwrap();
+
+    // 2. UPDATE v1: voice_provider='mock' + voice_embed=[1,0,0]
+    let db_path = data.join("avc/avc.db");
+    let db = rusqlite::Connection::open(&db_path).unwrap();
+    let blob: Vec<u8> = [1.0f32, 0.0, 0.0]
+        .iter()
+        .flat_map(|f| f.to_le_bytes())
+        .collect();
+    db.execute(
+        "UPDATE persona_versions SET voice_provider = ?1, voice_provider_version = ?2,
+             voice_embed = ?3, voice_embed_dim = ?4
+         WHERE persona_model_id = (SELECT id FROM persona_models WHERE name = 'yu')
+           AND version = 1",
+        rusqlite::params!["mock", "stub", &blob, 3i64],
+    )
+    .unwrap();
+    // v0.3.1+ 三维 drift：face + style 也需要 base 已有 embed；这里也写 [1,0,0]
+    db.execute(
+        "UPDATE persona_versions SET face_embed = ?1, face_embed_dim = ?2,
+             style_embed = ?3, style_embed_dim = ?4
+         WHERE persona_model_id = (SELECT id FROM persona_models WHERE name = 'yu')
+           AND version = 1",
+        rusqlite::params![&blob, 3i64, &blob, 3i64],
+    )
+    .unwrap();
+
+    // 3. INSERT audio sample
+    let sample_id = format!("sm_{}", ulid::Ulid::new().to_string().to_lowercase());
+    db.execute(
+        "INSERT INTO persona_samples (id, persona_model_id, kind, blob, blob_mime, source, created_at)
+         VALUES (?1, (SELECT id FROM persona_models WHERE name = 'yu'),
+                 'audio', ?2, 'audio/wav', 'test', '2026-08-01T00:00:00Z')",
+        rusqlite::params![&sample_id, &b"sample-audio-bytes".to_vec()],
+    )
+    .unwrap();
+    drop(db);
+
+    // 4. mock vendor CLI for voice SFT
+    let mock_bin = dir.path().join("mock_voice_ft.sh");
+    std::fs::write(
+        &mock_bin,
+        "#!/bin/sh
+set -e
+case \"$1\" in
+  finetune)
+    case \"$2\" in
+      submit)
+        if [ \"$3\" != \"--ref-audio\" ]; then
+          echo \"expected --ref-audio, got $3\" >&2; exit 2
+        fi
+        echo \"task_id=mock-vendor-ft-1\"
+        ;;
+      status) echo \"status=done\" ;;
+      fetch)
+        OUT=\"\"
+        while [ \"$#\" -gt 0 ]; do
+          case \"$1\" in
+            --out) OUT=\"$2\"; shift 2;;
+            *) shift;;
+          esac
+        done
+        mkdir -p \"$(dirname \"$OUT\")\"
+        printf 'MOCK_SFT_WAV_MAGIC' > \"$OUT\"
+        head -c 256 /dev/urandom >> \"$OUT\"
+        ;;
+      *) echo \"unknown $2\" >&2; exit 2 ;;
+    esac
+    ;;
+  *) echo \"unknown $1\" >&2; exit 2 ;;
+esac
+",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&mock_bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    // 写 avc.toml
+    std::fs::create_dir_all(config.join("avc")).unwrap();
+    let toml = format!(
+        "[provider.voice.mock]\nbinary = \"{}\"\n[provider.embed.mock]\napi_key = \"sk\"\nmodel = \"mock\"\nbase_url = \"http://127.0.0.1:{}\"\n",
+        mock_bin.to_str().unwrap(),
+        embed_port,
+    );
+    std::fs::write(config.join("avc/avc.toml"), toml).unwrap();
+
+    // 5. finetune start
+    let r = bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .args([
+            "finetune",
+            "start",
+            "yu",
+            "--base-version",
+            "1",
+            "--scope",
+            "voice",
+            "--threshold",
+            "0.5", // 低阈值：base [1,0,0] vs new [1,0,0] = 1.0 > 0.5
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        r.status.success(),
+        "finetune start: stderr={}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&r.stdout);
+    let fj_id: String = serde_json::from_str::<serde_json::Value>(&stdout).unwrap()
+        ["finetune_job_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // 6. finetune run --embed mock
+    let r = bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .args(["finetune", "run", &fj_id, "--embed", "mock"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&r.stderr);
+    let stdout = String::from_utf8_lossy(&r.stdout);
+    assert!(
+        r.status.success(),
+        "finetune run 应成功；status={:?}, stdout={}, stderr={}",
+        r.status.code(),
+        stdout,
+        stderr
+    );
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(parsed["status"], "succeeded");
+    assert_eq!(parsed["scopes_processed"][0], "voice");
+    assert_eq!(parsed["samples_used"], 1);
+    assert!(
+        (parsed["voice_cosine"].as_f64().unwrap() - 1.0).abs() < 1e-6,
+        "voice_cosine 应 ≈ 1.0；got {}",
+        parsed["voice_cosine"]
+    );
+
+    // 7. 验证 DB：target v2 voice_provider/voice_sample
+    let db = rusqlite::Connection::open(&db_path).unwrap();
+    let (vp, sample): (Option<String>, Option<Vec<u8>>) = db
+        .query_row(
+            "SELECT voice_provider, voice_sample FROM persona_versions pv
+             JOIN persona_models pm ON pm.id = pv.persona_model_id
+             WHERE pm.name = 'yu' AND pv.version = 2",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(vp.as_deref(), Some("mock"));
+    let sample = sample.expect("voice_sample 应非空");
+    assert!(
+        sample.starts_with(b"MOCK_SFT_WAV_MAGIC"),
+        "voice_sample 前缀"
+    );
+    assert!(sample.len() >= 256);
+
+    // 验证 v2 已 ready
+    let v2_status: String = db
+        .query_row(
+            "SELECT pv.status FROM persona_versions pv
+             JOIN persona_models pm ON pm.id = pv.persona_model_id
+             WHERE pm.name = 'yu' AND pv.version = 2",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(v2_status, "ready", "v2 应 ready after successful SFT");
+
+    // 验证 finetune_jobs.status = 'succeeded' + voice_embed 已补算
+    let row = db
+        .query_row(
+            "SELECT fj.status, pv.voice_embed_dim FROM finetune_jobs fj
+             LEFT JOIN persona_versions pv
+               ON pv.persona_model_id = fj.persona_model_id
+              AND pv.version = fj.target_version
+             WHERE fj.id = ?",
+            [&fj_id],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<i64>>(1)?)),
+        )
+        .unwrap();
+    let (fj_status, voice_embed_dim) = row;
+    assert_eq!(fj_status, "succeeded");
+    assert_eq!(
+        voice_embed_dim,
+        Some(3),
+        "voice_embed_dim=3（mock 返 3 维向量）"
+    );
+
+    let _ = embed_handle.join();
+}
+
+#[test]
+fn finetune_run_without_embed_arg_for_voice_scope_errors() {
+    // voice scope 跑 finetune run 但不传 --embed → Arg 错（voice drift 缺 embed provider
+    // 无法算 cosine），并保持 target v2 在 building 状态（不 commit 也不 rollback）。
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let config = dir.path().join("config");
+
+    bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .arg("init")
+        .output()
+        .unwrap();
+    bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .args(["persona", "create", "--name", "yu"])
+        .output()
+        .unwrap();
+
+    // 写 v1 voice_provider（不写 voice_embed 没事，因为 run 在 drift 之前会先要求 --embed）
+    let db_path = data.join("avc/avc.db");
+    let db = rusqlite::Connection::open(&db_path).unwrap();
+    db.execute(
+        "UPDATE persona_versions SET voice_provider = 'mock', voice_provider_version = 'stub'
+         WHERE persona_model_id = (SELECT id FROM persona_models WHERE name = 'yu')
+           AND version = 1",
+        [],
+    )
+    .unwrap();
+
+    // 不加 audio sample 也行，drift 之前会先报 no samples；但我们要测的是 drift 路径
+    // → 加一条 audio sample 让 svc 跑到 drift 那一步。
+    let sample_id = format!("sm_{}", ulid::Ulid::new().to_string().to_lowercase());
+    db.execute(
+        "INSERT INTO persona_samples (id, persona_model_id, kind, blob, blob_mime, source, created_at)
+         VALUES (?1, (SELECT id FROM persona_models WHERE name = 'yu'),
+                 'audio', ?2, 'audio/wav', 'test', '2026-08-01T00:00:00Z')",
+        rusqlite::params![&sample_id, &b"sample".to_vec()],
+    )
+    .unwrap();
+    drop(db);
+
+    // mock vendor CLI
+    let mock_bin = dir.path().join("mock_voice_ft.sh");
+    std::fs::write(
+        &mock_bin,
+        "#!/bin/sh
+case \"$1\" in
+  finetune) case \"$2\" in submit) echo \"task_id=t1\" ;; status) echo \"status=done\" ;;
+    fetch)
+      OUT=\"\"
+      while [ \"$#\" -gt 0 ]; do case \"$1\" in --out) OUT=\"$2\"; shift 2;; *) shift;; esac; done
+      mkdir -p \"$(dirname \"$OUT\")\"; printf 'MOCK' > \"$OUT\" ;; esac ;;
+esac
+",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&mock_bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    std::fs::create_dir_all(config.join("avc")).unwrap();
+    let toml = format!(
+        "[provider.voice.mock]\nbinary = \"{}\"\n",
+        mock_bin.to_str().unwrap(),
+    );
+    std::fs::write(config.join("avc/avc.toml"), toml).unwrap();
+
+    let r = bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .args([
+            "finetune",
+            "start",
+            "yu",
+            "--base-version",
+            "1",
+            "--scope",
+            "voice",
+        ])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&r.stdout);
+    let fj_id: String = serde_json::from_str::<serde_json::Value>(&stdout).unwrap()
+        ["finetune_job_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let r = bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .args(["finetune", "run", &fj_id]) // 不传 --embed
+        .output()
+        .unwrap();
+    assert_eq!(
+        r.status.code(),
+        Some(2),
+        "缺 --embed 应 Arg (exit 2); 实际={:?}, stderr={}",
+        r.status.code(),
+        String::from_utf8_lossy(&r.stderr)
+    );
+
+    // 验证 fj 仍在 running（未被 publish 改写）
+    let db = rusqlite::Connection::open(&db_path).unwrap();
+    let status: String = db
+        .query_row(
+            "SELECT status FROM finetune_jobs WHERE id = ?",
+            [&fj_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(status, "running", "缺 --embed 时 fj 应保持 running");
+}
+
+#[test]
+fn job_export_to_s3_target_invokes_upload_cmd() {
+    // 端到端：`avc job export <job_id> --target s3://bucket/prefix/` 走真 upload_cmd。
+    // mock uploader 写文件到 tmp/bucket/prefix/，assert 落到对的地方。
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let config = dir.path().join("config");
+    bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .arg("init")
+        .output()
+        .unwrap();
+    bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .args(["persona", "create", "--name", "yu"])
+        .output()
+        .unwrap();
+
+    // 直接 DB 写一个 succeeded job + 2 个 artifacts
+    let db_path = data.join("avc/avc.db");
+    let db = rusqlite::Connection::open(&db_path).unwrap();
+    let pid: String = db
+        .query_row("SELECT id FROM persona_models WHERE name='yu'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    let jid = format!("job_{}", ulid::Ulid::new().to_string().to_lowercase());
+    db.execute(
+        "INSERT INTO jobs (id, persona_model_id, persona_version, status, created_at)
+         VALUES (?1, ?2, 1, 'succeeded', '2026-08-01T00:00:00Z')",
+        rusqlite::params![&jid, &pid],
+    )
+    .unwrap();
+    for (kind, name, blob) in [
+        ("clip", "i2v", b"MOCK_S3_CLIP_BLOB".to_vec()),
+        ("audio", "tts", b"MOCK_S3_TTS_BLOB".to_vec()),
+    ] {
+        let aid = format!("art_{}", ulid::Ulid::new().to_string().to_lowercase());
+        db.execute(
+            "INSERT INTO artifacts (id, job_id, kind, name, content, byte_size, mime, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'application/octet-stream', '2026-08-01T00:00:00Z')",
+            rusqlite::params![&aid, &jid, kind, name, &blob, &(blob.len() as i64)],
+        )
+        .unwrap();
+    }
+    drop(db);
+
+    // mock s3 uploader + log
+    let dest_root = dir.path().join("bucket");
+    let log_path = dir.path().join("upload.log");
+    let uploader = dir.path().join("mock_s3.sh");
+    let script = format!(
+        r#"#!/bin/sh
+LOCAL=$1
+BUCKET=$2
+PREFIX=$3
+NAME=$4
+mkdir -p "{dest}/$BUCKET/$PREFIX"
+cp "$LOCAL" "{dest}/$BUCKET/$PREFIX$NAME"
+printf '%s\n' "$NAME" >> {log}
+"#,
+        dest = dest_root.display(),
+        log = log_path.display(),
+    );
+    std::fs::write(&uploader, script).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&uploader, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    // 写 avc.toml 配 upload_cmd
+    std::fs::create_dir_all(config.join("avc")).unwrap();
+    let toml = format!(
+        r#"[export.s3]
+upload_cmd = "{} {{local}} {{bucket}} {{prefix}} {{name}}"
+"#,
+        uploader.display(),
+    );
+    std::fs::write(config.join("avc/avc.toml"), toml).unwrap();
+
+    // 跑 export --target s3://
+    let r = bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .args([
+            "job",
+            "export",
+            &jid,
+            "--target",
+            "s3://my-bucket/videos/2026/",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        r.status.success(),
+        "export 应成功；status={:?}, stdout={}, stderr={}",
+        r.status.code(),
+        String::from_utf8_lossy(&r.stdout),
+        String::from_utf8_lossy(&r.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&r.stdout);
+    assert!(
+        stdout.contains("\"files\": 2"),
+        "files=2; stdout={}",
+        stdout
+    );
+    assert!(
+        stdout.contains("s3://my-bucket/videos/2026/"),
+        "target label; stdout={}",
+        stdout
+    );
+
+    // 验证：bucket/my-bucket/videos/2026/ 下有 2 个 .bin
+    let placed: Vec<_> = std::fs::read_dir(dest_root.join("my-bucket/videos/2026"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .collect();
+    assert_eq!(placed.len(), 2, "应 2 文件到 s3 mock；placed={:?}", placed);
+    for f in &placed {
+        assert!(f.ends_with(".bin"), "后缀 .bin；got {}", f);
+    }
+
+    // 验证 log 记录 2 次调用
+    let log = std::fs::read_to_string(&log_path).unwrap();
+    let lines: Vec<&str> = log.lines().collect();
+    assert_eq!(lines.len(), 2, "upload_cmd 调 2 次；log={}", log);
+}
+
+#[test]
+fn job_export_rejects_both_out_and_target() {
+    // --out 和 --target 互斥；同时给 → Arg 错。
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let config = dir.path().join("config");
+    bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .arg("init")
+        .output()
+        .unwrap();
+    let r = bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .args([
+            "job",
+            "export",
+            "job_xxx",
+            "--out",
+            "/tmp/xxx",
+            "--target",
+            "s3://b/p/",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        r.status.code(),
+        Some(2),
+        "--out + --target 应 Arg (exit 2); 实际={:?}",
+        r.status.code()
+    );
+}
+
+#[test]
+fn job_export_requires_out_or_target() {
+    // 既不 --out 也不 --target → Arg 错。
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let config = dir.path().join("config");
+    bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .arg("init")
+        .output()
+        .unwrap();
+    let r = bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .args(["job", "export", "job_xxx"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        r.status.code(),
+        Some(2),
+        "既不 --out 也不 --target 应 Arg (exit 2); 实际={:?}",
+        r.status.code()
+    );
+}
+
+#[test]
+fn finetune_show_returns_job_details() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let config = dir.path().join("config");
+    bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .arg("init")
+        .output()
+        .unwrap();
+    bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .args(["persona", "create", "--name", "yu"])
+        .output()
+        .unwrap();
+
+    let r = bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .args([
+            "finetune",
+            "start",
+            "yu",
+            "--base-version",
+            "1",
+            "--scope",
+            "voice",
+        ])
+        .output()
+        .unwrap();
+    let fj_id: String =
+        serde_json::from_str::<serde_json::Value>(&String::from_utf8_lossy(&r.stdout)).unwrap()
+            ["finetune_job_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+    let r = bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .args(["finetune", "show", &fj_id])
+        .output()
+        .unwrap();
+    assert!(
+        r.status.success(),
+        "show 应成功；stderr={}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&r.stdout).unwrap();
+    assert_eq!(v["id"], fj_id);
+    assert_eq!(v["persona"], "yu");
+    assert_eq!(v["base_version"], 1);
+    assert_eq!(v["target_version"], 2);
+    assert_eq!(v["status"], "running");
+    assert_eq!(v["scope"][0], "voice");
+    assert!(v["started_at"].is_string());
+}
+
+#[test]
+fn finetune_show_unknown_returns_notfound() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let config = dir.path().join("config");
+    bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .arg("init")
+        .output()
+        .unwrap();
+    let r = bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .args(["finetune", "show", "fj_doesnotexist"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        r.status.code(),
+        Some(3),
+        "NotFound 应 exit 3；got {:?}",
+        r.status.code()
+    );
+}
+
+#[test]
+fn finetune_report_without_drift_conflicts() {
+    // 没 run/publish 前 report 没数据 → Conflict (exit 4)
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let config = dir.path().join("config");
+    bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .arg("init")
+        .output()
+        .unwrap();
+    bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .args(["persona", "create", "--name", "yu"])
+        .output()
+        .unwrap();
+    let r = bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .args(["finetune", "start", "yu", "--base-version", "1"])
+        .output()
+        .unwrap();
+    let fj_id: String =
+        serde_json::from_str::<serde_json::Value>(&String::from_utf8_lossy(&r.stdout)).unwrap()
+            ["finetune_job_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+    let r = bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .args(["finetune", "report", &fj_id])
+        .output()
+        .unwrap();
+    assert_eq!(
+        r.status.code(),
+        Some(4),
+        "no drift → Conflict (exit 4)；got {:?}",
+        r.status.code()
+    );
+}
+
+#[test]
+fn finetune_report_after_publish_returns_drift_json() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let config = dir.path().join("config");
+    bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .arg("init")
+        .output()
+        .unwrap();
+    bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .args(["persona", "create", "--name", "yu"])
+        .output()
+        .unwrap();
+    let r = bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .args(["finetune", "start", "yu", "--base-version", "1"])
+        .output()
+        .unwrap();
+    let fj_id: String =
+        serde_json::from_str::<serde_json::Value>(&String::from_utf8_lossy(&r.stdout)).unwrap()
+            ["finetune_job_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+    bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .args(["finetune", "publish", &fj_id, "--passed"])
+        .output()
+        .unwrap();
+
+    let r = bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .args(["finetune", "report", &fj_id])
+        .output()
+        .unwrap();
+    assert!(r.status.success(), "report 应成功");
+    let v: serde_json::Value = serde_json::from_slice(&r.stdout).unwrap();
+    assert_eq!(v["passed"], true);
+    assert_eq!(v["voice"], 0.9);
+}
+
+#[test]
+fn finetune_cancel_running_then_re_cancelled_conflicts() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let config = dir.path().join("config");
+    bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .arg("init")
+        .output()
+        .unwrap();
+    bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .args(["persona", "create", "--name", "yu"])
+        .output()
+        .unwrap();
+    let r = bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .args(["finetune", "start", "yu", "--base-version", "1"])
+        .output()
+        .unwrap();
+    let fj_id: String =
+        serde_json::from_str::<serde_json::Value>(&String::from_utf8_lossy(&r.stdout)).unwrap()
+            ["finetune_job_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+    // 第一次 cancel：running → cancelled
+    let r = bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .args(["finetune", "cancel", &fj_id])
+        .output()
+        .unwrap();
+    assert!(
+        r.status.success(),
+        "cancel running 应成功；stderr={}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+
+    // 第二次 cancel：cancelled → Conflict
+    let r = bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .args(["finetune", "cancel", &fj_id])
+        .output()
+        .unwrap();
+    assert_eq!(
+        r.status.code(),
+        Some(4),
+        "已 cancelled 不能再 cancel；got {:?}",
+        r.status.code()
+    );
+}
+
+#[test]
+fn finetune_cancel_after_publish_conflicts() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let config = dir.path().join("config");
+    bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .arg("init")
+        .output()
+        .unwrap();
+    bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .args(["persona", "create", "--name", "yu"])
+        .output()
+        .unwrap();
+    let r = bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .args(["finetune", "start", "yu", "--base-version", "1"])
+        .output()
+        .unwrap();
+    let fj_id: String =
+        serde_json::from_str::<serde_json::Value>(&String::from_utf8_lossy(&r.stdout)).unwrap()
+            ["finetune_job_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+    bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .args(["finetune", "publish", &fj_id, "--passed"])
+        .output()
+        .unwrap();
+
+    let r = bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .args(["finetune", "cancel", &fj_id])
+        .output()
+        .unwrap();
+    assert_eq!(
+        r.status.code(),
+        Some(4),
+        "succeeded 不能 cancel；got {:?}",
+        r.status.code()
+    );
+}
+
+#[test]
+fn iterate_show_and_cancel_happy_paths() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let config = dir.path().join("config");
+    bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .arg("init")
+        .output()
+        .unwrap();
+    bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .args(["persona", "create", "--name", "yu"])
+        .output()
+        .unwrap();
+
+    // 直接 DB 写一条 iterate_jobs（queued）
+    let db_path = data.join("avc/avc.db");
+    let db = rusqlite::Connection::open(&db_path).unwrap();
+    let ij_id = format!("ij_{}", ulid::Ulid::new().to_string().to_lowercase());
+    db.execute(
+        "INSERT INTO iterate_jobs (id, persona_model_id, target_version, changes_json, status, started_at)
+         SELECT ?1, id, 1, '{}' , 'queued', '2026-08-01T00:00:00Z'
+         FROM persona_models WHERE name = 'yu'",
+        rusqlite::params![&ij_id],
+    ).unwrap();
+    drop(db);
+
+    // show
+    let r = bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .args(["iterate", "show", &ij_id])
+        .output()
+        .unwrap();
+    assert!(
+        r.status.success(),
+        "show 应成功；stderr={}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&r.stdout).unwrap();
+    assert_eq!(v["id"], ij_id);
+    assert_eq!(v["status"], "queued");
+    assert_eq!(v["target_version"], 1);
+
+    // cancel
+    let r = bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .args(["iterate", "cancel", &ij_id])
+        .output()
+        .unwrap();
+    assert!(
+        r.status.success(),
+        "cancel 应成功；stderr={}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+
+    // 再 cancel 一次 → Conflict
+    let r = bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .args(["iterate", "cancel", &ij_id])
+        .output()
+        .unwrap();
+    assert_eq!(
+        r.status.code(),
+        Some(4),
+        "已 cancelled 不能再 cancel；got {:?}",
+        r.status.code()
+    );
+}
+
+#[test]
+fn iterate_show_unknown_returns_notfound() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let config = dir.path().join("config");
+    bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .arg("init")
+        .output()
+        .unwrap();
+    let r = bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .args(["iterate", "show", "ij_xxx"])
+        .output()
+        .unwrap();
+    assert_eq!(r.status.code(), Some(3), "NotFound 应 exit 3");
+}
+
+#[test]
+fn job_cancel_queued_and_wait_until_succeeded() {
+    // 1. 起一个 job（手动 status='queued'）→ cancel → 再 cancel → Conflict
+    // 2. 起一个 job 立刻 status='succeeded' → wait --until succeeded → exit 0
+    // 3. 起一个 job 立刻 status='failed' → wait --until succeeded → exit 4
+    // 4. 起一个 job 立刻 status='running' → wait 超时短 → exit 4 (timeout)
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let config = dir.path().join("config");
+    bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .arg("init")
+        .output()
+        .unwrap();
+    bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .args(["persona", "create", "--name", "yu"])
+        .output()
+        .unwrap();
+
+    let db_path = data.join("avc/avc.db");
+    let db = rusqlite::Connection::open(&db_path).unwrap();
+    let pid: String = db
+        .query_row("SELECT id FROM persona_models WHERE name='yu'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+
+    // (1) job queued → cancel 成功；再 cancel → Conflict
+    let jid1 = format!("job_{}", ulid::Ulid::new().to_string().to_lowercase());
+    db.execute(
+        "INSERT INTO jobs (id, persona_model_id, persona_version, status, created_at)
+         VALUES (?1, ?2, 1, 'queued', '2026-08-01T00:00:00Z')",
+        rusqlite::params![&jid1, &pid],
+    )
+    .unwrap();
+    let r = bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .args(["job", "cancel", &jid1])
+        .output()
+        .unwrap();
+    assert!(
+        r.status.success(),
+        "cancel queued 应成功；stderr={}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+    let r = bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .args(["job", "cancel", &jid1])
+        .output()
+        .unwrap();
+    assert_eq!(
+        r.status.code(),
+        Some(4),
+        "已 cancelled 不能再 cancel；got {:?}",
+        r.status.code()
+    );
+
+    // (2) job 立刻 succeeded → wait --until succeeded 立即返 → exit 0
+    let jid2 = format!("job_{}", ulid::Ulid::new().to_string().to_lowercase());
+    db.execute(
+        "INSERT INTO jobs (id, persona_model_id, persona_version, status, created_at, finished_at)
+         VALUES (?1, ?2, 1, 'succeeded', '2026-08-01T00:00:00Z', '2026-08-01T00:00:00Z')",
+        rusqlite::params![&jid2, &pid],
+    )
+    .unwrap();
+    let r = bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .args([
+            "job",
+            "wait",
+            &jid2,
+            "--until",
+            "succeeded",
+            "--timeout",
+            "5",
+        ])
+        .output()
+        .unwrap();
+    assert!(r.status.success(), "wait succeeded 应成功");
+    let v: serde_json::Value = serde_json::from_slice(&r.stdout).unwrap();
+    assert_eq!(v["status"], "succeeded");
+    assert!(v["elapsed_secs"].as_u64().unwrap() < 5);
+
+    // (3) job failed → wait --until succeeded 立即发 Conflict
+    let jid3 = format!("job_{}", ulid::Ulid::new().to_string().to_lowercase());
+    db.execute(
+        "INSERT INTO jobs (id, persona_model_id, persona_version, status, created_at, finished_at)
+         VALUES (?1, ?2, 1, 'failed', '2026-08-01T00:00:00Z', '2026-08-01T00:00:00Z')",
+        rusqlite::params![&jid3, &pid],
+    )
+    .unwrap();
+    let r = bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .args([
+            "job",
+            "wait",
+            &jid3,
+            "--until",
+            "succeeded",
+            "--timeout",
+            "5",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        r.status.code(),
+        Some(4),
+        "等 succeeded 但实际 failed → Conflict (exit 4)"
+    );
+
+    // (4) job running + 短 timeout → wait 超时
+    let jid4 = format!("job_{}", ulid::Ulid::new().to_string().to_lowercase());
+    db.execute(
+        "INSERT INTO jobs (id, persona_model_id, persona_version, status, created_at)
+         VALUES (?1, ?2, 1, 'running', '2026-08-01T00:00:00Z')",
+        rusqlite::params![&jid4, &pid],
+    )
+    .unwrap();
+    let r = bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .args([
+            "job",
+            "wait",
+            &jid4,
+            "--until",
+            "succeeded",
+            "--timeout",
+            "1",
+            "--poll",
+            "200",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        r.status.code(),
+        Some(4),
+        "running 短 timeout → Conflict (exit 4)"
+    );
+
+    // (5) cancel 一个 running 状态 → Conflict（只允许 queued）
+    let r = bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .args(["job", "cancel", &jid4])
+        .output()
+        .unwrap();
+    assert_eq!(
+        r.status.code(),
+        Some(4),
+        "running 不能 cancel；got {:?}",
+        r.status.code()
+    );
+
+    drop(db);
+}
+
+#[test]
+fn job_wait_unknown_id_returns_notfound() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let config = dir.path().join("config");
+    bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .arg("init")
+        .output()
+        .unwrap();
+    let r = bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .args(["job", "wait", "job_xxx", "--until", "succeeded"])
+        .output()
+        .unwrap();
+    assert_eq!(r.status.code(), Some(3), "NotFound 应 exit 3");
+}
+
+#[test]
+fn job_wait_missing_until_flag_arg_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let config = dir.path().join("config");
+    bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .arg("init")
+        .output()
+        .unwrap();
+    // --until 但没给值
+    let r = bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .args(["job", "wait", "job_xxx", "--until"])
+        .output()
+        .unwrap();
+    assert_eq!(r.status.code(), Some(2), "缺 --until 值应 Arg (exit 2)");
+}
+
+#[test]
+fn drift_writes_all_three_dim_embeds_on_run() {
+    // 端到端 voice-only finetune run：除了 voice_embed，还应写 style_embed
+    // （face dim 不写因为 scope=voice 不含 avatar）。
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    // mock embed server (2 次调用：voice + style)
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let handle = std::thread::spawn(move || {
+        for _ in 0..2 {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 8192];
+                let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+                let _ = stream.read(&mut buf);
+                let body = r#"{"data":[{"embedding":[1.0,0.0,0.0]}]}"#;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(), body
+                );
+                let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.flush();
+            }
+        }
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let config = dir.path().join("config");
+    bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .arg("init")
+        .output()
+        .unwrap();
+    bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .args(["persona", "create", "--name", "yu"])
+        .output()
+        .unwrap();
+
+    // 写 v1: voice_provider / voice_embed / style_embed 都是 [1,0,0]
+    let db_path = data.join("avc/avc.db");
+    let db = rusqlite::Connection::open(&db_path).unwrap();
+    let blob: Vec<u8> = [1.0f32, 0.0, 0.0]
+        .iter()
+        .flat_map(|f| f.to_le_bytes())
+        .collect();
+    db.execute(
+        "UPDATE persona_versions SET voice_provider = 'mock', voice_provider_version = 'stub',
+             voice_embed = ?1, voice_embed_dim = 3,
+             style_embed = ?1, style_embed_dim = 3
+         WHERE persona_model_id = (SELECT id FROM persona_models WHERE name = 'yu') AND version = 1",
+        rusqlite::params![&blob],
+    ).unwrap();
+
+    // 加 audio sample
+    let sid = format!("sm_{}", ulid::Ulid::new().to_string().to_lowercase());
+    db.execute(
+        "INSERT INTO persona_samples (id, persona_model_id, kind, blob, blob_mime, source, created_at)
+         VALUES (?1, (SELECT id FROM persona_models WHERE name = 'yu'),
+                 'audio', ?2, 'audio/wav', 'test', '2026-08-01T00:00:00Z')",
+        rusqlite::params![&sid, &b"audio".to_vec()],
+    ).unwrap();
+    drop(db);
+
+    // mock vendor CLI for voice SFT
+    let mock_bin = dir.path().join("mock_voice_ft.sh");
+    std::fs::write(
+        &mock_bin,
+        r#"#!/bin/sh
+case "$1" in
+  finetune)
+    case "$2" in
+      submit) echo "task_id=t1" ;;
+      status) echo "status=done" ;;
+      fetch)
+        OUT=""
+        while [ "$#" -gt 0 ]; do case "$1" in --out) OUT="$2"; shift 2;; *) shift;; esac; done
+        mkdir -p "$(dirname "$OUT")"; printf 'MOCK_WAV' > "$OUT" ;;
+    esac ;;
+esac
+"#,
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&mock_bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    // avc.toml
+    std::fs::create_dir_all(config.join("avc")).unwrap();
+    let toml = format!(
+        r#"[provider.voice.mock]
+binary = "{}"
+[provider.embed.mock]
+api_key = "sk"
+model = "mock"
+base_url = "http://127.0.0.1:{}"
+"#,
+        mock_bin.display(),
+        port,
+    );
+    std::fs::write(config.join("avc/avc.toml"), toml).unwrap();
+
+    // start
+    let r = bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .args([
+            "finetune",
+            "start",
+            "yu",
+            "--base-version",
+            "1",
+            "--scope",
+            "voice",
+            "--threshold",
+            "0.5",
+        ])
+        .output()
+        .unwrap();
+    let fj_id: String =
+        serde_json::from_str::<serde_json::Value>(&String::from_utf8_lossy(&r.stdout)).unwrap()
+            ["finetune_job_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+    // run
+    let r = bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .args(["finetune", "run", &fj_id, "--embed", "mock"])
+        .output()
+        .unwrap();
+    assert!(
+        r.status.success(),
+        "run 应成功；status={:?}, stderr={}",
+        r.status.code(),
+        String::from_utf8_lossy(&r.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&r.stdout).unwrap();
+    assert_eq!(v["status"], "succeeded");
+    // 3 个 cosines 都应该有
+    assert!(
+        v["voice_cosine"].as_f64().is_some(),
+        "voice_cosine 应有数；got {:?}",
+        v
+    );
+    assert!(
+        v["face_cosine"].is_null(),
+        "scope=voice 时 face_cosine 应 None；got {:?}",
+        v
+    );
+    assert!(
+        v["style_cosine"].as_f64().is_some(),
+        "style_cosine 应有数；got {:?}",
+        v
+    );
+    assert!((v["voice_cosine"].as_f64().unwrap() - 1.0).abs() < 1e-6);
+    assert!((v["style_cosine"].as_f64().unwrap() - 1.0).abs() < 1e-6);
+
+    // 验证 DB：v2 有 voice_embed + style_embed（face_embed 留空，因为 scope 不含 avatar）
+    let db = rusqlite::Connection::open(&db_path).unwrap();
+    let (voice_dim, style_dim, face_dim): (Option<i64>, Option<i64>, Option<i64>) = db
+        .query_row(
+            "SELECT voice_embed_dim, style_embed_dim, face_embed_dim
+         FROM persona_versions pv
+         JOIN persona_models pm ON pm.id = pv.persona_model_id
+         WHERE pm.name = 'yu' AND pv.version = 2",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(voice_dim, Some(3), "v2 voice_embed_dim=3");
+    assert_eq!(style_dim, Some(3), "v2 style_embed_dim=3");
+    assert!(
+        face_dim.is_none(),
+        "v2 face_embed_dim 应 None (scope 不含 avatar)"
+    );
+
+    let _ = handle.join();
+}
+
+#[test]
+fn examples_vendor_cli_templates_run_e2e() {
+    // 端到端验证 examples/vendor-cli/*.sh 模板：
+    // 1. init + create persona
+    // 2. 配 [provider.video.kling] = examples/vendor-cli/kling-video.sh
+    // 3. 配 [export.s3] upload_cmd = examples/vendor-cli/aws-s3-cp.sh
+    // 4. render run → kling-video.sh 走 submit/status/fetch → 5 个 artifacts
+    // 5. job export --target s3:// → aws-s3-cp.sh 上传 5 文件 + 写 log
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let data = dir.path().join("data");
+    let config = dir.path().join("config");
+    let s3_root = dir.path().join("s3-mirror");
+
+    let examples = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples");
+    let kling_video = examples.join("vendor-cli/kling-video.sh");
+    let aws_s3_cp = examples.join("vendor-cli/aws-s3-cp.sh");
+    assert!(
+        kling_video.exists() && aws_s3_cp.exists(),
+        "examples/vendor-cli scripts must exist; kling={} aws={}",
+        kling_video.exists(),
+        aws_s3_cp.exists()
+    );
+
+    bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .arg("init")
+        .output()
+        .unwrap();
+    bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .args(["persona", "create", "--name", "yu"])
+        .output()
+        .unwrap();
+
+    // avc.toml
+    std::fs::create_dir_all(config.join("avc")).unwrap();
+    let toml = format!(
+        r#"[provider.video.kling]
+binary = "{}"
+
+[export.s3]
+upload_cmd = "{} {{local}} {{bucket}} {{prefix}} {{name}}"
+"#,
+        kling_video.display(),
+        aws_s3_cp.display(),
+    );
+    std::fs::write(config.join("avc/avc.toml"), toml).unwrap();
+
+    // render run
+    let r = bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .env("S3_MIRROR_ROOT", &s3_root)
+        .env("S3_UPLOAD_LOG", s3_root.join("upload.log"))
+        .args([
+            "render",
+            "run",
+            "--persona",
+            "yu",
+            "--version",
+            "1",
+            "--topic",
+            "exdemo",
+            "--video-provider",
+            "kling",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        r.status.success(),
+        "render run 失败；status={:?}, stderr={}",
+        r.status.code(),
+        String::from_utf8_lossy(&r.stderr)
+    );
+    let jid: String =
+        serde_json::from_str::<serde_json::Value>(&String::from_utf8_lossy(&r.stdout)).unwrap()
+            ["job_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+    // 验证 i2v artifact 来自 kling-video.sh（mock magic）
+    let db = rusqlite::Connection::open(data.join("avc/avc.db")).unwrap();
+    let i2v_blob: Vec<u8> = db
+        .query_row(
+            "SELECT content FROM artifacts WHERE job_id = ?1 AND name = 'i2v'",
+            [&jid],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(
+        i2v_blob.starts_with(b"MOCK_KLING_MP4_ftyp"),
+        "i2v BLOB 应有 MOCK_KLING_MP4_ftyp 前缀；actual前32={:?}",
+        &i2v_blob[..32.min(i2v_blob.len())]
+    );
+
+    // job export → s3://
+    let r = bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .env("S3_MIRROR_ROOT", &s3_root)
+        .env("S3_UPLOAD_LOG", s3_root.join("upload.log"))
+        .args([
+            "job",
+            "export",
+            &jid,
+            "--target",
+            "s3://my-bucket/videos/2026/",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        r.status.success(),
+        "export 失败；stderr={}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&r.stdout).unwrap();
+    assert_eq!(v["files"], 5);
+    assert_eq!(v["target"], "s3://my-bucket/videos/2026/");
+
+    // 验证：s3 mirror 应有 5 个文件
+    let placed: Vec<_> = std::fs::read_dir(s3_root.join("my-bucket/videos/2026"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .collect();
+    assert_eq!(
+        placed.len(),
+        5,
+        "应 5 个文件到 s3 mirror；placed={:?}",
+        placed
+    );
+
+    // 验证：upload log 应有 5 行
+    let log = std::fs::read_to_string(s3_root.join("upload.log")).unwrap();
+    let lines: Vec<&str> = log.lines().collect();
+    assert_eq!(lines.len(), 5, "应 5 行 log；log={}", log);
+    for line in &lines {
+        assert!(
+            line.contains("my-bucket"),
+            "log line 应含 my-bucket；line={}",
+            line
+        );
+    }
+}
+
+// ============================================================================
+// 0.3.3 — iterate list / set-knowledge / set-manifest 覆盖 + persona show/versions
+// ============================================================================
+
+#[test]
+fn iterate_list_returns_apply_records() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let config = dir.path().join("config");
+    bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .arg("init")
+        .output()
+        .unwrap();
+    bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .args(["persona", "create", "--name", "yu"])
+        .output()
+        .unwrap();
+
+    // 空 list：返 []（不是 NotFound）
+    let r = bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .args(["iterate", "list", "yu", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        r.status.success(),
+        "空 list 应成功；stderr={}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&r.stdout).unwrap();
+    assert!(v.is_array());
+    assert_eq!(v.as_array().unwrap().len(), 0);
+
+    // apply 两次 → list 返 2 行
+    bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .args([
+            "iterate",
+            "apply",
+            "yu",
+            "--version",
+            "1",
+            "--set-persona",
+            r#"{"traits":["严谨"]}"#,
+        ])
+        .output()
+        .unwrap();
+    bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .args([
+            "iterate",
+            "apply",
+            "yu",
+            "--version",
+            "1",
+            "--set-persona",
+            r#"{"catchphrase":"直接看源码"}"#,
+        ])
+        .output()
+        .unwrap();
+    let r = bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .args(["iterate", "list", "yu", "--json"])
+        .output()
+        .unwrap();
+    assert!(r.status.success());
+    let v: serde_json::Value = serde_json::from_slice(&r.stdout).unwrap();
+    assert_eq!(v.as_array().unwrap().len(), 2);
+    // 排序：started_at DESC（最新在前）→ 第二次 apply 在 index 0
+    assert!(v[0]["id"].as_str().unwrap().starts_with("ij_"));
+    assert_eq!(v[0]["status"], "succeeded");
+    assert_eq!(v[0]["target_version"], 1);
+}
+
+#[test]
+fn iterate_list_unknown_persona_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let config = dir.path().join("config");
+    bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .arg("init")
+        .output()
+        .unwrap();
+    let r = bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .args(["iterate", "list", "nonexistent"])
+        .output()
+        .unwrap();
+    assert_eq!(r.status.code(), Some(3), "未知 persona → NotFound (exit 3)");
+}
+
+#[test]
+fn iterate_apply_set_knowledge_merges_binding() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let config = dir.path().join("config");
+    bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .arg("init")
+        .output()
+        .unwrap();
+    bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .args(["persona", "create", "--name", "yu"])
+        .output()
+        .unwrap();
+
+    // 第一次 set-knowledge → 落 binding
+    bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .args([
+            "iterate",
+            "apply",
+            "yu",
+            "--version",
+            "1",
+            "--set-knowledge",
+            r#"{"corpus":"db_docs","priority":"high"}"#,
+        ])
+        .output()
+        .unwrap();
+
+    // 第二次 set-knowledge → 合并（不是覆盖）
+    bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .args([
+            "iterate",
+            "apply",
+            "yu",
+            "--version",
+            "1",
+            "--set-knowledge",
+            r#"{"retrieved_at":"2026-08-01"}"#,
+        ])
+        .output()
+        .unwrap();
+
+    let db = rusqlite::Connection::open(data.join("avc/avc.db")).unwrap();
+    let json: String = db
+        .query_row(
+            "SELECT knowledge_binding_json FROM persona_versions pv
+         JOIN persona_models pm ON pm.id = pv.persona_model_id
+         WHERE pm.name = ?",
+            ["yu"],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(v["corpus"], "db_docs");
+    assert_eq!(v["priority"], "high");
+    assert_eq!(v["retrieved_at"], "2026-08-01");
+}
+
+#[test]
+fn iterate_apply_set_manifest_merges_render_options() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let config = dir.path().join("config");
+    bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .arg("init")
+        .output()
+        .unwrap();
+    bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .args(["persona", "create", "--name", "yu"])
+        .output()
+        .unwrap();
+
+    bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .args([
+            "iterate",
+            "apply",
+            "yu",
+            "--version",
+            "1",
+            "--set-manifest",
+            r#"{"render_options":{"resolution":"1080p","fps":30}}"#,
+        ])
+        .output()
+        .unwrap();
+
+    bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .args([
+            "iterate",
+            "apply",
+            "yu",
+            "--version",
+            "1",
+            "--set-manifest",
+            r#"{"render_options":{"fps":60},"style":"严谨"}"#,
+        ])
+        .output()
+        .unwrap();
+
+    let db = rusqlite::Connection::open(data.join("avc/avc.db")).unwrap();
+    let json: String = db
+        .query_row(
+            "SELECT manifest_json FROM persona_versions pv
+         JOIN persona_models pm ON pm.id = pv.persona_model_id
+         WHERE pm.name = ?",
+            ["yu"],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+    // resolution 保留（merge），fps 覆盖到 60，style 新增
+    assert_eq!(v["render_options"]["resolution"], "1080p");
+    assert_eq!(v["render_options"]["fps"], 60);
+    assert_eq!(v["style"], "严谨");
+}
+
+#[test]
+fn iterate_apply_three_sections_together() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let config = dir.path().join("config");
+    bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .arg("init")
+        .output()
+        .unwrap();
+    bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .args(["persona", "create", "--name", "yu"])
+        .output()
+        .unwrap();
+
+    // 一次 apply 三段都给
+    let r = bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .args([
+            "iterate",
+            "apply",
+            "yu",
+            "--version",
+            "1",
+            "--set-persona",
+            r#"{"traits":["严谨","务实"]}"#,
+            "--set-knowledge",
+            r#"{"corpus":"db_docs"}"#,
+            "--set-manifest",
+            r#"{"render_options":{"resolution":"720p"}}"#,
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        r.status.success(),
+        "三段同时给应成功；stderr={}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&r.stdout).unwrap();
+    assert!(v["iterate_job_id"].as_str().unwrap().starts_with("ij_"));
+    assert_eq!(v["persona"], "yu");
+    assert_eq!(v["version"], 1);
+
+    // 三列都落库
+    let db = rusqlite::Connection::open(data.join("avc/avc.db")).unwrap();
+    let (p, k, m): (String, String, String) = db
+        .query_row(
+            "SELECT persona_descriptor_json, knowledge_binding_json, manifest_json
+         FROM persona_versions pv
+         JOIN persona_models pm ON pm.id = pv.persona_model_id
+         WHERE pm.name = ?",
+            ["yu"],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert!(p.contains("严谨"));
+    assert!(k.contains("db_docs"));
+    assert!(m.contains("720p"));
+}
+
+#[test]
+fn iterate_apply_missing_version_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let config = dir.path().join("config");
+    bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .arg("init")
+        .output()
+        .unwrap();
+    bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .args(["persona", "create", "--name", "yu"])
+        .output()
+        .unwrap();
+    // 不传 --version → Arg 错误（exit 2）
+    let r = bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .args([
+            "iterate",
+            "apply",
+            "yu",
+            "--set-persona",
+            r#"{"traits":["a"]}"#,
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(r.status.code(), Some(2), "缺 --version → Arg (exit 2)");
+}
+
+#[test]
+fn iterate_apply_unknown_persona_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let config = dir.path().join("config");
+    bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .arg("init")
+        .output()
+        .unwrap();
+    let r = bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .args([
+            "iterate",
+            "apply",
+            "nope",
+            "--version",
+            "1",
+            "--set-persona",
+            "{}",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(r.status.code(), Some(3), "未知 persona → NotFound (exit 3)");
+}
+
+#[test]
+fn persona_show_returns_full_row_json() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let config = dir.path().join("config");
+    bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .arg("init")
+        .output()
+        .unwrap();
+    bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .args([
+            "persona",
+            "create",
+            "--name",
+            "yu",
+            "--archetype",
+            "db_kernel_expert",
+        ])
+        .output()
+        .unwrap();
+
+    let r = bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .args(["persona", "show", "yu", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        r.status.success(),
+        "show 应成功；stderr={}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&r.stdout).unwrap();
+    assert_eq!(v["name"], "yu");
+    assert_eq!(v["archetype"], "db_kernel_expert");
+    assert_eq!(v["current_version"], 1);
+    assert_eq!(v["status"], "pending");
+}
+
+#[test]
+fn persona_show_unknown_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let config = dir.path().join("config");
+    bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .arg("init")
+        .output()
+        .unwrap();
+    let r = bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .args(["persona", "show", "nope"])
+        .output()
+        .unwrap();
+    assert_eq!(r.status.code(), Some(3), "未知 persona → NotFound (exit 3)");
+}
+
+#[test]
+fn persona_versions_lists_after_finetune() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let config = dir.path().join("config");
+    bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .arg("init")
+        .output()
+        .unwrap();
+    bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .args(["persona", "create", "--name", "yu"])
+        .output()
+        .unwrap();
+
+    // 起 v1 → versions 应见 [1]
+    let r = bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .args(["persona", "versions", "yu", "--json"])
+        .output()
+        .unwrap();
+    assert!(r.status.success());
+    let v: serde_json::Value = serde_json::from_slice(&r.stdout).unwrap();
+    assert_eq!(v.as_array().unwrap().len(), 1);
+    assert_eq!(v[0], 1);
+
+    // finetune start → 自动建 v2（pending）
+    let r = bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .args([
+            "finetune",
+            "start",
+            "yu",
+            "--base-version",
+            "1",
+            "--scope",
+            "voice",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        r.status.success(),
+        "finetune start 应成功；stderr={}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+
+    // versions 应见 [1, 2]
+    let r = bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .args(["persona", "versions", "yu", "--json"])
+        .output()
+        .unwrap();
+    assert!(r.status.success());
+    let v: serde_json::Value = serde_json::from_slice(&r.stdout).unwrap();
+    let versions: Vec<i64> = v
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x.as_i64().unwrap())
+        .collect();
+    assert_eq!(versions, vec![1, 2]);
+}
+
+#[test]
+fn iterate_show_parses_changes_json_as_object() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let config = dir.path().join("config");
+    bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .arg("init")
+        .output()
+        .unwrap();
+    bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .args(["persona", "create", "--name", "yu"])
+        .output()
+        .unwrap();
+
+    // apply 后拿 ij_id
+    let r = bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .args([
+            "iterate",
+            "apply",
+            "yu",
+            "--version",
+            "1",
+            "--set-persona",
+            r#"{"traits":["严谨","务实"]}"#,
+            "--set-knowledge",
+            r#"{"corpus":"db_docs"}"#,
+        ])
+        .output()
+        .unwrap();
+    assert!(r.status.success());
+    let v: serde_json::Value = serde_json::from_slice(&r.stdout).unwrap();
+    let ij_id = v["iterate_job_id"].as_str().unwrap().to_string();
+
+    // iterate show 应把 changes_json 解析为 JSON object（不是字符串）
+    let r = bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .args(["iterate", "show", &ij_id, "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        r.status.success(),
+        "show 应成功；stderr={}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&r.stdout).unwrap();
+    assert_eq!(v["id"], ij_id);
+    assert_eq!(v["persona"], "yu");
+    assert_eq!(v["target_version"], 1);
+    assert_eq!(v["status"], "succeeded");
+    // changes 应该是 JSON object，不是 string
+    let changes = &v["changes"];
+    assert!(
+        changes.is_object(),
+        "changes 字段应是 object；got={}",
+        changes
+    );
+    assert_eq!(changes["persona_descriptor"]["traits"][0], "严谨");
+    assert_eq!(changes["persona_descriptor"]["traits"][1], "务实");
+    assert_eq!(changes["knowledge_binding"]["corpus"], "db_docs");
+}
+
+#[test]
+fn persona_list_filters_by_status() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let config = dir.path().join("config");
+    bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .arg("init")
+        .output()
+        .unwrap();
+    bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .args(["persona", "create", "--name", "yu"])
+        .output()
+        .unwrap();
+    bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .args(["persona", "create", "--name", "lin"])
+        .output()
+        .unwrap();
+
+    // 默认（不传 status）应返 2 行
+    let r = bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .args(["persona", "list", "--json"])
+        .output()
+        .unwrap();
+    assert!(r.status.success());
+    let v: serde_json::Value = serde_json::from_slice(&r.stdout).unwrap();
+    assert_eq!(v.as_array().unwrap().len(), 2);
+
+    // --status pending 应返 2 行（两个新 persona 默认 status=pending）
+    let r = bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .args(["persona", "list", "--status", "pending", "--json"])
+        .output()
+        .unwrap();
+    assert!(r.status.success());
+    let v: serde_json::Value = serde_json::from_slice(&r.stdout).unwrap();
+    assert_eq!(v.as_array().unwrap().len(), 2);
+
+    // --status archived 应返 0 行
+    let r = bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .args(["persona", "list", "--status", "archived", "--json"])
+        .output()
+        .unwrap();
+    assert!(r.status.success());
+    let v: serde_json::Value = serde_json::from_slice(&r.stdout).unwrap();
+    assert_eq!(v.as_array().unwrap().len(), 0);
+
+    // 未知 status 也返 0 行（不报错）
+    let r = bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .args(["persona", "list", "--status", "nonsense", "--json"])
+        .output()
+        .unwrap();
+    assert!(r.status.success());
+    let v: serde_json::Value = serde_json::from_slice(&r.stdout).unwrap();
+    assert_eq!(v.as_array().unwrap().len(), 0);
 }

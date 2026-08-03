@@ -45,3 +45,32 @@ impl Db {
         Self::open(&path)
     }
 }
+
+/// 打开默认 DB 文件 + 跑迁移并把裸 `Connection` 交出去。
+///
+/// 用途：provider hook 在 token 鉴权 / 限速 / 超时 / 上游错时**被动**落库；hook
+/// 不持有 `Db` 句柄，且必须能容忍"无 DB / 无 schema"的情况（best-effort）。详见
+/// `src/provider/real.rs::db_conn`。
+pub fn open_default() -> AvcResult<Connection> {
+    use std::sync::Arc;
+    let path = crate::config::Config::default_db_path()?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    let conn = Connection::open(&path)?;
+    conn.pragma_update(None, "journal_mode", "WAL")?;
+    conn.pragma_update(None, "foreign_keys", "ON")?;
+    conn.pragma_update(None, "synchronous", "NORMAL")?;
+    let pool: DbPool = Arc::new(Mutex::new(conn));
+    let db = Db {
+        conn: pool,
+        path: path.clone(),
+    };
+    schema::migrate(&db)?;
+    // 取出里面那个 Connection（hook 场景下没人共享，try_unwrap 必成功）
+    let conn = Arc::try_unwrap(db.conn)
+        .map_err(|_| crate::error::AvcError::Db("connection still shared".into()))?
+        .into_inner()
+        .map_err(|_| crate::error::AvcError::Db("lock poisoned".into()))?;
+    Ok(conn)
+}
