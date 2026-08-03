@@ -2,9 +2,6 @@
 //!
 //! 详见 docs/superpowers/specs/2026-08-03-provider-daemon-design.md §3-4
 
-// `OptionalExtension` 暂未使用（T4 rate_limit_* 会用到），保持 clippy -D warnings 干净
-#![allow(unused_imports, dead_code)]
-
 use crate::error::AvcResult;
 use crate::svc::now_iso;
 use rusqlite::{params, Connection, OptionalExtension};
@@ -131,6 +128,79 @@ pub fn latest_per_provider(
     Ok(rows)
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RateLimitRow {
+    pub provider_key: String,
+    pub last_hit_at: String,
+    pub retry_after_s: Option<i64>,
+    pub until_ts: Option<String>,
+    pub hit_count_24h: i64,
+    pub updated_at: String,
+}
+
+pub fn rate_limit_upsert(
+    conn: &Connection,
+    key: &str,
+    retry_after_s: Option<i64>,
+    until_ts: Option<&str>,
+) -> AvcResult<()> {
+    let now = now_iso();
+    conn.execute(
+        "INSERT INTO provider_rate_limit
+            (provider_key, last_hit_at, retry_after_s, until_ts, hit_count_24h, updated_at)
+         VALUES (?1, ?2, ?3, ?4, 1, ?5)
+         ON CONFLICT(provider_key) DO UPDATE SET
+            last_hit_at = excluded.last_hit_at,
+            retry_after_s = excluded.retry_after_s,
+            until_ts = excluded.until_ts,
+            hit_count_24h = provider_rate_limit.hit_count_24h + 1,
+            updated_at = excluded.updated_at",
+        params![key, now, retry_after_s, until_ts, now],
+    )?;
+    Ok(())
+}
+
+pub fn rate_limit_get(conn: &Connection, key: &str) -> AvcResult<Option<RateLimitRow>> {
+    let row = conn
+        .query_row(
+            "SELECT provider_key, last_hit_at, retry_after_s, until_ts, hit_count_24h, updated_at
+             FROM provider_rate_limit WHERE provider_key = ?1",
+            params![key],
+            |r| {
+                Ok(RateLimitRow {
+                    provider_key: r.get(0)?,
+                    last_hit_at: r.get(1)?,
+                    retry_after_s: r.get(2)?,
+                    until_ts: r.get(3)?,
+                    hit_count_24h: r.get(4)?,
+                    updated_at: r.get(5)?,
+                })
+            },
+        )
+        .optional()?;
+    Ok(row)
+}
+
+pub fn rate_limit_all(conn: &Connection) -> AvcResult<Vec<RateLimitRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT provider_key, last_hit_at, retry_after_s, until_ts, hit_count_24h, updated_at
+         FROM provider_rate_limit ORDER BY provider_key",
+    )?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok(RateLimitRow {
+                provider_key: r.get(0)?,
+                last_hit_at: r.get(1)?,
+                retry_after_s: r.get(2)?,
+                until_ts: r.get(3)?,
+                hit_count_24h: r.get(4)?,
+                updated_at: r.get(5)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -234,6 +304,35 @@ mod tests {
         let latest = latest_per_provider(&conn, Some("llm")).unwrap();
         assert_eq!(latest.len(), 1);
         assert_eq!(latest[0].provider_key, "llm.openai");
+    }
+
+    #[test]
+    fn rate_limit_upsert_increments_hit_count() {
+        let conn = fresh_db();
+        rate_limit_upsert(&conn, "llm.openai", Some(60), Some("2030-01-01T00:00:00Z")).unwrap();
+        rate_limit_upsert(&conn, "llm.openai", Some(30), Some("2030-01-01T00:00:30Z")).unwrap();
+        let got = rate_limit_get(&conn, "llm.openai").unwrap().expect("row");
+        assert_eq!(got.hit_count_24h, 2);
+        assert_eq!(got.retry_after_s, Some(30)); // 最近一次覆盖
+    }
+
+    #[test]
+    fn rate_limit_get_returns_none_when_absent() {
+        let conn = fresh_db();
+        let got = rate_limit_get(&conn, "missing").unwrap();
+        assert!(got.is_none());
+    }
+
+    #[test]
+    fn rate_limit_all_returns_all_rows() {
+        let conn = fresh_db();
+        rate_limit_upsert(&conn, "llm.openai", None, None).unwrap();
+        rate_limit_upsert(&conn, "embed.openai", Some(15), None).unwrap();
+        let all = rate_limit_all(&conn).unwrap();
+        assert_eq!(all.len(), 2);
+        let keys: Vec<&str> = all.iter().map(|r| r.provider_key.as_str()).collect();
+        assert!(keys.contains(&"llm.openai"));
+        assert!(keys.contains(&"embed.openai"));
     }
 }
 
