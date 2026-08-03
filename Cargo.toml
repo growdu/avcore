@@ -1,9 +1,17 @@
 [package]
 name = "avc"
-version = "0.2.0"
+version = "0.3.2"
 edition = "2021"
 description = "AI Video Core — minimalist persona & video generation framework"
 license = "Apache-2.0"
+license-file = "LICENSE"
+repository = "https://github.com/avcore/avc"
+homepage = "https://github.com/avcore/avc"
+documentation = "https://docs.rs/avc"
+readme = "README.md"
+keywords = ["ai", "video", "persona", "cli", "sqlite"]
+categories = ["command-line-utilities", "database"]
+authors = ["avc contributors"]
 
 [[bin]]
 name = "avc"
@@ -33,6 +41,10 @@ thiserror = "1"
 
 # HTTP（Provider 调用）
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# HTTP（daemon server）
+axum = "0.7"
+tower = "0.5"
 
 # 配置 / 路径
 toml = "0.8"
