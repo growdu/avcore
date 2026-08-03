@@ -64,6 +64,114 @@ pub async fn probe_llm(cfg: &Config, name: &str) -> (Status, Option<i64>, Option
     }
 }
 
+/// 探活 Embed provider：发最小 embed(["ping"]) 请求
+pub async fn probe_embed(cfg: &Config, name: &str) -> (Status, Option<i64>, Option<String>) {
+    use crate::provider::real::OpenAiCompatEmbedProvider;
+    use crate::provider::EmbedProvider;
+    let pc = match cfg.provider.embed.get(name) {
+        Some(p) => p,
+        None => {
+            return (
+                Status::Unconfigured,
+                None,
+                Some(format!("embed.{} not in config", name)),
+            )
+        }
+    };
+    if pc.api_key.is_none() {
+        return (Status::Unconfigured, None, Some("missing api_key".into()));
+    }
+    let provider = match OpenAiCompatEmbedProvider::new(name.to_string(), pc.clone()) {
+        Ok(p) => p,
+        Err(e) => return (Status::UpstreamError, None, Some(e.to_string())),
+    };
+    let started = Instant::now();
+    let res = tokio::time::timeout(PROBE_TIMEOUT, provider.embed(&["ping"])).await;
+    let elapsed_ms = started.elapsed().as_millis() as i64;
+    match res {
+        Ok(Ok(_)) => (Status::Healthy, Some(elapsed_ms), None),
+        Ok(Err(e)) => classify_llm_error(&e, elapsed_ms),
+        Err(_) => (Status::Timeout, Some(elapsed_ms), Some("5s timeout".into())),
+    }
+}
+
+/// 探活 Avatar provider：发最小 create("ping") 请求
+pub async fn probe_avatar(cfg: &Config, name: &str) -> (Status, Option<i64>, Option<String>) {
+    use crate::provider::real::OpenAiCompatAvatarProvider;
+    use crate::provider::AvatarProvider;
+    let pc = match cfg.provider.avatar.get(name) {
+        Some(p) => p,
+        None => {
+            return (
+                Status::Unconfigured,
+                None,
+                Some(format!("avatar.{} not in config", name)),
+            )
+        }
+    };
+    if pc.api_key.is_none() {
+        return (Status::Unconfigured, None, Some("missing api_key".into()));
+    }
+    let provider = match OpenAiCompatAvatarProvider::new(name.to_string(), pc.clone()) {
+        Ok(p) => p,
+        Err(e) => return (Status::UpstreamError, None, Some(e.to_string())),
+    };
+    let spec = crate::provider::AvatarSpec {
+        prompt: "ping".into(),
+        style: None,
+        ref_image_paths: vec![],
+    };
+    let started = Instant::now();
+    let res = tokio::time::timeout(PROBE_TIMEOUT, provider.create(&spec)).await;
+    let elapsed_ms = started.elapsed().as_millis() as i64;
+    match res {
+        Ok(Ok(_)) => (Status::Healthy, Some(elapsed_ms), None),
+        Ok(Err(e)) => classify_llm_error(&e, elapsed_ms),
+        Err(_) => (Status::Timeout, Some(elapsed_ms), Some("5s timeout".into())),
+    }
+}
+
+/// 探活 Voice provider：用 stub base Voice 发最小 synth("ping") 请求
+pub async fn probe_voice(cfg: &Config, name: &str) -> (Status, Option<i64>, Option<String>) {
+    use crate::provider::real::OpenAiCompatVoiceProvider;
+    use crate::provider::VoiceProvider;
+    let pc = match cfg.provider.voice.get(name) {
+        Some(p) => p,
+        None => {
+            return (
+                Status::Unconfigured,
+                None,
+                Some(format!("voice.{} not in config", name)),
+            )
+        }
+    };
+    if pc.api_key.is_none() {
+        return (Status::Unconfigured, None, Some("missing api_key".into()));
+    }
+    let provider = match OpenAiCompatVoiceProvider::new(name.to_string(), pc.clone()) {
+        Ok(p) => p,
+        Err(e) => return (Status::UpstreamError, None, Some(e.to_string())),
+    };
+    // voice synth 需要一个 Voice；用 stub base
+    let base = crate::provider::Voice {
+        provider: name.into(),
+        provider_version: "v1".into(),
+        voice_id_remote: Some("base".into()),
+        sample_wav_b64: String::new(),
+        transcript: None,
+        embed_b64: None,
+        embed_dim: None,
+    };
+    let started = Instant::now();
+    let res = tokio::time::timeout(PROBE_TIMEOUT, provider.synth(&base, "ping")).await;
+    let elapsed_ms = started.elapsed().as_millis() as i64;
+    match res {
+        Ok(Ok(_)) => (Status::Healthy, Some(elapsed_ms), None),
+        Ok(Err(e)) => classify_llm_error(&e, elapsed_ms),
+        Err(_) => (Status::Timeout, Some(elapsed_ms), Some("5s timeout".into())),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -154,5 +262,62 @@ mod tests {
         );
         let (status, _, _) = probe_llm(&cfg, "openai").await;
         assert_eq!(status, Status::Unconfigured);
+    }
+
+    #[tokio::test]
+    async fn probe_embed_429_records_rate_limited() {
+        let addr = spawn_mock(|_| {
+            "HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\n\r\n".to_string()
+        })
+        .await;
+        let mut cfg = Config::default();
+        cfg.provider.embed.insert(
+            "openai".into(),
+            ProviderCfg {
+                api_key: Some("sk-test".into()),
+                base_url: Some(format!("http://{}", addr)),
+                ..Default::default()
+            },
+        );
+        let (status, _, _) = probe_embed(&cfg, "openai").await;
+        assert_eq!(status, Status::RateLimited);
+    }
+
+    #[tokio::test]
+    async fn probe_avatar_500_records_upstream_error() {
+        let addr =
+            spawn_mock(|_| "HTTP/1.1 500 Internal\r\nContent-Length: 0\r\n\r\n".to_string()).await;
+        let mut cfg = Config::default();
+        cfg.provider.avatar.insert(
+            "dalle".into(),
+            ProviderCfg {
+                api_key: Some("sk-test".into()),
+                base_url: Some(format!("http://{}", addr)),
+                ..Default::default()
+            },
+        );
+        let (status, _, _) = probe_avatar(&cfg, "dalle").await;
+        assert_eq!(status, Status::UpstreamError);
+    }
+
+    #[tokio::test]
+    async fn probe_voice_timeout_records_timeout() {
+        // Mock hangs > 5s so probe's PROBE_TIMEOUT fires first.
+        let addr = spawn_mock(|_| {
+            std::thread::sleep(std::time::Duration::from_secs(8));
+            "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n".to_string()
+        })
+        .await;
+        let mut cfg = Config::default();
+        cfg.provider.voice.insert(
+            "tts".into(),
+            ProviderCfg {
+                api_key: Some("sk-test".into()),
+                base_url: Some(format!("http://{}", addr)),
+                ..Default::default()
+            },
+        );
+        let (status, _, _) = probe_voice(&cfg, "tts").await;
+        assert_eq!(status, Status::Timeout);
     }
 }
