@@ -6,7 +6,7 @@
 use std::time::{Duration, Instant};
 
 use crate::config::{Config, ProviderCfg};
-use crate::error::AvcError;
+use crate::error::{AvcError, AvcResult};
 use crate::provider::real::OpenAiCompatLlmProvider;
 use crate::provider::LlmProvider;
 use crate::svc::health::Status;
@@ -208,6 +208,64 @@ pub async fn probe_voice(cfg: &Config, name: &str) -> (Status, Option<i64>, Opti
     }
 }
 
+/// 遍历 config 中所有 provider，调用对应的 probe，并把结果写入 provider_health
+///
+/// 4 个 HTTP probe 并发跑（tokio::join!）；video probe 是 sync，串行跑（一次只跑一个，不阻塞）。
+/// 写库失败不会回滚已写入的记录（best-effort）。
+pub async fn probe_all(cfg: &Config, conn: &rusqlite::Connection) -> AvcResult<()> {
+    use crate::svc::health::{provider_key, record};
+
+    // 4 个 HTTP probe 并发
+    let llm_fut = async {
+        let names = collect_names(&cfg.provider.llm);
+        for name in names {
+            let key = provider_key("llm", &name);
+            let (status, ms, err) = probe_llm(cfg, &name).await;
+            record(conn, &key, status, ms, err.as_deref(), "probe").ok();
+        }
+    };
+    let embed_fut = async {
+        let names = collect_names(&cfg.provider.embed);
+        for name in names {
+            let key = provider_key("embed", &name);
+            let (status, ms, err) = probe_embed(cfg, &name).await;
+            record(conn, &key, status, ms, err.as_deref(), "probe").ok();
+        }
+    };
+    let avatar_fut = async {
+        let names = collect_names(&cfg.provider.avatar);
+        for name in names {
+            let key = provider_key("avatar", &name);
+            let (status, ms, err) = probe_avatar(cfg, &name).await;
+            record(conn, &key, status, ms, err.as_deref(), "probe").ok();
+        }
+    };
+    let voice_fut = async {
+        let names = collect_names(&cfg.provider.voice);
+        for name in names {
+            let key = provider_key("voice", &name);
+            let (status, ms, err) = probe_voice(cfg, &name).await;
+            record(conn, &key, status, ms, err.as_deref(), "probe").ok();
+        }
+    };
+    tokio::join!(llm_fut, embed_fut, avatar_fut, voice_fut);
+
+    // CLI video: 串行（一次只跑一个，避免多 which 竞争）
+    let video_names = collect_names(&cfg.provider.video);
+    for name in video_names {
+        let key = provider_key("video", &name);
+        let (status, ms, err) = probe_cli_video(cfg, &name);
+        record(conn, &key, status, ms, err.as_deref(), "probe").ok();
+    }
+    Ok(())
+}
+
+fn collect_names<V>(map: &std::collections::HashMap<String, V>) -> Vec<String> {
+    let mut names: Vec<String> = map.keys().cloned().collect();
+    names.sort();
+    names
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -383,5 +441,26 @@ mod tests {
         );
         let (status, _, _) = probe_cli_video(&cfg, "sh");
         assert_eq!(status, Status::Healthy);
+    }
+
+    #[test]
+    fn probe_all_empty_config_writes_nothing() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let sqls = [
+            include_str!("../../migrations/0001_init.sql"),
+            include_str!("../../migrations/0002_drift_dimensions.sql"),
+            include_str!("../../migrations/0003_provider_health.sql"),
+        ];
+        for s in sqls {
+            conn.execute_batch(s).unwrap();
+        }
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            probe_all(&Config::default(), &conn).await.unwrap();
+        });
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM provider_health", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
     }
 }
