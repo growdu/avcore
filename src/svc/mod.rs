@@ -5,10 +5,12 @@
 pub mod corpus;
 pub mod drift;
 pub mod finetune;
+pub mod health;
 pub mod iterate;
 pub mod persona;
 pub mod pipeline;
 pub mod render;
+pub mod sample;
 
 use chrono::Utc;
 

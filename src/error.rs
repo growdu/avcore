@@ -43,6 +43,22 @@ pub enum AvcError {
 
     #[error("内部错：{0}")]
     Internal(String),
+
+    #[error("daemon already running: pid {pid}, port {port}")]
+    AlreadyRunning { pid: u32, port: u16 },
+
+    #[error("daemon bind failed on {addr}:{port}: {msg}")]
+    BindFailed {
+        addr: String,
+        port: u16,
+        msg: String,
+    },
+
+    #[error("pidfile stale: {0}")]
+    PidfileStale(String),
+
+    #[error("daemon not running")]
+    DaemonNotRunning,
 }
 
 impl AvcError {
@@ -60,6 +76,10 @@ impl AvcError {
             AvcError::Generic(_) => ExitCode::from(1),
             AvcError::Db(_) => ExitCode::from(20),
             AvcError::Io(_) => ExitCode::from(21),
+            AvcError::AlreadyRunning { .. } => ExitCode::from(4),
+            AvcError::BindFailed { .. } => ExitCode::from(21),
+            AvcError::PidfileStale(_) => ExitCode::from(4),
+            AvcError::DaemonNotRunning => ExitCode::from(3),
             AvcError::Internal(_) => ExitCode::from(99),
         }
     }
