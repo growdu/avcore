@@ -131,6 +131,42 @@ pub async fn probe_avatar(cfg: &Config, name: &str) -> (Status, Option<i64>, Opt
     }
 }
 
+/// 探活 CLI video provider：仅检查 `which <binary>` 是否能定位到
+///
+/// CLI video provider 不走 HTTP，所以探活只看二进制是否存在。不发起实际 vendor 调用。
+pub fn probe_cli_video(cfg: &Config, name: &str) -> (Status, Option<i64>, Option<String>) {
+    let pc = match cfg.provider.video.get(name) {
+        Some(p) => p,
+        None => {
+            return (
+                Status::Unconfigured,
+                None,
+                Some(format!("video.{} not in config", name)),
+            )
+        }
+    };
+    let bin = match pc.binary.as_ref() {
+        Some(b) if !b.is_empty() => b,
+        _ => return (Status::Unconfigured, None, Some("missing binary".into())),
+    };
+    let started = Instant::now();
+    let ok = std::process::Command::new("which")
+        .arg(bin)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    let ms = started.elapsed().as_millis() as i64;
+    if ok {
+        (Status::Healthy, Some(ms), None)
+    } else {
+        (
+            Status::UpstreamError,
+            Some(ms),
+            Some(format!("binary not found: {}", bin)),
+        )
+    }
+}
+
 /// 探活 Voice provider：用 stub base Voice 发最小 synth("ping") 请求
 pub async fn probe_voice(cfg: &Config, name: &str) -> (Status, Option<i64>, Option<String>) {
     use crate::provider::real::OpenAiCompatVoiceProvider;
@@ -319,5 +355,33 @@ mod tests {
         );
         let (status, _, _) = probe_voice(&cfg, "tts").await;
         assert_eq!(status, Status::Timeout);
+    }
+
+    #[test]
+    fn probe_cli_video_missing_binary_skipped() {
+        let mut cfg = Config::default();
+        cfg.provider.video.insert(
+            "kling".into(),
+            ProviderCfg {
+                binary: None,
+                ..Default::default()
+            },
+        );
+        let (status, _, _) = probe_cli_video(&cfg, "kling");
+        assert_eq!(status, Status::Unconfigured);
+    }
+
+    #[test]
+    fn probe_cli_video_known_binary_healthy() {
+        let mut cfg = Config::default();
+        cfg.provider.video.insert(
+            "sh".into(),
+            ProviderCfg {
+                binary: Some("/bin/sh".into()),
+                ..Default::default()
+            },
+        );
+        let (status, _, _) = probe_cli_video(&cfg, "sh");
+        assert_eq!(status, Status::Healthy);
     }
 }
