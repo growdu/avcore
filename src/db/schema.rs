@@ -6,8 +6,17 @@
 use crate::db::Db;
 use crate::error::AvcResult;
 
-const MIGRATIONS: &[(&str, &str)] =
-    &[("0001_init", include_str!("../../migrations/0001_init.sql"))];
+const MIGRATIONS: &[(&str, &str)] = &[
+    ("0001_init", include_str!("../../migrations/0001_init.sql")),
+    (
+        "0002_drift_dimensions",
+        include_str!("../../migrations/0002_drift_dimensions.sql"),
+    ),
+    (
+        "0003_provider_health",
+        include_str!("../../migrations/0003_provider_health.sql"),
+    ),
+];
 
 pub fn migrate(db: &Db) -> AvcResult<()> {
     let mut conn = db.conn.lock().unwrap();
