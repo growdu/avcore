@@ -71,21 +71,32 @@ avc ask "用一句话介绍你的身份"
 ### 2.1 拿 key + endpoint
 
 MiniMax（也作 MiniMax）有两个 API 协议：
-- **OpenAI 兼容**：`https://api.minimax.chat/v1`（首选）
-- **Anthropic 兼容**：`https://api.minimaxi.com/anthropic`（次选）
+- **OpenAI 兼容**：`https://api.minimaxi.com/v1`（首选，AVCore 用这个）
+- **Anthropic 兼容**：`https://api.minimaxi.com/anthropic`（Claude Code 那种客户端用）
 
-待你确认 token plan 实际开通的 endpoint。**实测时**先试 `https://api.minimax.chat/v1`。
+model 名常见为 `MiniMax-M3` / `MiniMax-M2.7` / `MiniMax-M2.7-highspeed` / `MiniMax-M2.5` / `MiniMax-M2.5-highspeed` / `MiniMax-M2.1` / `MiniMax-M2.1-highspeed` 等（按你账户的 `/v1/models` 列表为准）。
 
-model 名常见为 `MiniMax-大模型` / `MiniMax-Latest` / `MiniMax-ABAB6.5s` 等（按你账户的模型列表为准）。
+实测可用模型（2026-08-04 调用 `GET /v1/models` 验证）：
+```
+MiniMax-M3          (latest)
+MiniMax-M2.7
+MiniMax-M2.7-highspeed
+MiniMax-M2.5
+MiniMax-M2.5-highspeed
+MiniMax-M2.1
+MiniMax-M2.1-highspeed
+```
+
+> ⚠️ 文档里之前写的 `https://api.minimax.chat/v1` 是**错的**。实测正确的端点是 `https://api.minimaxi.com/v1`。
 
 ### 2.2 avc.toml 段
 
 ```toml
-# 备用 LLM（MiniMax token plan）
+# 备用 LLM（MiniMax token plan，OpenAI 兼容）
 [provider.llm.minimax]
-api_key = "sk-..."
-model = "MiniMax-大模型"             # 实际模型名按账户内
-base_url = "https://api.minimax.chat/v1"
+api_key = "sk-cp-..."                  # 从 MiniMax 控制台复制
+model = "MiniMax-M3"                   # 或 M2.7 / M2.5 / M2.1
+base_url = "https://api.minimaxi.com/v1"
 ```
 
 ### 2.3 设置
@@ -164,6 +175,37 @@ avc provider status --dim llm
 # 7. 清理
 avc daemon stop
 ```
+
+## 4.5 实测结果（2026-08-04，MiniMax）
+
+> 火山方舟的「agent plan」key 走的是 `/api/v3/bots/chat/completions` 专用协议，AVCore 的 OpenAI 兼容 chat provider 不兼容。改用 env 里的 MiniMax token plan key（`minimaxi.com/v1` 端点）跑通完整 7 步。
+
+### 配置
+
+```toml
+[provider.llm.minimax]
+api_key = "sk-cp-..."                  # 来自 env $ANTHROPIC_AUTH_TOKEN
+model = "MiniMax-M3"
+base_url = "https://api.minimaxi.com/v1"
+```
+
+### 各步实测结果
+
+| 步 | 命令 | 结果 |
+|---|---|---|
+| 1 | `curl -fsS .../v1/models` | HTTP 200，列出 7 个模型（MiniMax-M3 / M2.7 / M2.7-highspeed / M2.5 / M2.5-highspeed / M2.1 / M2.1-highspeed）|
+| 2 | `curl -X POST .../v1/chat/completions` body=`{"model":"MiniMax-M3","messages":...}` | HTTP 200，回复「我是 MiniMax-M3，一个由 MiniMax 开发的 AI 助手...」，250 tokens |
+| 3 | `avc config set` 3 个字段 | 全部成功（但 `shell.nl_model` 不在 white-list，需直接编辑 `~/.config/avc/avc.toml`）|
+| 4 | `avc provider test llm.minimax` | exit 0，JSON `{"ok": true, "provider": "llm.minimax", "reply_preview": "..."}` |
+| 5 | `avc ask "用一句话介绍你自己"` | MiniMax 返回 plan JSON `{"intent":"unknown","read_only":true,"steps":[]}`（正确：此 prompt 不对应任何 verb）|
+| 6 | `avc shell` + `persona create --name minimax_test ...` + `show minimax_test` | `minimax_test` 创建成功（id `pm_01kz5z4rtw2tb8j3zypgq0bcvy`），show 返 JSON；shell 内 NL 也走 minimax 翻译 |
+| 7 | `avc daemon start` → `provider status` → `daemon logs` → `daemon stop` | daemon 启 pid 1327464；`llm.minimax healthy latency=2123ms`；日志写 `avc.log`（`daemon listening on 127.0.0.1:7891`）；SIGTERM 干净退出 |
+
+### 副作用
+
+- `avc config set` 没读 XDG_CONFIG_HOME，写到了**全局** `~/.config/avc/avc.toml`（`avc init` 也是）。要隔离测试目录得直接编辑文件 + 用 `XDG_DATA_HOME` 覆盖 DB 路径
+- 全局 avc.toml 现在有明文 api_key（chmod 600 保护，但任何能读你 home 的人能看）。清理方式：`vim ~/.config/avc/avc.toml` 删 `[provider.llm.minimax]` 整段
+- 整个流程没有遇到 panic / 数据损坏 / 权限错误
 
 如果某步失败，按 `docs/providers-cn.md` §9 + `docs/operations.md` §10 排查。
 
