@@ -91,7 +91,8 @@ avc
 ├── job         渲染任务账本
 ├── render      出片工作流
 ├── corpus      知识语料
-├── provider    Provider 注册与诊断
+├── daemon      后台守护进程（start/stop/status/logs）
+├── provider    Provider 注册、诊断、健康、限速
 ├── shell       进入交互式 Shell（也可由 TTY 下裸 `avc` 触发）
 └── ask         非交互式自然语言执行（avc ask "..."）
 ```
@@ -179,9 +180,12 @@ avc
 
 | 命令 | 类型 | 作用 |
 |------|------|------|
-| `avc finetune start <persona> --scope ... --base-version <v> [--threshold <n>]` | `[A]` | 启动 finetune 任务 |
+| `avc finetune start <persona> --scope ... --base-version <v> [--threshold <n>]` | `[A]` | 启动 finetune 任务（建 fj 行 + 预占 target_version） |
+| `avc finetune run <fj_id> [--embed <name>]` | `[A]` | 端到端：拉 samples → 调 vendor CLI SFT → 算 voice drift → publish/rollback |
+| `avc finetune drift eval <fj_id> [--embed <name>]` | `[A]` | 只算 drift，不动 fj.status（与 run 配套的可观测 verb） |
 | `avc finetune list --persona <n>` | `[A]` | 列出该 persona 的 finetune 任务 |
 | `avc finetune show <id>` | `[A]` | 任务详情 |
+| `avc finetune publish <id> --passed\|--failed` | `[A]` | 测试用：手动 publish（不走真 SFT 也不调 Provider） |
 | `avc finetune report <id> --json` | `[A]` | drift_report_json 结构化输出 |
 | `avc finetune cancel <id>` | `[A]` | 取消 queued / running |
 
@@ -193,7 +197,8 @@ avc
 | `avc job show <id> [--watch]` | `[A]` | 任务详情 |
 | `avc job wait <id> --until <status>` | `[A]` | 阻塞到目标状态 |
 | `avc job cancel <id>` | `[A]` | 取消 |
-| `avc job export <id> --all\|--kind <k> --out <dir>` | `[A]` | 拷 BLOB 到 FS |
+| `avc job export <id> --out <dir>` | `[A]` | 拷 BLOB 到本地 FS（`<kind>__<name>__<id>.bin`） |
+| `avc job export <id> --target s3://bucket/prefix/` | `[A]` | 走 `[export.s3].upload_cmd` 模板（默认 `aws s3 cp`）上传每个 artifact；`--out` 和 `--target` 互斥 |
 | `avc job feedback <id> --looks_unlike` | `[A]` | 把"不像"标记写入 `persona_samples(kind=feedback)` |
 
 ### 4.7 render
@@ -233,8 +238,70 @@ avc render pack --persona yu --topics-file ./daily_topics.txt
 | `avc provider show <name>` | `[A]` | 元数据 + endpoint + auth scheme |
 | `avc provider test <name>` | `[A]` | 一次轻量 ping |
 | `avc provider config <name> --set-key` | `[A]` | 写 token 到 `avc.toml` |
+| `avc provider status [--dim <llm\|embed\|avatar\|voice\|video>] [--json]` | `[A]` | 健康查询（默认查 DB 最近 1 条/provider；`--dim` 单维过滤；`--json` 机器读） |
+| `avc provider rate-limit [--json]` | `[A]` | 限速查询（`in_cooldown` / `hit_count_24h` / 触发的 dim/name） |
 
-### 4.10 shell（交互式）
+`status` / `rate-limit` 读 daemon 写入的 `provider_health` / `provider_rate_limit` 表；
+daemon 未运行时显示"无记录"。
+
+输出（text 模式）：
+
+```
+dim      name           status         latency_ms  source  checked_at
+llm      openai         healthy        234         probe   2026-08-04T10:00:00Z
+embed    openai         auth           -           hook    2026-08-04T09:30:00Z
+voice    elevenlabs     rate_limited   -           hook    2026-08-04T09:00:00Z
+```
+
+status 取值：`healthy` / `rate_limited` / `unauthenticated` / `timeout` /
+`upstream_error` / `unknown`。`source` 取值：`probe`（daemon 主动 ping）/
+`hook`（Provider 错误分支旁路记录）。
+
+### 4.10 daemon
+
+后台进程管理。daemon 启动后**自动 ping 所有配置的 provider**（按
+`ping_interval_s` 间隔）并把 Provider 调用 hook 写入 DB；同进程绑定
+HTTP loopback 端口供 `provider status/rate-limit` 查询。
+
+| 动词 | 行为 |
+|------|------|
+| `avc daemon start [--foreground]` | fork 子进程（执行 `avc _run`）；pid 写到 `~/.local/share/avc/avc.pid`；`--foreground` 不 fork（CI/调试用） |
+| `avc daemon stop` | 给 pidfile 中的 pid 发 `SIGTERM`（Unix）；Windows 不支持（报 exit 1） |
+| `avc daemon status` | 显示 pid / alive / uptime / port / bind / log 路径 |
+| `avc daemon logs` | tail `~/.local/share/avc/avc.log`（最近 2000 字符） |
+
+`status` 输出示例：
+
+```
+daemon    pid=12345   alive=true   uptime=14m
+          bind=127.0.0.1   port=7891
+          log=/home/user/.local/share/avc/avc.log
+          last_ping_at=2026-08-04T10:00:00Z
+```
+
+#### 配置 (`avc.toml`)
+
+```toml
+[daemon]
+enabled = true                       # 默认
+port = 7891                          # 默认
+bind = "127.0.0.1"                   # 默认（不允许 0.0.0.0，强校验失败）
+ping_interval_s = 60                 # 默认
+log_level = "info"                   # tracing filter（debug/info/warn/error）
+auto_record_hook = true              # 默认；provider 错误分支旁路是否写 DB
+```
+
+#### HTTP endpoints（axum 0.7，loopback only）
+
+| 端点 | 用途 |
+|------|------|
+| `GET /health/all` | 全 provider 健康快照（JSON） |
+| `GET /limits/all` | 全 provider 限速快照（JSON） |
+| `GET /version` | daemon 元数据（pid / uptime / 配置摘要） |
+
+仅监听 `[daemon].bind`；外部访问需 SSH tunnel，不暴露公网。
+
+### 4.11 shell（交互式）
 
 详见 [`shell.md`](./shell.md)。
 
@@ -254,7 +321,7 @@ Shell 内建命令：
 | `!str` | 重跑最近以 `str` 开头的命令 |
 | `--help` | 同 `help` |
 
-### 4.11 ask（非交互式 NL）
+### 4.12 ask（非交互式 NL）
 
 ```bash
 avc ask "列出所有角色"                      # 只读：自动执行
@@ -416,6 +483,7 @@ plan (no changes made):
                          atomic        integrated
                     ───────────────  ──────────────
 root                init/verify/...   doctor/prune/config
+daemon              start/stop/status/logs               ← Phase 3
 persona             create           onboard
                     attach-*         refine          ← 80% 路径（纯数据）
                     set-traits/...   finetune        ← 少数路径（调 SFT）
@@ -429,16 +497,17 @@ job                 list/show/wait/cancel/export/feedback
 render              script/video     run / pack
 corpus              create/chunks/search/attach/detach/reindex
 provider            list/show/test/config
+                    status/rate-limit                   ← Phase 3
 shell                                 shell           ← 交互入口
 ask                                   ask             ← 非交互 NL
 ```
 
 合计：
 
-- 原子：**约 50** 条
+- 原子：**约 56** 条（daemon 4 + provider status/rate-limit 2）
 - 集成（不含 shell / ask）：**约 9** 条
 - shell / ask：**2** 条入口
-- 总计：**约 61** 条
+- 总计：**约 67** 条
 
 ---
 
@@ -459,6 +528,11 @@ ask                                   ask             ← 非交互 NL
 | `sample add` | `INSERT persona_samples` |
 | `job feedback` | `INSERT persona_samples(kind='feedback')` |
 | `job export` | `SELECT content FROM artifacts WHERE ...` |
+| `daemon start` | fork + write `daemon_meta` row（pid / bind / port） |
+| `daemon stop` | read pidfile + `SIGTERM` + clear `daemon_meta` |
+| `daemon _run` (internal) | PingLoop: `INSERT/UPSERT provider_health` each tick；hook: `INSERT/UPSERT provider_health` & `provider_rate_limit` on Provider error |
+| `provider status` | `SELECT … FROM provider_health ORDER BY checked_at DESC LIMIT 1 [WHERE dim=?]` |
+| `provider rate-limit` | `SELECT … FROM provider_rate_limit WHERE in_cooldown=1 OR hit_count_24h > 0` |
 
 > 集成命令是 `BEGIN; ... COMMIT;` 内多步原子。失败 → `ROLLBACK`，状态不变。
 
@@ -505,6 +579,14 @@ sqlite3 ~/.local/share/avc/avc.db ".schema persona_versions"
 
 # 强制回滚到 v1
 avc persona promote yu --to 1
+
+# daemon + provider 健康（Phase 3）
+avc daemon start
+avc provider status                 # 看最近一次 ping
+avc provider status --dim llm --json
+avc provider rate-limit             # 限速状态
+curl -s http://127.0.0.1:7891/health/all | jq
+avc daemon stop
 ```
 
 完整 Shell 设计见 [`shell.md`](./shell.md)。
