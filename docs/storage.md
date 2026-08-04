@@ -383,7 +383,31 @@ sqlite3 ~/.local/share/avc/avc.db ".schema persona_versions"
 
 ---
 
-## 10. 升级阈值（透明告知）
+## 10. export 目标（Local | S3）
+
+`svc::render::export_artifacts(db, job_id, target)` 支持两种 target：
+
+| target | CLI | 行为 |
+|--------|-----|------|
+| `ExportTarget::Local(&Path)` | `--out <dir>` | mkdir -p + 每条 artifact 落 `<kind>__<name>__<id>.bin` |
+| `ExportTarget::S3 { bucket, prefix, upload_cmd }` | `--target s3://bucket/prefix/` | 每条 artifact 写到 tmp，跑 `sh -c <upload_cmd>`（占位符 `{local} {bucket} {prefix} {name}` 替换），完即清 tmp |
+
+`upload_cmd` 来自 `[export.s3]` config 段；默认：
+
+```toml
+[export.s3]
+upload_cmd = "aws s3 cp --region us-east-1 {local} s3://{bucket}/{prefix}{name}"
+```
+
+可换：
+
+- `mc`： `[export.s3] upload_cmd = "mc cp {local} minio/{bucket}/{prefix}{name}"`
+- `rclone`：`[export.s3] upload_cmd = "rclone copyto {local} s3remote:{bucket}/{prefix}{name}"`
+- 自家脚本：`[export.s3] upload_cmd = "/usr/local/bin/upload.sh {local} {bucket} {prefix} {name}"`
+
+`--out` 和 `--target` 互斥；都不传 → Arg 错（exit 2）。
+
+## 11. 升级阈值（透明告知）
 
 | 规模 | 方案 |
 |------|------|

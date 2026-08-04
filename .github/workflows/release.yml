@@ -1,0 +1,196 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'                  # v0.3.2, v1.0.0, ...
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to release (e.g. v0.3.2)'
+        required: true
+        default: 'v0.3.2'
+
+permissions:
+  contents: write            # 创 GitHub release
+
+jobs:
+  build:
+    name: Build (${{ matrix.target.os }}-${{ matrix.target.arch }})
+    runs-on: ${{ matrix.target.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target:
+              os: ubuntu
+              arch: x86_64
+              runner: ubuntu-latest
+              triple: x86_64-unknown-linux-gnu
+              archive: tar.xz
+            artifact: avc-linux-x86_64
+          - target:
+              os: ubuntu
+              arch: aarch64
+              runner: ubuntu-24.04-arm
+              triple: aarch64-unknown-linux-gnu
+              archive: tar.xz
+            artifact: avc-linux-aarch64
+          - target:
+              os: macos
+              arch: x86_64
+              runner: macos-13
+              triple: x86_64-apple-darwin
+              archive: tar.xz
+            artifact: avc-macos-x86_64
+          - target:
+              os: macos
+              arch: aarch64
+              runner: macos-14
+              triple: aarch64-apple-darwin
+              archive: tar.xz
+            artifact: avc-macos-aarch64
+          - target:
+              os: windows
+              arch: x86_64
+              runner: windows-latest
+              triple: x86_64-pc-windows-msvc
+              archive: zip
+            artifact: avc-windows-x86_64.exe
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target.triple }}
+
+      - name: Cache cargo registry
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Build release binary
+        run: |
+          cargo build --release --locked --target ${{ matrix.target.triple }} --bin avc
+
+      - name: Package artifact
+        shell: bash
+        run: |
+          mkdir -p ${{ matrix.artifact }}
+          cp target/${{ matrix.target.triple }}/release/avc ${{ matrix.artifact }}/avc
+          if [ -f target/${{ matrix.target.triple }}/release/avc.exe ]; then
+            mv target/${{ matrix.target.triple }}/release/avc.exe ${{ matrix.artifact }}/avc.exe
+          fi
+          chmod +x ${{ matrix.artifact }}/avc || true
+          if [ "${{ matrix.target.os }}" = "windows" ]; then
+            (cd ${{ matrix.artifact }} && zip -r ../${{ matrix.artifact }}.zip .)
+          else
+            tar -cJf ${{ matrix.artifact }}.tar.xz -C ${{ matrix.artifact }} .
+          fi
+          ls -la ${{ matrix.artifact }}.${{ matrix.target.archive }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}.${{ matrix.target.archive }}
+          if-no-files-found: error
+          retention-days: 90
+
+  publish:
+    name: GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Determine tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "name=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "name=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          fi
+          echo "Resolving tag: ${{ steps.tag.outputs.name }}"
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Generate checksums
+        shell: bash
+        run: |
+          cd dist
+          for f in */*; do
+            sha256sum "$f" >> SHA256SUMS
+          done
+          cat SHA256SUMS
+          mv SHA256SUMS ../SHA256SUMS
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.name }}
+          name: avc ${{ steps.tag.outputs.name }}
+          body: |
+            See [CHANGELOG.md](../../blob/main/CHANGELOG.md) for release notes.
+
+            ## Install
+
+            ```bash
+            # pick one
+            curl -L https://github.com/${{ github.repository }}/releases/download/${{ steps.tag.outputs.name }}/avc-linux-x86_64.tar.xz | tar xJ
+            curl -L https://github.com/${{ github.repository }}/releases/download/${{ steps.tag.outputs.name }}/avc-macos-aarch64.tar.xz | tar xJ
+            # or
+            cargo install avc --version $(echo ${{ steps.tag.outputs.name }} | tr -d v)
+            ```
+
+            ## Verify
+
+            ```bash
+            sha256sum -c SHA256SUMS
+            ```
+          files: |
+            dist/**/*.tar.xz
+            dist/**/*.zip
+            SHA256SUMS
+          draft: false
+          prerelease: false
+          fail_on_unmatched_files: true
+
+  publish-crates:
+    name: Publish to crates.io
+    needs: publish
+    runs-on: ubuntu-latest
+    # 仅 tag push 自动跑；manual workflow_dispatch 不自动 publish（防误操作）
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    environment:
+      name: publish-crates
+      url: https://crates.io/crates/avc
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Verify dry-run package builds
+        # cargo publish --dry-run 真打 tarball 跑完整 build check；不传网络
+        run: cargo package --no-verify --list  # 先 list 看文件
+      - name: Publish to crates.io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          # --allow-dirty：CI 检出后 Cargo.lock 可能有差异；正式发布前应先 commit
+          cargo publish --locked

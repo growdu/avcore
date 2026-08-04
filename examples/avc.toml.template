@@ -1,0 +1,81 @@
+# avc.toml.template — 完整 avc 配置示例
+#
+# 用法：拷贝到 ~/.config/avc/avc.toml，按需删除/修改段。
+# 每个段对应一个 [provider.<dim>.<name>] 维度的实例；
+# 多个实例互不冲突（按 name 选）。
+
+# ── LLM Provider（OpenAI 兼容 chat）─────────────────────
+# 用于 ask / shell NL 解析 / finetune drift seed text 等。
+[provider.llm.openai]
+api_key = "sk-..."                       # env: OPENAI_API_KEY
+model = "gpt-4o-mini"
+base_url = "https://api.openai.com/v1"   # 默认
+# extra_headers = { "anthropic-version" = "2023-06-01" }  # Anthropic 兼容 proxy
+
+# 备选：DashScope（阿里）
+# [provider.llm.dashscope]
+# api_key = "sk-..."
+# model = "qwen-plus"
+# base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+
+# ── Embed Provider（OpenAI 兼容 embeddings）───────────────
+# 用于 finetune drift eval：seed_text → vector，与 base 比 cosine。
+[provider.embed.openai]
+api_key = "sk-..."
+model = "text-embedding-3-small"
+base_url = "https://api.openai.com/v1"
+
+# ── Avatar Provider（image generation + 可选 vendor SFT）───
+# create() 走 OpenAI 兼容 /v1/images/generations（DALL-E / wanx / CogView）。
+# finetune() 在 cfg.binary 设了的情况下 spawn vendor CLI（kling-avatar-fin.sh）。
+[provider.avatar.openai]
+api_key = "sk-..."
+model = "dall-e-3"
+base_url = "https://api.openai.com/v1"
+
+# 配 vendor CLI：把 kling 头像 SFT 二进制接进来
+[provider.avatar.kling]
+binary = "/usr/local/bin/kling-cli"       # 替换为你自家 SFT 端点
+
+# ── Voice Provider（tts + 可选 vendor SFT/clone）────────
+# synth() 走 OpenAI 兼容 /audio/speech（tts-1）。
+# finetune() 在 cfg.binary 设了的情况下 spawn vendor CLI（elevenlabs-voice-fin.sh）。
+[provider.voice.openai]
+api_key = "sk-..."
+model = "tts-1"
+base_url = "https://api.openai.com/v1"
+
+[provider.voice.elevenlabs]
+binary = "/usr/local/bin/elevenlabs-cli"
+
+# ── Video Provider（CliVideoProvider 三段式）─────────────
+# Phase 2+：binary 设了走真 vendor CLI（kling-video.sh 模板）；
+#           不设返占位 mp4（向后兼容 Phase 1）。
+[provider.video.kling]
+binary = "/usr/local/bin/kling-cli"
+
+# 或不配 binary → Phase 1 占位行为
+# [provider.video.placeholder]
+# （无 binary 字段时 render run 走 mock mp4）
+
+# ── Shell NL 入口配置 ───────────────────────────────────
+[shell]
+nl_model = "gpt-4o-mini"     # 走 [provider.llm.<name>]；缺省 = 第一个 llm provider
+max_plan_steps = 8
+temperature = 0.0
+
+# ── Safety 配置 ─────────────────────────────────────────
+[safety]
+real_person_enabled = false    # 真人类 likeness 开关（默认 false）
+auto_consume_feedback = true   # feedback sample 自动进入下次 finetune
+
+# ── Export to S3 / 对象存储 ─────────────────────────────
+# `avc job export <id> --target s3://bucket/prefix/` 走 upload_cmd 模板；
+# 每条 artifact 替换 {local} {bucket} {prefix} {name} 后 `sh -c`。
+# 替换 upload_cmd 为真 aws-cli / mc / rclone / 自家脚本即可接 S3 兼容服务。
+[export.s3]
+upload_cmd = "aws s3 cp --region us-east-1 {local} s3://{bucket}/{prefix}{name}"
+
+# 或用 mock（开发/CI 无 key 时用 examples/vendor-cli/aws-s3-cp.sh）：
+# [export.s3]
+# upload_cmd = "/path/to/avc/examples/vendor-cli/aws-s3-cp.sh {local} {bucket} {prefix} {name}"

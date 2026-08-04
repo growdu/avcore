@@ -13,7 +13,7 @@ pub fn dispatch(argv: &[String]) -> AvcResult<()> {
     );
 
     if argv.is_empty() {
-        return Err(AvcError::Arg("iterate list|apply|show ...".into()));
+        return Err(AvcError::Arg("iterate list|apply|show|cancel ...".into()));
     }
 
     let db = Db::open_default()?;
@@ -25,6 +25,8 @@ pub fn dispatch(argv: &[String]) -> AvcResult<()> {
                 .get(1)
                 .copied()
                 .ok_or_else(|| AvcError::Arg("iterate list <persona>".into()))?;
+            // 先验 persona 存在：未知 -> NotFound (exit 3)，与 persona show / apply 一致
+            crate::svc::persona::get_persona(&db, name)?;
             let conn = db.conn.lock().unwrap();
             let mut stmt = conn.prepare(
                 "SELECT ij.id, ij.persona_model_id, ij.target_version, ij.status, ij.started_at
@@ -47,6 +49,90 @@ pub fn dispatch(argv: &[String]) -> AvcResult<()> {
                 out.push(r?);
             }
             print(mode, &out)?;
+        }
+        "show" => {
+            // iterate show <ij_id> → ij 详情（changes_json / status / started_at / finished_at）
+            let ij_id = argv_ref
+                .get(1)
+                .copied()
+                .ok_or_else(|| AvcError::Arg("iterate show <ij_id>".into()))?;
+            let conn = db.conn.lock().unwrap();
+            type IjRow = (
+                String,
+                String,
+                i64,
+                String,
+                String,
+                Option<String>,
+                Option<String>,
+            );
+            let row: Result<IjRow, _> = conn.query_row(
+                "SELECT ij.id, pm.name, ij.target_version, ij.changes_json, ij.status,
+                            ij.started_at, ij.finished_at
+                     FROM iterate_jobs ij
+                     JOIN persona_models pm ON pm.id = ij.persona_model_id
+                     WHERE ij.id = ?",
+                [ij_id],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                    ))
+                },
+            );
+            drop(conn);
+            let (id, name, target_v, changes, status, started, finished) =
+                row.map_err(|_| AvcError::NotFound(format!("iterate job '{}'", ij_id)))?;
+            let changes_parsed: serde_json::Value =
+                serde_json::from_str(&changes).unwrap_or(serde_json::Value::String(changes));
+            print(
+                mode,
+                &serde_json::json!({
+                    "id": id,
+                    "persona": name,
+                    "target_version": target_v,
+                    "status": status,
+                    "changes": changes_parsed,
+                    "started_at": started,
+                    "finished_at": finished,
+                }),
+            )?;
+        }
+        "cancel" => {
+            // iterate cancel <ij_id> → 标 status='cancelled'（仅 queued/running；succeeded/failed/cancelled 拒）
+            let ij_id = argv_ref
+                .get(1)
+                .copied()
+                .ok_or_else(|| AvcError::Arg("iterate cancel <ij_id>".into()))?;
+            let mut conn = db.conn.lock().unwrap();
+            let tx = conn.transaction()?;
+            let status: String = tx
+                .query_row(
+                    "SELECT status FROM iterate_jobs WHERE id = ?",
+                    [ij_id],
+                    |r| r.get(0),
+                )
+                .map_err(|_| AvcError::NotFound(format!("iterate job '{}'", ij_id)))?;
+            if status != "queued" && status != "running" {
+                return Err(AvcError::Conflict(format!(
+                    "iterate job '{}' is in '{}' state; cannot cancel",
+                    ij_id, status
+                )));
+            }
+            tx.execute(
+                "UPDATE iterate_jobs SET status = 'cancelled', finished_at = ? WHERE id = ?",
+                rusqlite::params![crate::svc::now_iso(), ij_id],
+            )?;
+            tx.commit()?;
+            print(
+                mode,
+                &serde_json::json!({"iterate_job_id": ij_id, "status": "cancelled"}),
+            )?;
         }
         "apply" => {
             let name = argv_ref.get(1).copied().ok_or_else(|| {

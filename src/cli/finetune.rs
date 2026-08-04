@@ -14,7 +14,7 @@ pub fn dispatch(argv: &[String]) -> AvcResult<()> {
 
     if argv.is_empty() {
         return Err(AvcError::Arg(
-            "finetune start|list|show|publish|drift ...".into(),
+            "finetune start|list|show|publish|drift|run|report|cancel ...".into(),
         ));
     }
 
@@ -27,6 +27,8 @@ pub fn dispatch(argv: &[String]) -> AvcResult<()> {
                 .get(1)
                 .copied()
                 .ok_or_else(|| AvcError::Arg("finetune list <persona>".into()))?;
+            // 先验 persona 存在：未知 -> NotFound (exit 3)，与 iterate list / persona show 一致
+            crate::svc::persona::get_persona(&db, name)?;
             let conn = db.conn.lock().unwrap();
             let mut stmt = conn.prepare(
                 "SELECT fj.id, fj.persona_model_id, fj.base_version, fj.target_version, fj.status, fj.started_at
@@ -50,6 +52,119 @@ pub fn dispatch(argv: &[String]) -> AvcResult<()> {
                 out.push(r?);
             }
             print(mode, &out)?;
+        }
+        "show" => {
+            // finetune show <fj_id> → fj 详情（base/target/scope/status/started_at/finished_at）
+            let fj_id = argv_ref
+                .get(1)
+                .copied()
+                .ok_or_else(|| AvcError::Arg("finetune show <fj_id>".into()))?;
+            let conn = db.conn.lock().unwrap();
+            type FjRow = (
+                String,
+                String,
+                i64,
+                Option<i64>,
+                String,
+                String,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+            );
+            let row: Result<FjRow, _> =
+                conn.query_row(
+                    "SELECT fj.id, pm.name, fj.base_version, fj.target_version,
+                            fj.status, fj.scope_json, fj.started_at, fj.finished_at, fj.drift_report_json
+                     FROM finetune_jobs fj
+                     JOIN persona_models pm ON pm.id = fj.persona_model_id
+                     WHERE fj.id = ?",
+                    [fj_id],
+                    |r| {
+                        Ok((
+                            r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?,
+                            r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?,
+                        ))
+                    },
+                );
+            drop(conn);
+            let (id, name, base_v, target_v, status, scope, started, finished, drift_json) =
+                row.map_err(|_| AvcError::NotFound(format!("finetune job '{}'", fj_id)))?;
+            print(
+                mode,
+                &serde_json::json!({
+                    "id": id,
+                    "persona": name,
+                    "base_version": base_v,
+                    "target_version": target_v,
+                    "status": status,
+                    "scope": serde_json::from_str::<Vec<String>>(&scope).unwrap_or_default(),
+                    "started_at": started,
+                    "finished_at": finished,
+                    "drift_report": drift_json.and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()),
+                }),
+            )?;
+        }
+        "report" => {
+            // finetune report <fj_id> → drift_report_json 单独输出（便于管道）
+            let fj_id = argv_ref
+                .get(1)
+                .copied()
+                .ok_or_else(|| AvcError::Arg("finetune report <fj_id>".into()))?;
+            let conn = db.conn.lock().unwrap();
+            let drift_json: Option<String> = conn
+                .query_row(
+                    "SELECT drift_report_json FROM finetune_jobs WHERE id = ?",
+                    [fj_id],
+                    |r| r.get(0),
+                )
+                .map_err(|_| AvcError::NotFound(format!("finetune job '{}'", fj_id)))?;
+            drop(conn);
+            match drift_json {
+                None => {
+                    return Err(AvcError::Conflict(format!(
+                        "finetune job '{}' has no drift_report (尚未 run 或 publish)",
+                        fj_id
+                    )));
+                }
+                Some(s) => {
+                    let parsed: serde_json::Value =
+                        serde_json::from_str(&s).unwrap_or(serde_json::Value::String(s));
+                    print(mode, &parsed)?;
+                }
+            }
+        }
+        "cancel" => {
+            // finetune cancel <fj_id> → 标 status='cancelled'（仅 queued/running；已
+            // succeeded/failed_drift/cancelled 拒）；外部 vendor SFT 不会被本命令停，
+            // 仅记账。需要外部 cleanup 时手动。
+            let fj_id = argv_ref
+                .get(1)
+                .copied()
+                .ok_or_else(|| AvcError::Arg("finetune cancel <fj_id>".into()))?;
+            let mut conn = db.conn.lock().unwrap();
+            let tx = conn.transaction()?;
+            let status: String = tx
+                .query_row(
+                    "SELECT status FROM finetune_jobs WHERE id = ?",
+                    [fj_id],
+                    |r| r.get(0),
+                )
+                .map_err(|_| AvcError::NotFound(format!("finetune job '{}'", fj_id)))?;
+            if status == "succeeded" || status == "failed_drift" || status == "cancelled" {
+                return Err(AvcError::Conflict(format!(
+                    "finetune job '{}' is in '{}' state; cannot cancel",
+                    fj_id, status
+                )));
+            }
+            tx.execute(
+                "UPDATE finetune_jobs SET status = 'cancelled', finished_at = ? WHERE id = ?",
+                rusqlite::params![crate::svc::now_iso(), fj_id],
+            )?;
+            tx.commit()?;
+            print(
+                mode,
+                &serde_json::json!({"finetune_job_id": fj_id, "status": "cancelled"}),
+            )?;
         }
         "start" => {
             let name = argv_ref.get(1).copied().ok_or_else(|| {
@@ -226,6 +341,73 @@ pub fn dispatch(argv: &[String]) -> AvcResult<()> {
                     reported_cosine, threshold
                 )));
             }
+        }
+        "run" => {
+            // finetune run <fj_id> [--embed <name>]
+            // 端到端：调 voice/avatar Provider SFT → 算 voice drift → publish/rollback
+            let fj_id = argv_ref
+                .get(1)
+                .copied()
+                .ok_or_else(|| AvcError::Arg("finetune run <fj_id> [--embed <name>]".into()))?;
+            let mut embed_name: Option<&str> = None;
+            let mut i = 2;
+            while i < argv_ref.len() {
+                match argv_ref[i] {
+                    "--embed" => {
+                        embed_name = argv_ref.get(i + 1).copied();
+                        i += 2;
+                    }
+                    _ => {
+                        return Err(AvcError::Arg(format!(
+                            "finetune run: unknown flag '{}'",
+                            argv_ref[i]
+                        )));
+                    }
+                }
+            }
+            let cfg = crate::config::Config::load(&crate::config::Config::default_config_path()?)?;
+            let report = crate::svc::finetune::run(&db, &cfg, fj_id, embed_name)?;
+            // 状态语义：succeeded → exit 0；failed_drift → exit 4 (Conflict)
+            // CLI 表面把 provider 错误（network/binary）原样返 ProviderUpstream 退出码。
+            if report.status == "failed_drift" {
+                print(
+                    mode,
+                    &serde_json::json!({
+                        "finetune_job_id": report.finetune_job_id,
+                        "persona": report.persona,
+                        "base_version": report.base_version,
+                        "target_version": report.target_version,
+                        "scopes_processed": report.scopes_processed,
+                        "status": report.status,
+                        "voice_cosine": report.voice_cosine,
+                        "face_cosine": report.face_cosine,
+                        "style_cosine": report.style_cosine,
+                        "threshold": report.threshold,
+                        "samples_used": report.samples_used,
+                    }),
+                )?;
+                return Err(AvcError::Conflict(format!(
+                    "drift below threshold: voice={:?} face={:?} style={:?} < {}",
+                    report.voice_cosine, report.face_cosine, report.style_cosine, report.threshold
+                )));
+            }
+            print(
+                mode,
+                &serde_json::json!({
+                    "finetune_job_id": report.finetune_job_id,
+                    "persona": report.persona,
+                    "base_version": report.base_version,
+                    "target_version": report.target_version,
+                    "scopes_processed": report.scopes_processed,
+                    "status": report.status,
+                    "voice_cosine": report.voice_cosine,
+                    "face_cosine": report.face_cosine,
+                    "style_cosine": report.style_cosine,
+                    "threshold": report.threshold,
+                    "samples_used": report.samples_used,
+                    "next_step": "avc persona set-current <name> --to <target> or render run with --version <target>",
+                }),
+            )?;
         }
         _ => {
             return Err(AvcError::Arg(format!(

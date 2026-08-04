@@ -1,0 +1,103 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'tests/**'
+      - 'migrations/**'
+      - 'examples/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/ci.yml'
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fmt:
+    name: cargo fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  test:
+    name: Build & Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: cargo build
+        run: cargo build --locked --all-targets
+
+      - name: cargo test
+        # windows + macos runner：单个 test 默认 5min timeout，pack 等可能 30s+，
+        # 给 60s 容忍度。windows 上 rusqlite::bundled 编译耗时 +30s。
+        run: cargo test --locked --all-targets
+
+  clippy:
+    name: cargo clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+      # CI 上 clippy 视为 error；本地开发可以 -A warn
+      - run: cargo clippy --locked --all-targets -- -D warnings
+
+  # 验证 examples/ 模板在干净环境下也能跑通
+  examples-smoke:
+    name: examples/ e2e
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: cargo build
+        run: cargo build --locked
+      - name: 跑 examples/README.md 30 秒 e2e
+        run: |
+          set -e
+          mkdir -p /tmp/avc-examples-data /tmp/avc-examples-config /tmp/avc-examples-s3
+          XDG_DATA_HOME=/tmp/avc-examples-data XDG_CONFIG_HOME=/tmp/avc-examples-config \
+            ./target/debug/avc init
+          XDG_DATA_HOME=/tmp/avc-examples-data XDG_CONFIG_HOME=/tmp/avc-examples-config \
+            ./target/debug/avc persona create --name yu
+          cat > /tmp/avc-examples-config/avc/avc.toml <<TOML
+          [provider.video.kling]
+          binary = "$GITHUB_WORKSPACE/examples/vendor-cli/kling-video.sh"
+
+          [export.s3]
+          upload_cmd = "$GITHUB_WORKSPACE/examples/vendor-cli/aws-s3-cp.sh {local} {bucket} {prefix} {name}"
+          TOML
+          JID=$(XDG_DATA_HOME=/tmp/avc-examples-data XDG_CONFIG_HOME=/tmp/avc-examples-config \
+            ./target/debug/avc render run --persona yu --version 1 --topic "ci" --video-provider kling \
+            | python3 -c "import sys, json; print(json.load(sys.stdin)['job_id'])")
+          echo "JID=$JID"
+          S3_MIRROR_ROOT=/tmp/avc-examples-s3 S3_UPLOAD_LOG=/tmp/avc-examples-s3/upload.log \
+          XDG_DATA_HOME=/tmp/avc-examples-data XDG_CONFIG_HOME=/tmp/avc-examples-config \
+            ./target/debug/avc job export "$JID" --target s3://my-bucket/videos/
+          test -f /tmp/avc-examples-s3/my-bucket/videos/i2v__i2v__art_*.bin || \
+            (echo "i2v artifact missing from s3 mirror"; exit 1)

@@ -112,8 +112,8 @@ flowchart LR
 
 ```mermaid
 flowchart LR
-    SF[sample_filter] -->|"if avatar"| AT[avatar SFT]
-    SF -->|"if voice"| VT[voice SFT]
+    SF[sample_filter] -->|"if avatar"| AT[avatar SFT vendor CLI]
+    SF -->|"if voice"| VT[voice SFT vendor CLI]
     SF -->|"if persona"| PT[persona SFT]
     AT --> AN[anchor extract]
     VT --> AN
@@ -124,6 +124,14 @@ flowchart LR
 ```
 
 > 所有 SFT 节点都走 Provider 的远端 SFT 端点——**AVCore 不下载权重**。
+>
+> **vendor CLI 协议**（`OpenAiCompat{Avatar,Voice}Provider.finetune` 在 `cfg.binary` 设了的情况下）：
+> 1. `binary finetune submit --ref-image <paths...>`（avatar）/ `--ref-audio <paths...>`（voice）→ stdout `task_id=...`
+> 2. `binary finetune status --task-id <id>` → stdout `status=done|pending|failed`，500ms poll、5 min timeout
+> 3. `binary finetune fetch --task-id <id> --out <path>` → 写真 PNG/WAV 文件
+>
+> 仿 CliVideoProvider 三段式；fetch 出来的 tmp 文件由 `TempFileGuard` 在 drop 时清。
+> 未配 `binary` 时按既有行为报 "requires a vendor CLI binary"（`avc finetune publish` 走手动 drift 也保留）。
 
 ### 4.2 样本池（persona_samples）
 
@@ -205,11 +213,24 @@ plan (no changes made):
 ```bash
 avc sample add yu --kind audio --uri ./new.wav --text "..." --consent ./auth.pdf
 avc finetune start yu --scope voice --base-version 1 --threshold 0.85
+avc finetune run fj_xxx --embed openai_embed           # 端到端：SFT → drift → publish/rollback
+avc finetune drift eval fj_xxx --embed openai_embed    # 只算 drift 不动 fj.status
 avc finetune list --persona yu
 avc finetune show fj_xxx
+avc finetune publish fj_xxx --passed                   # 测试用：手动 publish
 avc finetune report fj_xxx --json
 avc finetune cancel fj_xxx
 ```
+
+> `avc finetune run` 是 Phase 2.5 新加的端到端 verb：
+> 1. 校验 `fj.status == 'running'`（已 published → Conflict）
+> 2. 拉 `persona_samples` kind=image/audio → materialize 到 tmp → 调 `provider.finetune()`
+> 3. 把 vendor 返的 PNG/WAV 写到 `persona_versions` target 行（`voice_sample` / `avatar_primary`）
+> 4. 若 voice scope：调 `embed.<name>.embed("persona:<name>:target:<v>")` → 写 `voice_embed` → 与 base 算 cosine
+> 5. `cosine ≥ threshold` → `UPDATE persona_versions SET status='ready'` + `finetune_jobs.status='succeeded'`
+>    `< threshold` → `DELETE persona_versions target` + `finetune_jobs.status='failed_drift'`
+>
+> 退出码：succeeded → 0、failed_drift → 4、缺 `--embed`（voice scope 时）→ 2、Provider 错误 → 11/12。
 
 **集成**（典型工作流）：
 

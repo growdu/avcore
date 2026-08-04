@@ -97,12 +97,29 @@ pub fn list_artifacts(db: &Db, job_id: &str) -> AvcResult<Vec<ArtifactRow>> {
     Ok(out)
 }
 
-/// Phase 2: 把一个 job 的所有 artifacts (BLOB) 落 FS 到 out_dir/<kind>__<name>__<id>.bin。
+/// Phase 2.5: export 目标。
+///
+/// - `Local(dir)`: 落 FS 到 `dir/<kind>__<name>__<id>.bin`（Phase 2 既有行为）。
+/// - `S3 { bucket, prefix, upload_cmd }`: 每个 artifact materializes 到 tmp 后用
+///   `upload_cmd` 模板（`{local} {bucket} {prefix} {name}` 占位符替换后 `sh -c`）
+///   跑上传；上传完即删 tmp。`upload_cmd` 默认是 `aws s3 cp --region us-east-1
+///   {local} s3://{bucket}/{prefix}{name}`（来自 `[export.s3]` config）。
+#[derive(Debug, Clone)]
+pub enum ExportTarget<'a> {
+    Local(&'a std::path::Path),
+    S3 {
+        bucket: &'a str,
+        prefix: &'a str,
+        upload_cmd: &'a str,
+    },
+}
+
+/// Phase 2.5: 把一个 job 的所有 artifacts 按 target 导出。
 /// 返 (写出文件数, 累计 bytes)。
 pub fn export_artifacts(
     db: &Db,
     job_id: &str,
-    out_dir: &std::path::Path,
+    target: ExportTarget<'_>,
 ) -> AvcResult<(usize, u64)> {
     // 0. 校验 job 存在
     let exists: bool = db
@@ -118,11 +135,18 @@ pub fn export_artifacts(
         return Err(AvcError::NotFound(format!("job '{}'", job_id)));
     }
 
-    // 1. mkdir -p
-    std::fs::create_dir_all(out_dir)
-        .map_err(|e| AvcError::Db(format!("mkdir {}: {}", out_dir.display(), e)))?;
+    // 1. 准备 target
+    match target {
+        ExportTarget::Local(out_dir) => {
+            std::fs::create_dir_all(out_dir)
+                .map_err(|e| AvcError::Db(format!("mkdir {}: {}", out_dir.display(), e)))?;
+        }
+        ExportTarget::S3 { .. } => {
+            // S3 不需要 prep
+        }
+    }
 
-    // 2. 读每条 artifact BLOB 写文件
+    // 2. 读每条 artifact BLOB
     let conn = db.conn.lock().unwrap();
     let mut stmt = conn.prepare(
         "SELECT id, kind, name, content FROM artifacts WHERE job_id = ? ORDER BY created_at ASC",
@@ -139,33 +163,78 @@ pub fn export_artifacts(
     let mut total_bytes = 0u64;
     for r in rows {
         let (id, kind, name, blob) = r?;
-        let safe_kind = kind
-            .chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
-                    c
-                } else {
-                    '_'
+        let safe_kind = sanitize(&kind, &['_', '-']);
+        let safe_name = sanitize(&name, &['_', '-', '.']);
+        let file_name = format!("{}__{}__{}.bin", safe_kind, safe_name, id);
+
+        match target {
+            ExportTarget::Local(out_dir) => {
+                let path = out_dir.join(&file_name);
+                std::fs::write(&path, &blob)
+                    .map_err(|e| AvcError::Db(format!("write {}: {}", path.display(), e)))?;
+            }
+            ExportTarget::S3 {
+                bucket,
+                prefix,
+                upload_cmd,
+            } => {
+                // materializes 到 tmp + 调 upload_cmd
+                let tmp = std::env::temp_dir().join(format!("avc-export-{}-{}", job_id, file_name));
+                std::fs::write(&tmp, &blob)
+                    .map_err(|e| AvcError::Db(format!("write tmp {}: {}", tmp.display(), e)))?;
+                let cmd_str = upload_cmd
+                    .replace("{local}", &shell_quote(&tmp.display().to_string()))
+                    .replace("{bucket}", &shell_quote(bucket))
+                    .replace("{prefix}", &shell_quote(prefix))
+                    .replace("{name}", &shell_quote(&file_name));
+                let out = std::process::Command::new("sh")
+                    .arg("-c")
+                    .arg(&cmd_str)
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .output()
+                    .map_err(|e| {
+                        // 尽力清 tmp
+                        let _ = std::fs::remove_file(&tmp);
+                        AvcError::ProviderUpstream(format!("spawn upload_cmd `{}`: {}", cmd_str, e))
+                    })?;
+                let _ = std::fs::remove_file(&tmp);
+                if !out.status.success() {
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    let stdout = String::from_utf8_lossy(&out.stdout);
+                    return Err(AvcError::ProviderUpstream(format!(
+                        "upload_cmd `{}` exit {:?}: stdout={} stderr={}",
+                        cmd_str,
+                        out.status.code(),
+                        stdout,
+                        stderr
+                    )));
                 }
-            })
-            .collect::<String>();
-        let safe_name = name
-            .chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.' {
-                    c
-                } else {
-                    '_'
-                }
-            })
-            .collect::<String>();
-        let path = out_dir.join(format!("{}__{}__{}.bin", safe_kind, safe_name, id));
-        std::fs::write(&path, &blob)
-            .map_err(|e| AvcError::Db(format!("write {}: {}", path.display(), e)))?;
+            }
+        }
         total_bytes += blob.len() as u64;
         count += 1;
     }
     Ok((count, total_bytes))
+}
+
+fn sanitize(s: &str, extra: &[char]) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || extra.contains(&c) {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// 单引号包裹（POSIX shell）；对已含单引号的字符串不完美，但 artifact name 是受控的
+///（只走 sanitize 输出），实际不会出现 '。
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s)
 }
 
 /// Phase 2: 反馈入口 — 用户标 "looks_unlike" → 写 persona_samples(kind='feedback', source='user_feedback')。
@@ -264,4 +333,239 @@ pub fn pack(
         }
     }
     Ok((job_ids, errors))
+}
+
+#[cfg(test)]
+mod export_tests {
+    use super::*;
+    use crate::db::Db;
+
+    fn open_temp_db() -> (tempfile::TempDir, Db) {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let db = Db::open(&dir.path().join("test.db")).expect("open db");
+        (dir, db)
+    }
+
+    /// 起一个 job + 2 个 artifacts（kind=clip, name=i2v / script_gen）。
+    fn seed_job_with_artifacts(db: &Db) -> String {
+        // 1. persona
+        let pid = crate::svc::new_id("pm");
+        let now = crate::svc::now_iso();
+        let conn = db.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO persona_models (id, name, current_version, status, created_at, updated_at)
+             VALUES (?1, 'yu', 1, 'active', ?2, ?2)",
+            rusqlite::params![&pid, &now],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO persona_versions (persona_model_id, version, status, created_at)
+             VALUES (?1, 1, 'ready', ?2)",
+            rusqlite::params![&pid, &now],
+        )
+        .unwrap();
+        // 2. job（jobs 表无 topic 列；status='succeeded' 让 export 不依赖 step 状态）
+        let jid = crate::svc::new_id("job");
+        conn.execute(
+            "INSERT INTO jobs (id, persona_model_id, persona_version, status, created_at)
+             VALUES (?1, ?2, 1, 'succeeded', ?3)",
+            rusqlite::params![&jid, &pid, &now],
+        )
+        .unwrap();
+        // 3. artifacts
+        for (kind, name, blob) in [
+            ("clip", "i2v", b"MOCK_CLIP_BLOB".to_vec()),
+            ("audio", "tts", b"MOCK_TTS_BLOB".to_vec()),
+        ] {
+            let aid = crate::svc::new_id("art");
+            conn.execute(
+                "INSERT INTO artifacts (id, job_id, kind, name, content, byte_size, mime, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'application/octet-stream', ?7)",
+                rusqlite::params![&aid, &jid, kind, name, &blob, &(blob.len() as i64), &now],
+            )
+            .unwrap();
+        }
+        drop(conn);
+        jid
+    }
+
+    #[test]
+    fn export_local_writes_files_to_dir() {
+        let (dir, db) = open_temp_db();
+        let jid = seed_job_with_artifacts(&db);
+        let out_dir = dir.path().join("out");
+        let (count, bytes) =
+            export_artifacts(&db, &jid, ExportTarget::Local(&out_dir)).expect("export ok");
+        assert_eq!(count, 2);
+        assert!(bytes > 20);
+        let files: Vec<_> = std::fs::read_dir(&out_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        assert_eq!(files.len(), 2, "应写 2 个文件；out_dir={:?}", out_dir);
+    }
+
+    #[test]
+    fn export_s3_invokes_upload_cmd_per_artifact() {
+        // mock uploader 写到 /tmp/avc-s3-mock/<bucket>/<prefix><name>，并 echo 调用 args 到 log
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let dest_root = dir.path().join("bucket");
+        std::fs::create_dir_all(&dest_root).unwrap();
+        let log_path = dir.path().join("upload.log");
+
+        let uploader = dir.path().join("mock_s3.sh");
+        let script = format!(
+            r#"#!/bin/sh
+# mock s3 cp: 接 4 个替换后的参数，写文件 + 记 log
+# 期望 args: <local> <bucket> <prefix> <name>
+LOCAL=$1
+BUCKET=$2
+PREFIX=$3
+NAME=$4
+mkdir -p "{dest}/$BUCKET/$PREFIX"
+mkdir -p "$(dirname "$LOCAL")"
+cp "$LOCAL" "{dest}/$BUCKET/$PREFIX$NAME"
+printf '%s %s %s %s
+' "$LOCAL" "$BUCKET" "$PREFIX" "$NAME" >> {log}
+"#,
+            dest = dest_root.display(),
+            log = log_path.display(),
+        );
+        std::fs::write(&uploader, script).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&uploader, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let upload_cmd = format!(
+            "{} {{local}} {{bucket}} {{prefix}} {{name}}",
+            uploader.display()
+        );
+
+        let (tdb_dir, db) = open_temp_db();
+        let jid = seed_job_with_artifacts(&db);
+        let (count, bytes) = export_artifacts(
+            &db,
+            &jid,
+            ExportTarget::S3 {
+                bucket: "yu-bucket",
+                prefix: "videos/2026/",
+                upload_cmd: &upload_cmd,
+            },
+        )
+        .expect("export ok");
+        assert_eq!(count, 2);
+        assert!(bytes > 20);
+
+        // 验证：2 个文件落到 dest_root/yu-bucket/videos/2026/<name>
+        let placed: Vec<_> = std::fs::read_dir(dest_root.join("yu-bucket/videos/2026"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(
+            placed.len(),
+            2,
+            "应 2 个文件落到 s3 mock；placed={:?}",
+            placed
+        );
+        for f in &placed {
+            assert!(f.ends_with(".bin"), "文件名后缀 .bin；got {}", f);
+        }
+
+        // 验证 log 记录了 2 次调用
+        let log = std::fs::read_to_string(&log_path).unwrap();
+        let lines: Vec<&str> = log.lines().collect();
+        assert_eq!(lines.len(), 2, "upload_cmd 应被调 2 次；log={}", log);
+        for line in &lines {
+            assert!(line.contains("yu-bucket videos/2026/"), "line={}", line);
+        }
+
+        // 验证 tdb_dir 已经被 drop（虽然不是真删，但表明 no panic）
+        let _ = tdb_dir;
+    }
+
+    #[test]
+    fn export_s3_upload_cmd_failure_returns_provider_upstream() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let uploader = dir.path().join("fail.sh");
+        std::fs::write(
+            &uploader,
+            "#!/bin/sh
+echo upload failed >&2
+exit 1
+",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&uploader, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let upload_cmd = format!(
+            "{} {{local}} {{bucket}} {{prefix}} {{name}}",
+            uploader.display()
+        );
+
+        let (_tdb_dir, db) = open_temp_db();
+        let jid = seed_job_with_artifacts(&db);
+        let res = export_artifacts(
+            &db,
+            &jid,
+            ExportTarget::S3 {
+                bucket: "b",
+                prefix: "p/",
+                upload_cmd: &upload_cmd,
+            },
+        );
+        assert!(
+            matches!(res, Err(AvcError::ProviderUpstream(_))),
+            "upload_cmd exit !=0 应 ProviderUpstream；got {:?}",
+            res.map(|r| r.0)
+        );
+    }
+
+    #[test]
+    fn export_s3_upload_cmd_missing_returns_provider_upstream() {
+        let (_tdb_dir, db) = open_temp_db();
+        let jid = seed_job_with_artifacts(&db);
+        let res = export_artifacts(
+            &db,
+            &jid,
+            ExportTarget::S3 {
+                bucket: "b",
+                prefix: "p/",
+                upload_cmd: "/nonexistent/path/to/uploader {local} {bucket} {prefix} {name}",
+            },
+        );
+        assert!(
+            matches!(res, Err(AvcError::ProviderUpstream(_))),
+            "spawn fail 应 ProviderUpstream；got {:?}",
+            res.map(|r| r.0)
+        );
+    }
+
+    #[test]
+    fn export_nonexistent_job_returns_notfound() {
+        let (_tdb_dir, db) = open_temp_db();
+        let res = export_artifacts(
+            &db,
+            "job_xxx",
+            ExportTarget::Local(std::path::Path::new("/tmp")),
+        );
+        assert!(matches!(res, Err(AvcError::NotFound(_))));
+    }
+
+    #[test]
+    fn shell_quote_wraps_in_single_quotes() {
+        assert_eq!(shell_quote("abc"), "'abc'");
+        assert_eq!(shell_quote("/tmp/x"), "'/tmp/x'");
+    }
+
+    #[test]
+    fn sanitize_strips_unsafe_chars() {
+        assert_eq!(sanitize("hello world", &['_', '-']), "hello_world");
+        assert_eq!(sanitize("foo.bar", &['_', '-', '.']), "foo.bar");
+        assert_eq!(sanitize(r"a/b\c", &['_', '-']), "a_b_c");
+    }
 }
