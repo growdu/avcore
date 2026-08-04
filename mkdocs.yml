@@ -76,6 +76,7 @@ nav:
   - 首页: README.md
   - 设计: design.md
   - 架构: architecture.md
+  - 人物全生命周期: persona-lifecycle.md
   - 实现状态: status.md
   - 存储: storage.md
   - CLI: cli.md

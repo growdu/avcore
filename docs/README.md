@@ -11,6 +11,7 @@ docs/
 ├── README.md                  ← 你在这里
 ├── design.md                  设计
 ├── architecture.md            架构
+├── persona-lifecycle.md        人物生成、持久化、还原与使用
 ├── storage.md                 单一 SQLite schema
 ├── cli.md                     CLI
 ├── modules/                   子模块
@@ -29,6 +30,7 @@ docs/
 |----------|--------|
 | 总览 | [design.md](./design.md) |
 | 架构 + 技术选型 | [architecture.md](./architecture.md) |
+| 人物如何生成、保存并还原使用 | [persona-lifecycle.md](./persona-lifecycle.md) |
 | 数据怎么存 | [storage.md](./storage.md) |
 | 命令行怎么用 | [cli.md](./cli.md) |
 | 怎么创建一个角色 | [modules/persona-modeling.md](./modules/persona-modeling.md) |
