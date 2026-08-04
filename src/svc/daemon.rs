@@ -101,6 +101,14 @@ mod tests {
         clear_pid().unwrap();
         assert_eq!(read_pid().unwrap(), None);
     }
+
+    /// `_run` 会卡在 signal 上，单元测试很难完整跑；
+    /// 这里只验证它存在并能构造 future（不 poll，不会触发 DB 打开）。
+    /// 实际信号路径在 `main.rs` (T17) 通过 LocalSet + ctrl_c 触发。
+    #[test]
+    fn _run_compiles() {
+        let _f = _run(Config::default());
+    }
 }
 
 // ---- T14: axum HTTP server ----
@@ -245,6 +253,95 @@ pub async fn run_ping_loop(cfg: Config, conn: Arc<Mutex<rusqlite::Connection>>) 
         }
         drop(conn_guard);
         tokio::time::sleep(interval).await;
+    }
+}
+
+/// daemon 主入口（在 tokio LocalSet 中跑）
+///
+/// 1. 写 `daemon_meta`（started_at / version / port / pid）
+/// 2. `spawn_local` ping loop + http server（它们持 `&Connection` 跨 await，非 Send）
+/// 3. 阻塞等 SIGTERM / SIGINT（Unix）或 Ctrl-C（Windows）
+/// 4. 信号到达：清 `daemon_meta` + 清 pidfile
+///
+/// 注意：`run_ping_loop` 与 `run_http` 内部持 `&rusqlite::Connection` 跨 `.await`，
+/// 因此产生的 future 不是 `Send`，**必须**在 `LocalSet` 内 `spawn_local`，
+/// 不能在多线程 runtime 上 `tokio::spawn`。
+pub async fn _run(cfg: Config) -> AvcResult<()> {
+    // 1. 写 daemon_meta
+    let conn = crate::db::open_default()?;
+    let started_at = crate::svc::now_iso();
+    std::env::set_var("AVC_DAEMON_STARTED_AT", &started_at);
+    let pid = std::process::id();
+    let version = env!("CARGO_PKG_VERSION");
+    let port_str = cfg.daemon.port.to_string();
+    let pid_str = pid.to_string();
+    conn.execute_batch(&format!(
+        "INSERT OR REPLACE INTO daemon_meta (key, value) VALUES
+            ('started_at', '{}'),
+            ('version', '{}'),
+            ('port', '{}'),
+            ('pid', '{}')",
+        started_at, version, port_str, pid_str,
+    ))?;
+    let conn = Arc::new(Mutex::new(conn));
+
+    // 2. 起 LocalSet（因 ping loop / http server 持 &Connection 非 Send）
+    let local = tokio::task::LocalSet::new();
+    let cfg_for_ping = cfg.clone();
+    let conn_for_ping = conn.clone();
+    local.spawn_local(async move {
+        run_ping_loop(cfg_for_ping, conn_for_ping).await;
+    });
+    let conn_for_http = conn.clone();
+    let bind = cfg.daemon.bind.clone();
+    let port = cfg.daemon.port;
+    local.spawn_local(async move {
+        if let Err(e) = run_http(&bind, port, conn_for_http).await {
+            tracing::error!("http: {}", e);
+        }
+    });
+
+    // 3. 在 local 中跑 signal 监听
+    local.run_until(wait_for_signal()).await;
+
+    // 4. 清理：daemon_meta + pidfile
+    {
+        let conn_guard = conn.lock().await;
+        let _ = conn_guard.execute("DELETE FROM daemon_meta", []);
+    }
+    let _ = clear_pid();
+    Ok(())
+}
+
+/// 等待 SIGTERM / SIGINT（Unix）或 Ctrl-C（Windows）
+async fn wait_for_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut sigterm = match signal(SignalKind::terminate()) {
+            Ok(s) => s,
+            Err(_) => {
+                // 无法安装 handler —— 永不返回
+                std::future::pending::<()>().await;
+                return;
+            }
+        };
+        let mut sigint = match signal(SignalKind::interrupt()) {
+            Ok(s) => s,
+            Err(_) => {
+                std::future::pending::<()>().await;
+                return;
+            }
+        };
+        tokio::select! {
+            _ = sigterm.recv() => tracing::info!("SIGTERM received"),
+            _ = sigint.recv() => tracing::info!("SIGINT received"),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+        tracing::info!("ctrl_c received");
     }
 }
 
