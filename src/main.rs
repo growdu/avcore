@@ -4,11 +4,12 @@
 //! - CLI 模式：`avc <atom>` 一次性精确命令
 //! - Shell 模式：`avc shell` 或 TTY 下裸 `avc`，交互式 Shell
 //! - ask 模式：`avc ask "..."`，非交互式 NL
+//! - Daemon 内部入口：`avc _run`（T17 hidden verb，由 T18 的 `daemon start` 触发）
 
 use std::io::IsTerminal;
 use std::process::ExitCode;
 
-use avc::{ask, cli, shell};
+use avc::{ask, cli, config, shell};
 
 fn main() -> ExitCode {
     // 初始化 tracing
@@ -21,6 +22,45 @@ fn main() -> ExitCode {
         .try_init();
 
     let args: Vec<String> = std::env::args().collect();
+
+    // T17: 隐藏 verb `_run` —— daemon 内部入口。
+    // `_run` 非 Send（内部 `LocalSet` + `&Connection` 跨 await），
+    // 必须用单线程 runtime + LocalSet 驱动，不能用默认多线程 `#[tokio::main]`。
+    if args.len() >= 2 && args[1] == "_run" {
+        let cfg_path = match config::Config::default_config_path() {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("config path error: {}", e);
+                return ExitCode::from(1);
+            }
+        };
+        let cfg = match config::Config::load(&cfg_path) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("config error: {}", e);
+                return ExitCode::from(1);
+            }
+        };
+        let rt = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("daemon runtime build: {}", e);
+                return ExitCode::from(1);
+            }
+        };
+        let local = tokio::task::LocalSet::new();
+        // `_run` 内部自建 LocalSet 并 `spawn_local` ping loop + http server；
+        // 外层 `local.run_until(...)` 负责驱动其返回的 non-Send future。
+        let daemon_fut = local.run_until(async move { avc::svc::daemon::_run(cfg).await });
+        if let Err(e) = rt.block_on(daemon_fut) {
+            e.print();
+            return e.exit_code();
+        }
+        return ExitCode::SUCCESS;
+    }
 
     // 入口路由（详见 docs/shell.md §1.1）
     let mode = if args.len() <= 1 {
