@@ -4,6 +4,7 @@
 //! 详见 docs/cli.md。
 
 pub mod corpus;
+pub mod daemon;
 pub mod finetune;
 pub mod iterate;
 pub mod job;
@@ -55,6 +56,7 @@ pub fn run(args: &[String]) -> AvcResult<()> {
         "render" => render::dispatch(&argv[1..]),
         "corpus" => corpus::dispatch(&argv[1..]),
         "provider" => provider::dispatch(&argv[1..]),
+        "daemon" => daemon::dispatch(&argv[1..]),
         other => Err(AvcError::Arg(format!("未知子命令: {}", other))),
     }
 }
