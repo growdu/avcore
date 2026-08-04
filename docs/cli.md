@@ -131,11 +131,11 @@ avc
 |------|------|
 | `avc persona create --name <n> --archetype <a>` | 预占 `persona_models` 行 + 新版本号 status=`pending` |
 | `avc persona show <name>` | 概要 |
-| `avc persona list [--status active\|archived]` | 列表 |
+| `avc persona list [--status pending\|active\|archived]` | 列表 |
 | `avc persona versions <name>` | 历史版本 |
 | `avc persona attach-avatar <name> --version <v> --ref <img>` | 写 `avatar_*` 列 |
 | `avc persona attach-voice <name> --version <v> --ref <wav>` | 写 `voice_*` 列 |
-| `avc persona attach-persona <name> --version <v>` | 写 `persona_descriptor_json` |
+| `avc persona attach-persona <name> --version <v> --descriptor <json>` | 写 `persona_descriptor_json` |
 | `avc persona attach-knowledge <name> --version <v> --corpus <id>` | 写 `knowledge_binding_json` |
 | `avc persona set-traits <name> --version <v> --traits <list>` | refine：改 `persona_descriptor_json.traits` |
 | `avc persona set-catchphrase <name> --version <v> --add <s>` / `--remove <s>` | refine：改 catchphrases |
@@ -153,11 +153,13 @@ avc
 
 | 命令 | 内部等价于 |
 |------|----------|
-| `avc persona onboard --name <n> --from <yaml>` | `create` + `attach-avatar` + `attach-voice` + `attach-persona` (+ 可选 `attach-knowledge`) + `commit` |
-| `avc persona refine --name <n> --from <yaml>` | `set-traits` + `set-catchphrase` + `set-render` + `corpus attach/detach`（按 yaml diff；通常不调 Provider） |
+| `avc persona onboard --name <n> --avatar <png> --voice <wav> --descriptor <json> [--corpus <id>] [--archetype <a>] [--description <s>]` | `create` + `attach-avatar` + `attach-voice` + `attach-persona` (+ 可选 `attach-knowledge`) + `commit` |
 | `avc persona finetune --name <n> --scope <avatar\|voice\|persona> [--with-feedback] [--threshold <n>]` | 收集样本 + `finetune start` + drift 评估 + 达标 → `commit` + `promote`，不达标 → `DELETE` 整行事务回退 |
 
-> `--with-feedback` 自动把该 persona 最近标记 `looks_unlike` 的 feedback 样本纳入训练池。
+> 注：v0.3 起 `avc persona` 不再有 `refine` 或 `finetune` 子动词——refine
+> 走 `avc iterate apply`（`--set-persona/--set-knowledge/--set-manifest`），
+> finetune 走 `avc finetune start/run/drift ...`（顶层）。`onboard` 的入参是离散
+> flag（见上），不是 `--from <yaml>`。
 
 ### 4.3 sample
 
@@ -172,8 +174,9 @@ avc
 
 | 命令 | 类型 | 作用 |
 |------|------|------|
-| `avc iterate list --persona <n>` | `[A]` | 列出该 persona 的 iterate 任务 |
+| `avc iterate list <persona>` | `[A]` | 列出该 persona 的 iterate 任务（位置参数，v0.3.3 改） |
 | `avc iterate show <id>` | `[A]` | 任务详情（含 `changes_json`） |
+| `avc iterate apply <name> --version <v> [--set-persona <json>] [--set-knowledge <json>] [--set-manifest <json>]` | `[A]` | 把 changes 应用到 (pm, v) 同一行的可改列；同步落 `iterate_jobs(status=succeeded)` |
 | `avc iterate cancel <id>` | `[A]` | 取消 queued |
 
 ### 4.5 finetune（SFT 任务账本）
@@ -183,9 +186,9 @@ avc
 | `avc finetune start <persona> --scope ... --base-version <v> [--threshold <n>]` | `[A]` | 启动 finetune 任务（建 fj 行 + 预占 target_version） |
 | `avc finetune run <fj_id> [--embed <name>]` | `[A]` | 端到端：拉 samples → 调 vendor CLI SFT → 算 voice drift → publish/rollback |
 | `avc finetune drift eval <fj_id> [--embed <name>]` | `[A]` | 只算 drift，不动 fj.status（与 run 配套的可观测 verb） |
-| `avc finetune list --persona <n>` | `[A]` | 列出该 persona 的 finetune 任务 |
+| `avc finetune list <persona>` | `[A]` | 列出该 persona 的 finetune 任务（位置参数，v0.3.3 改） |
 | `avc finetune show <id>` | `[A]` | 任务详情 |
-| `avc finetune publish <id> --passed\|--failed` | `[A]` | 测试用：手动 publish（不走真 SFT 也不调 Provider） |
+| `avc finetune publish <id> --passed` | `[A]` | 测试用：手动 publish（不走真 SFT 也不调 Provider）。`--failed` 保留字段但当前不生效（实现仅识别 `--passed`） |
 | `avc finetune report <id> --json` | `[A]` | drift_report_json 结构化输出 |
 | `avc finetune cancel <id>` | `[A]` | 取消 queued / running |
 
@@ -199,7 +202,7 @@ avc
 | `avc job cancel <id>` | `[A]` | 取消 |
 | `avc job export <id> --out <dir>` | `[A]` | 拷 BLOB 到本地 FS（`<kind>__<name>__<id>.bin`） |
 | `avc job export <id> --target s3://bucket/prefix/` | `[A]` | 走 `[export.s3].upload_cmd` 模板（默认 `aws s3 cp`）上传每个 artifact；`--out` 和 `--target` 互斥 |
-| `avc job feedback <id> --looks_unlike` | `[A]` | 把"不像"标记写入 `persona_samples(kind=feedback)` |
+| `avc job feedback <id> --looks-unlike [--reason <text>]` | `[A]` | 把"不像"标记写入 `persona_samples(kind=feedback)` |
 
 ### 4.7 render
 
@@ -340,13 +343,15 @@ avc ask --dry-run "..."                     # 只展示计划，不执行
 ```bash
 # A. 完整闭环：创建 → 迭代 → 出片
 NAME=yu
-avc persona onboard $NAME --from ./yu.toml
+avc persona onboard $NAME --avatar ./yu.png --voice ./yu.wav --descriptor '{"traits":["严谨","务实"]}'
 
 # 改 prompt / 知识（纯数据，常做）
-avc persona refine $NAME --from ./yu.v2.toml
+avc iterate apply $NAME --version "$(avc persona current $NAME)" --set-persona '{"tone":"严谨"}'
 
 # 加样本 + 微调（花 token，慢）
-avc persona finetune $NAME --scope voice --base-version 2 --with-feedback
+avc finetune start $NAME --scope voice --base-version 1
+avc sample add $NAME --kind audio --uri ./new.wav --consent ./auth.pdf
+avc finetune run fj_xxx --embed openai_embed
 
 # 4. 出片
 v=$(avc persona show $NAME --json | jq -r .current_version)
@@ -448,29 +453,29 @@ error[E0501]: provider_unauthenticated
 1. 接受 `--dry-run`：打印**将执行**的原子列表，不真执行
 2. 实际执行时，所有变更都体现为 SQLite 的 INSERT / UPDATE，长任务进度写到 `job_steps` 与 `iterate_jobs` / `finetune_jobs`
 
-### 7.1 `avc persona refine yu --from ./yu.v2.toml --dry-run` 输出
+### 7.1 `avc iterate apply yu --version 1 --set-persona '{"tone":"严谨"}' --dry-run` 输出
+
+> 注：v0.3 起 persona 不再有 `refine` 子命令；refine 走顶层 `avc iterate apply`，
+> 内部分解为"读现 JSON → deep merge 三个 patch 列 → 写回"单事务。`--dry-run`
+> 仅打印将落 `iterate_jobs` 的 changes 摘要，不写 DB。
 
 ```
 plan (no changes made):
 
-  1. set-traits     yu --version 1 --traits 严谨,务实            (atomic)
-  2. set-catchphrase yu --version 1 --add "我们直接看源码"        (atomic)
-  3. set-render     yu --version 1 --resolution 1080p           (atomic)
-  4. corpus attach  yu --version 1 --corpus db-internals         (atomic)
+  1. iterate apply yu --version 1 --set-persona '{"tone":"严谨"}'   (atomic)
   no Provider SFT calls.  no new version.  no drift eval.
 ```
 
-### 7.2 `avc persona finetune yu --scope voice --dry-run` 输出
+### 7.2 `avc finetune start yu --scope voice --base-version 1 --dry-run` 输出
 
 ```
 plan (no changes made):
 
-  1. sample add yu --kind audio --uri ./feedback_*.wav   (atomic)
-  2. sample add yu --kind audio --uri ./new_*.wav         (atomic, --with-feedback resolved)
-  3. finetune start yu --scope voice --base-version 1    (atomic)
-  4.   ↳ publish_or_rollback branch
-  5. persona commit yu --version <v>   if drift ok        (atomic)
-  6. persona promote yu --to <v>      if drift ok        (atomic)
+  1. finetune start yu --scope voice --base-version 1    (atomic)
+  2.   ↳ voice SFT → voice drift eval (3-dim: face/voice/style, all ≥ threshold)
+  3. publish_or_rollback branch
+  4. persona commit yu --version <v>   if drift ok       (atomic)
+  5. persona promote yu --to <v>      if drift ok        (atomic)
 ```
 
 集成命令 = **原子列表 + 默认值 + 顺序**。可观察、可回放。
@@ -485,14 +490,14 @@ plan (no changes made):
 root                init/verify/...   doctor/prune/config
 daemon              start/stop/status/logs               ← Phase 3
 persona             create           onboard
-                    attach-*         refine          ← 80% 路径（纯数据）
-                    set-traits/...   finetune        ← 少数路径（调 SFT）
+                    attach-*         （无 refine/finetune 子动词；refine → iterate.apply，finetune → 顶层 finetune.*）
+                    set-traits/...
                     commit
                     promote/demote
                     archive/delete
 sample              add/list/remove
-iterate             list/show/cancel
-finetune            start/list/show/report/cancel
+iterate             list/apply/show/cancel
+finetune            start/run/drift/list/show/report/cancel/publish
 job                 list/show/wait/cancel/export/feedback
 render              script/video     run / pack
 corpus              create/chunks/search/attach/detach/reindex
@@ -505,9 +510,9 @@ ask                                   ask             ← 非交互 NL
 合计：
 
 - 原子：**约 56** 条（daemon 4 + provider status/rate-limit 2）
-- 集成（不含 shell / ask）：**约 9** 条
+- 集成（不含 shell / ask）：**约 8** 条（去掉了 `persona refine` / `persona finetune`）
 - shell / ask：**2** 条入口
-- 总计：**约 67** 条
+- 总计：**约 66** 条
 
 ---
 
@@ -521,7 +526,7 @@ ask                                   ask             ← 非交互 NL
 | `persona attach-avatar` | `UPDATE persona_versions SET avatar_primary=...` |
 | `persona commit` | `UPDATE persona_versions SET status='ready'` |
 | `persona set-traits` | `UPDATE persona_versions SET persona_descriptor_json=...`（refine 路径） |
-| `persona refine` | `BEGIN; UPDATE persona_versions ... COMMIT;` |
+| `iterate apply` | `BEGIN; UPDATE persona_versions ... COMMIT;` + `INSERT iterate_jobs(status='succeeded')` |
 | `finetune start` | `BEGIN; INSERT finetune_jobs; INSERT persona_versions(version=N+1, status=building); ... COMMIT;` |
 | `persona promote` | `UPDATE persona_models SET current_version=...` |
 | `persona archive` | `UPDATE persona_models SET status='archived'` |
@@ -554,7 +559,7 @@ ask                                   ask             ← 非交互 NL
 ```bash
 # 精确 CLI（脚本）
 avc persona list
-avc persona refine yu --from ./yu.v2.toml
+avc iterate apply yu --version 1 --set-persona '{"tone":"严谨"}'
 avc render run --persona yu --topic "InnoDB Buffer Pool"
 
 # 交互式 Shell（人类）

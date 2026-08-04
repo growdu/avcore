@@ -59,11 +59,11 @@ erDiagram
 ```sql
 CREATE TABLE persona_models (
     id TEXT PRIMARY KEY,                    -- pm_<ULID>
-    name TEXT NOT NULL,
+    name TEXT NOT NULL UNIQUE,              -- 唯一（migration 0001:6）
     archetype TEXT,                         -- db_kernel_expert / vlogger / anchor / ...
     description TEXT,
-    current_version INTEGER NOT NULL,
-    status TEXT NOT NULL,                   -- active / archived
+    current_version INTEGER NOT NULL DEFAULT 1,
+    status TEXT NOT NULL,                   -- pending / active / archived
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -78,7 +78,7 @@ CREATE TABLE persona_versions (
     persona_model_id TEXT NOT NULL,
     version INTEGER NOT NULL,
     parent_version INTEGER,
-    status TEXT NOT NULL,                   -- building / ready / deprecated
+    status TEXT NOT NULL,                   -- pending / building / ready / deprecated
 
     -- avatar
     avatar_provider TEXT,
@@ -103,13 +103,23 @@ CREATE TABLE persona_versions (
     voice_embed_dim INTEGER,
     voice_embed_sha256 TEXT,
 
+    -- face anchor (v0.3.1, migration 0002:9-11)
+    face_embed BLOB,
+    face_embed_dim INTEGER,
+    face_embed_sha256 TEXT,
+
+    -- style anchor (v0.3.1, migration 0002:12-14)
+    style_embed BLOB,
+    style_embed_dim INTEGER,
+    style_embed_sha256 TEXT,
+
     -- persona
     persona_descriptor_json TEXT,
 
     -- knowledge (optional)
     knowledge_binding_json TEXT,
 
-    -- identity anchor
+    -- identity anchor (commit 时从 face/voice/style embed 复制)
     anchor_face_emb BLOB,
     anchor_voice_emb BLOB,
     anchor_style_emb BLOB,
@@ -131,7 +141,7 @@ CREATE TABLE persona_versions (
 
 ```sql
 CREATE TABLE persona_samples (
-    id TEXT PRIMARY KEY,                    -- smp_<ULID>
+    id TEXT PRIMARY KEY,                    -- sm_<ULID>
     persona_model_id TEXT NOT NULL,
     version_id_at_collection INTEGER,       -- 收集时 persona 的版本号
     kind TEXT NOT NULL,                     -- image / audio / behavior_text / feedback
@@ -155,8 +165,9 @@ CREATE TABLE iterate_jobs (
     id TEXT PRIMARY KEY,                    -- ij_<ULID>
     persona_model_id TEXT NOT NULL,
     target_version INTEGER NOT NULL,        -- 同版本号升级 = current_version
-    changes_json TEXT NOT NULL,             -- {persona_descriptor?, knowledge_binding?, manifest?, metrics?}
-    status TEXT NOT NULL,                   -- queued/running/succeeded/failed/cancelled
+    changes_json TEXT NOT NULL,             -- {persona_descriptor?, knowledge_binding?, manifest?}
+    status TEXT NOT NULL,                   -- succeeded（iterate 是同步单步 op，只写 succeeded；
+                                            --   NOTE：未来切到异步实现后可能引入 queued/running/failed/cancelled）
     started_at TEXT,
     finished_at TEXT
 );
@@ -174,7 +185,7 @@ CREATE TABLE finetune_jobs (
     target_version INTEGER,                 -- 预占 = base+1
     scope_json TEXT NOT NULL,               -- ["avatar","voice","persona"]
     config_json TEXT,
-    status TEXT NOT NULL,                   -- queued/running/succeeded/failed_drift/failed/cancelled
+    status TEXT NOT NULL,                   -- running/succeeded/failed_drift/cancelled
     result_version INTEGER,
     drift_report_json TEXT,
     started_at TEXT,
@@ -189,11 +200,10 @@ CREATE TABLE scripts (
     id TEXT PRIMARY KEY,                    -- scr_<ULID>
     persona_model_id TEXT NOT NULL,
     persona_version INTEGER NOT NULL,       -- 锁定
-    topic TEXT,
-    scenes_json TEXT NOT NULL,
-    bgm_id TEXT,
+    topic TEXT NOT NULL,
+    content_json TEXT,                      -- 完整分镜 + 渲染选项
     duration_ms INTEGER,
-    created_at TEXT
+    created_at TEXT NOT NULL
 );
 ```
 
@@ -229,7 +239,7 @@ CREATE TABLE artifacts (
     mime TEXT,
     byte_size INTEGER,
     sha256 TEXT,
-    created_at TEXT
+    created_at TEXT NOT NULL
 );
 CREATE INDEX idx_artifacts_job ON artifacts(job_id, kind);
 ```
@@ -264,7 +274,7 @@ CREATE TABLE knowledge_corpora (
     language TEXT,
     chunk_count INTEGER DEFAULT 0,
     index_version INTEGER DEFAULT 0,
-    created_at TEXT
+    created_at TEXT NOT NULL
 );
 
 CREATE TABLE corpus_chunks (
@@ -281,6 +291,21 @@ CREATE TABLE corpus_chunks (
 ```
 
 chunks 检索：`SELECT ... FROM corpus_chunks WHERE corpus_id=?` 全表扫 + `embed_blob + 应用层 cosine` 即可——50 corpus × 1000 chunk 完全够。
+
+### 4.11 Daemon 表（v0.3.3 新增，Provider 健康守护）
+
+> Phase 3（provider-daemon）一次性新增 3 张表，详见
+> [`docs/superpowers/specs/2026-08-03-provider-daemon-design.md`](./superpowers/specs/2026-08-03-provider-daemon-design.md) §3
+> 与 `migrations/0003_provider_health.sql`。本文档不展开列细节，只点出表的作用：
+
+| 表 | 作用 |
+|---|---|
+| `provider_health` | 滚动窗口：daemon 主动 ping / Provider 错误 hook 旁路记录 (provider_key, status, latency_ms, checked_at, source) |
+| `provider_rate_limit` | 限速状态：被 hit_rate_limit 时 UPSERT (provider_key, last_hit_at, until_ts, hit_count_24h) |
+| `daemon_meta` | `avc daemon` 自身元信息：pid / bind / port / started_at 等 k-v |
+
+`avc provider status` / `avc provider rate-limit` 读这两表；
+daemon 未运行（`daemon_meta` 无 row 或 `started_at` 过期）时输出"无记录"。
 
 ---
 
