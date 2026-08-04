@@ -47,3 +47,6 @@ logs/
 # Added by cargo
 
 /target
+
+# Claude / agent tooling (local only, not project code)
+.claude/
