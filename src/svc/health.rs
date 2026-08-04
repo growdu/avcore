@@ -296,7 +296,7 @@ mod tests {
             "embed.openai",
             Status::Auth,
             None,
-            Some("401".into()),
+            Some("401"),
             "hook",
         )
         .unwrap();

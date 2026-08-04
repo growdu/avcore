@@ -12,15 +12,6 @@ use std::process::ExitCode;
 use avc::{ask, cli, config, shell};
 
 fn main() -> ExitCode {
-    // 初始化 tracing
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
-        )
-        .with_target(false)
-        .try_init();
-
     let args: Vec<String> = std::env::args().collect();
 
     // T17: 隐藏 verb `_run` —— daemon 内部入口。
@@ -63,6 +54,16 @@ fn main() -> ExitCode {
     }
 
     // 入口路由（详见 docs/shell.md §1.1）
+    // 注意：tracing init 在 _run 路径里跳过（daemon 自己 init_logging），
+    // 在其他路径里走这里（shell/ask/cli）。
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+        )
+        .with_target(false)
+        .try_init();
+
     let mode = if args.len() <= 1 {
         if std::io::stdout().is_terminal() {
             Mode::Shell

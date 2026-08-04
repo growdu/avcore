@@ -109,7 +109,7 @@ pub fn create_from_file(
     }
     for (i, (text, vec)) in chunks.iter().zip(vecs.iter()).enumerate() {
         let blob: Vec<u8> = vec.iter().flat_map(|f| f.to_le_bytes()).collect();
-        let id = format!("{}_{:04}", &chunk_id, i);
+        let id = format!("{}_{:04}", chunk_id, i);
         tx.execute(
             "INSERT INTO corpus_chunks
                 (id, corpus_id, ordinal, content, embed_blob, embed_dim, token_count, deprecated, meta_json)

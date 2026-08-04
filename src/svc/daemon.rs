@@ -30,6 +30,31 @@ fn data_dir() -> AvcResult<PathBuf> {
     Ok(dir)
 }
 
+/// Initialize tracing to write to the daemon log file (and stderr).
+/// Called once from `_run` before starting ping/http tasks.
+/// Idempotent: subsequent calls silently no-op.
+pub fn init_logging(log_level: &str) -> AvcResult<()> {
+    use tracing_subscriber::{fmt, prelude::*, EnvFilter};
+    let log_path = log_path()?;
+    if let Some(parent) = log_path.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)?;
+    let file_layer = fmt::layer().with_writer(log_file).with_ansi(false);
+    let stderr_layer = fmt::layer().with_writer(std::io::stderr);
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(log_level));
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(file_layer)
+        .with(stderr_layer)
+        .try_init()
+        .map_err(|e| AvcError::Internal(format!("tracing init: {}", e)))?;
+    Ok(())
+}
+
 /// Write the current process pid to the pidfile
 pub fn write_pid(pid: u32) -> AvcResult<()> {
     let p = pid_path()?;
@@ -267,6 +292,9 @@ pub async fn run_ping_loop(cfg: Config, conn: Arc<Mutex<rusqlite::Connection>>) 
 /// 因此产生的 future 不是 `Send`，**必须**在 `LocalSet` 内 `spawn_local`，
 /// 不能在多线程 runtime 上 `tokio::spawn`。
 pub async fn _run(cfg: Config) -> AvcResult<()> {
+    // 0. 初始化文件日志（idempotent）
+    init_logging(&cfg.daemon.log_level)?;
+
     // 1. 写 daemon_meta
     let conn = crate::db::open_default()?;
     let started_at = crate::svc::now_iso();

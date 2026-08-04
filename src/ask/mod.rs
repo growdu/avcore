@@ -104,10 +104,8 @@ async fn run_async(args: &[String]) -> AvcResult<()> {
             "--json" => json = true,
             "--dry-run" => dry_run = true,
             "--yes" | "-y" => yes = true,
-            other if !other.starts_with("--") => {
-                if nl.is_none() {
-                    nl = Some(other);
-                }
+            other if !other.starts_with("--") && nl.is_none() => {
+                nl = Some(other);
             }
             _ => {}
         }

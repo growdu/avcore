@@ -5,7 +5,7 @@
 
 use std::time::{Duration, Instant};
 
-use crate::config::{Config, ProviderCfg};
+use crate::config::Config;
 use crate::error::{AvcError, AvcResult};
 use crate::provider::real::OpenAiCompatLlmProvider;
 use crate::provider::LlmProvider;
@@ -269,6 +269,7 @@ fn collect_names<V>(map: &std::collections::HashMap<String, V>) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ProviderCfg;
     use std::net::SocketAddr;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
