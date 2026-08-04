@@ -5630,3 +5630,138 @@ fn persona_list_filters_by_status() {
     let v: serde_json::Value = serde_json::from_slice(&r.stdout).unwrap();
     assert_eq!(v.as_array().unwrap().len(), 0);
 }
+
+// ---------------------------- Task 20: daemon lifecycle integration tests ----------------------------
+//
+// 这些测试只覆盖 daemon CLI 的表面（verb 列表、错误处理、provider status 走 DB 兜底）。
+// 真实起 daemon 子进程 / SIGTERM 的测试被推迟到后续 PR，因为：
+//   1. 端口 7891 在 cargo test 并行环境下有冲突风险
+//   2. 子进程清理依赖 pidfile + 信号链路，跨平台 CI 容易脏
+
+#[test]
+fn daemon_help_lists_verbs() {
+    // `avc daemon`（无 verb）应走 cmd_help 列出 start/stop/status/logs。
+    let out = bin().arg("daemon").output().expect("run avc daemon");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("start"),
+        "help 应包含 start; stdout={stdout:?}"
+    );
+    assert!(
+        stdout.contains("stop"),
+        "help 应包含 stop; stdout={stdout:?}"
+    );
+    assert!(
+        stdout.contains("status"),
+        "help 应包含 status; stdout={stdout:?}"
+    );
+    assert!(
+        stdout.contains("logs"),
+        "help 应包含 logs; stdout={stdout:?}"
+    );
+}
+
+#[test]
+fn daemon_unknown_verb_errors() {
+    // 未知 verb 应被 dispatch 返回 Arg → exit 2。
+    let out = bin().args(["daemon", "frobnicate"]).output().expect("run");
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "unknown verb 应 exit 2 (Arg); stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("frobnicate") || stderr.contains("daemon verb"),
+        "stderr 应提示 verb 名；stderr={stderr:?}"
+    );
+}
+
+#[test]
+fn provider_status_reads_db_when_daemon_dead() {
+    // daemon 不在时，`avc provider status` 必须能从 DB 读出健康信息（v1 行为）。
+    // 直接往 DB 写一条 provider_health 行（不需要起 mock server / daemon）。
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let config = dir.path().join("config");
+
+    let r = bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .arg("init")
+        .output()
+        .unwrap();
+    assert!(
+        r.status.success(),
+        "init: {}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+
+    // 直接写一条 provider_health 行：模拟 daemon 上一次 ping 的结果
+    let db_path = data.join("avc/avc.db");
+    let conn = rusqlite::Connection::open(&db_path).expect("open db");
+    conn.execute(
+        "INSERT INTO provider_health
+         (provider_key, status, latency_ms, error_msg, checked_at, source)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        rusqlite::params![
+            "llm.fake",
+            "healthy",
+            42i64,
+            None::<String>,
+            "2026-08-04T00:00:00Z",
+            "probe",
+        ],
+    )
+    .expect("insert provider_health");
+
+    // 前提：pidfile 不应存在（daemon 完全没启动）
+    let pidfile = data.join("avc/avc.pid");
+    assert!(
+        !pidfile.exists(),
+        "测试前提：pidfile 不应存在；path={}",
+        pidfile.display()
+    );
+
+    // provider status：应走 DB 读出 1 条
+    let out = bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .args(["provider", "status", "--json"])
+        .output()
+        .expect("run provider status --json");
+    assert!(
+        out.status.success(),
+        "provider status --json 应成功；stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let rows = v["rows"].as_array().expect("rows 数组");
+    assert_eq!(rows.len(), 1, "DB 中应恰好 1 条 provider_health；rows={v}");
+    assert_eq!(rows[0]["provider"].as_str(), Some("llm.fake"));
+    assert_eq!(rows[0]["status"].as_str(), Some("healthy"));
+
+    // 文本模式也应成功 + stdout 含 llm.fake
+    let out = bin()
+        .env("XDG_DATA_HOME", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .args(["provider", "status"])
+        .output()
+        .expect("run provider status (text)");
+    assert!(
+        out.status.success(),
+        "provider status (text) 应成功；stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("llm.fake"),
+        "文本模式 stdout 应含 llm.fake；stdout={stdout:?}"
+    );
+}
