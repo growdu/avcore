@@ -6,7 +6,43 @@ Versioning follows [Semantic Versioning](https://semver.org/) — 当前 alpha �
 
 ---
 
-## [Unreleased] — Phase 3 daemon 模式 + Provider 健康/限速
+## [Unreleased] — MiniMax 多模态 Provider 适配
+
+### Added
+- **MiniMax 多模态 Provider 适配**（avatar / voice / video 三维）：
+  - 端点：`api.minimaxi.com` 专有 API（非 OpenAI 兼容）
+  - 配置：`[provider.<dim>.<n>_minimax]` 段——名字后缀固定 `_minimax` 触发工厂路由
+  - 实测可用模型：
+    - `image-01`（图像，`/v1/image_generation`）
+    - `speech-01-turbo`（TTS，`/v1/t2a_v2`）
+    - `video-01`（视频，`/v1/video_generation` 3 段式）
+  - 视频异步 3 段式：submit → poll `/v1/query/video_generation?task_id=...` → retrieve `/v1/files/retrieve?file_id=...` → 下载 mp4
+  - **3 个 `#[ignore]` 真实 API 集成测试**（需 `MINIMAX_API_KEY` env）：avatar / voice / video 端到端
+  - **9 个 mock 单元测试 + 工厂路由测试**（avatar / voice / video 各 3 个）
+- **错误翻译**：401 → `TokenAuth`、429 → `RateLimited`、5xx → `ProviderUpstream`、
+  `base_resp.status_code=2013` → `Arg`、其它非 0 → `ProviderUpstream`
+- **工厂路由**：`make_avatar` / `make_voice` / `make_video` 按名字 `_minimax` 后缀路由到
+  MiniMax provider（与 OpenAI 兼容路径共存）
+- **公共 helper**：`auth_header` / `decode_hex_audio` / `handle_response`（MiniMax audio 字段
+  是 HEX 编码非 base64，helper 自动解码）
+- **`docs/cli.md` §12 新章节**：`MiniMax Provider (minimaxi.com)` 含配置段 / 用法 / 协议差异表
+  / 重要陷阱 / 端到端示例
+
+### Known Limitations
+- **`provider.embed`**：MiniMax 没暴露 OpenAI 兼容 embedding endpoint（实测 `/v1/embeddings` 404）——
+  沿用 OpenAI `text-embedding-3-small`
+- **voice clone**：需 `file_id` / `audio_url` 复杂 schema，v1 留 placeholder（`Err` 提示用 vendor CLI）
+- **avatar / voice finetune**：v1 留 placeholder（`Err` 提示用 vendor CLI；走 `avc finetune start --scope avatar|voice` 不接 MiniMax）
+- **video I2V-01 / live**：需 `first_frame_image` 字段，v1 暂不支持（仅 T2V-01 / video-01）
+- **video 每日 3 条配额**（用户层 plan 决定；撞到 429 报 `AvcError::RateLimited` exit 10）
+- **`voice_id` 写死 `male-qn-qingse`**：MiniMax API 没暴露 list voices endpoint，v1 不可选声线
+
+### Planned
+- 升级阈值到 100+ persona 的 side-file 拆分（与本框架无关，独立项目）
+
+---
+
+## [0.3.4] - 2026-08-03 — Phase 3 daemon 模式 + Provider 健康/限速
 
 ### Added
 - **后台 daemon**：`avc daemon start|stop|status|logs`（fork 子进程执行 `avc _run`、pid 写到 `~/.local/share/avc/avc.pid`、HTTP loopback 端口 7891、tracing 写 `~/.local/share/avc/avc.log`）。
@@ -24,8 +60,8 @@ Versioning follows [Semantic Versioning](https://semver.org/) — 当前 alpha �
 - `Cargo.toml` 增 `axum = "0.7"` + `tower` 依赖（HTTP loopback 用）。
 - `Config` 加 `daemon: Option<DaemonCfg>` 段。
 
-### Planned
-- 升级阈值到 100+ persona 的 side-file 拆分（与本框架无关，独立项目）
+### Known Limitations
+- 沿用 v0.3.2 的三条限制。
 
 ---
 

@@ -594,4 +594,87 @@ curl -s http://127.0.0.1:7891/health/all | jq
 avc daemon stop
 ```
 
+---
+
+## 12. MiniMax Provider (`minimaxi.com`)
+
+支持 MiniMax 文本 / 图像 / 语音 / 视频专有 API（**非** OpenAI 兼容）。
+工厂按 provider **名字**是否以 `_minimax` 结尾来路由到 MiniMax 适配器；现有
+`[provider.<dim>.<n>]` 段继续走 OpenAI 兼容实现。
+
+### 12.1 配置段
+
+```toml
+[provider.avatar.yu_minimax]
+api_key = "sk-cp-..."                   # MiniMax 控制台创建
+model = "image-01"                      # image-01 / image-01-live
+base_url = "https://api.minimaxi.com"   # 默认
+
+[provider.voice.yu_minimax]
+api_key = "sk-cp-..."
+model = "speech-01-turbo"               # speech-01-turbo / speech-01
+base_url = "https://api.minimaxi.com"
+
+[provider.video.yu_minimax]
+api_key = "sk-cp-..."
+model = "video-01"                      # video-01 / T2V-01；I2V-01 需 first_frame_image（v1 暂不支持）
+base_url = "https://api.minimaxi.com"
+```
+
+> LLM 不需要 `_minimax` 后缀——MiniMax 的 chat completion 走 OpenAI 兼容
+> `/v1/chat/completions`，沿用现有 `[provider.llm.<n>]` 段即可。
+
+### 12.2 用法
+
+```bash
+avc render run \
+  --persona <name> --version <v> --topic "..." \
+  --llm-provider <openai_or_minimax> \
+  --avatar-provider yu_minimax \
+  --voice-provider yu_minimax \
+  --video-provider yu_minimax
+```
+
+工厂自动按 `_minimax` 后缀路由：现有 `[provider.avatar.<n>]` 走 OpenAI 兼容
+适配器，名字带 `_minimax` 后缀的段（`[provider.avatar.<n>_minimax]`）走 MiniMax
+专有适配器。
+
+### 12.3 协议差异（vs OpenAI 兼容）
+
+| 维度 | OpenAI 兼容 | MiniMax 专有 |
+|---|---|---|
+| LLM | `/v1/chat/completions` ✅ | 同协议（沿用 OpenAI 兼容适配器） |
+| image | `/v1/images/generations` body=`{prompt,n,size}` | `/v1/image_generation` body=`{prompt,n,aspect_ratio,response_format:"url",prompt_enhancer}` |
+| audio | `/v1/audio/speech` body=`{input,voice,model}` | `/v1/t2a_v2` body=`{text,voice_setting:{voice_id},audio_setting:{format:"mp3"}}` |
+| video | 无（vendor CLI 三段式） | `/v1/video_generation` 3 步：submit → poll `/v1/query/video_generation?task_id=...` → retrieve `/v1/files/retrieve?file_id=...` → 下载 |
+
+### 12.4 重要陷阱
+
+- **audio 字段是 HEX 编码**（不是 base64）—— 适配器内部自动解码为 MP3 字节
+- **video 是异步 3 段式**（submit / poll / retrieve）—— 适配器内部阻塞轮询
+  （默认 5s 一次、5min 超时）
+- **视频每日 3 条配额**（撞到 429 报 `AvcError::RateLimited` exit 10）
+- **`voice_id` 写死 `male-qn-qingse`**（v1 不可选声线 —— MiniMax API 没暴露
+  list voices endpoint；如需切换音色走 vendor CLI）
+- **HTTP 200 但 `base_resp.status_code != 0` 也是失败** —— 业务错误码
+  `2013` 是参数错（如不支持的 model 名）
+
+### 12.5 端到端示例
+
+跑 MiniMax 真实 API 集成测试（默认 `#[ignore]`，需 `MINIMAX_API_KEY` 环境变量）：
+
+```bash
+export MINIMAX_API_KEY=sk-cp-...
+
+cd /home/ubuntu/avcore
+MINIMAX_API_KEY=sk-cp-... rtk proxy cargo test --test integration \
+  minimax_real -- --ignored
+```
+
+### 12.6 详见
+
+- 实测 spec：`docs/minimax-api.md`
+- 设计 spec：`docs/superpowers/specs/2026-08-04-minimax-provider-design.md`
+- 实施 plan：`docs/superpowers/plans/2026-08-05-minimax-provider.md`
+
 完整 Shell 设计见 [`shell.md`](./shell.md)。
