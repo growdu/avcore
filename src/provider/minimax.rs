@@ -188,3 +188,95 @@ impl AvatarProvider for MiniMaxCompatAvatarProvider {
         ))
     }
 }
+
+// ── Voice ──────────────────────────────────────────
+
+pub struct MiniMaxCompatVoiceProvider {
+    pub name: String,
+    pub cfg: ProviderCfg,
+    client: Client,
+    base_url: String,
+}
+
+impl MiniMaxCompatVoiceProvider {
+    pub fn new(name: String, cfg: ProviderCfg) -> AvcResult<Self> {
+        let headers = auth_header(cfg.api_key.as_deref().unwrap_or(""));
+        let client = Client::builder()
+            .default_headers(headers)
+            .timeout(Duration::from_secs(60))
+            .build()
+            .map_err(|e| AvcError::Internal(format!("reqwest builder: {}", e)))?;
+        let base_url = cfg
+            .base_url
+            .clone()
+            .unwrap_or_else(|| DEFAULT_BASE_URL.to_string());
+        Ok(Self {
+            name,
+            cfg,
+            client,
+            base_url,
+        })
+    }
+}
+
+#[async_trait]
+impl VoiceProvider for MiniMaxCompatVoiceProvider {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    async fn clone(&self, _ref_audio_paths: &[String]) -> AvcResult<crate::provider::Voice> {
+        // minimax voice clone not implemented; use vendor CLI
+        Err(AvcError::Internal(
+            "minimax voice clone not implemented; use vendor CLI".into(),
+        ))
+    }
+
+    async fn synth(&self, voice: &crate::provider::Voice, text: &str) -> AvcResult<Audio> {
+        let body = serde_json::json!({
+            "model": self.cfg.model.as_deref().unwrap_or("speech-01-turbo"),
+            "text": text,
+            "voice_setting": {
+                "voice_id": voice.voice_id_remote.as_deref().unwrap_or("male-qn-qingse"),
+            },
+            "audio_setting": { "format": "mp3" },
+        });
+        let url = format!("{}/v1/t2a_v2", self.base_url);
+        let resp = self
+            .client
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| AvcError::ProviderUpstream(e.to_string()))?;
+
+        #[derive(Deserialize)]
+        struct TtsResp {
+            data: TtsData,
+            #[allow(dead_code)]
+            base_resp: serde_json::Value,
+        }
+        #[derive(Deserialize)]
+        struct TtsData {
+            audio: String, // hex-encoded MP3
+        }
+        let parsed: TtsResp = handle_response(resp).await?;
+        let mp3_bytes = decode_hex_audio(&parsed.data.audio)?;
+        Ok(Audio {
+            wav_b64: base64::engine::general_purpose::STANDARD.encode(&mp3_bytes),
+            mime: "audio/mpeg".into(),
+        })
+    }
+
+    async fn finetune(
+        &self,
+        _base: &crate::provider::Voice,
+        _ref_audio: &[String],
+        _cfg: &crate::provider::FinetuneConfig,
+    ) -> AvcResult<crate::provider::Voice> {
+        // minimax voice finetune not implemented; use vendor CLI
+        Err(AvcError::Internal(
+            "minimax voice finetune not implemented; use vendor CLI".into(),
+        ))
+    }
+}

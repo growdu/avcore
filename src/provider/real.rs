@@ -944,6 +944,17 @@ impl VoiceProvider for OpenAiCompatVoiceProvider {
 }
 
 pub fn make_voice(cfg: &Config, name: &str) -> AvcResult<Arc<dyn VoiceProvider>> {
+    if name.ends_with("_minimax") {
+        let pc = cfg
+            .provider
+            .voice
+            .get(name)
+            .ok_or_else(|| AvcError::NotFound(format!("provider.voice.{}", name)))?;
+        return Ok(Arc::new(super::minimax::MiniMaxCompatVoiceProvider::new(
+            name.to_string(),
+            pc.clone(),
+        )?));
+    }
     let pc = cfg
         .provider
         .voice

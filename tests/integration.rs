@@ -5894,3 +5894,98 @@ fn minimax_factory_routes_avatar_by_name_suffix() {
     let result_openai = make_avatar(&cfg, "yu");
     assert!(result_openai.is_ok());
 }
+
+#[test]
+fn minimax_voice_synth_decodes_hex_mp3() {
+    use avc::config::ProviderCfg;
+    use avc::provider::minimax::MiniMaxCompatVoiceProvider;
+    use avc::provider::{Voice, VoiceProvider};
+    use base64::Engine;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let handle = std::thread::spawn(move || {
+        // Accept up to 1 connection (single TTS POST). Loop instead of single accept.
+        for _ in 0..1 {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 8192];
+                let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+                let _ = stream.read(&mut buf);
+                let body = r#"{"data":{"audio":"494433"},"base_resp":{"status_code":0}}"#;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.flush();
+            } else {
+                break;
+            }
+        }
+    });
+
+    let cfg = ProviderCfg {
+        api_key: Some("sk-cp-test".into()),
+        model: Some("speech-01-turbo".into()),
+        base_url: Some(format!("http://127.0.0.1:{}", port)),
+        ..Default::default()
+    };
+    let p = MiniMaxCompatVoiceProvider::new("test_minimax_voice".into(), cfg).unwrap();
+
+    let voice = Voice {
+        provider: "test".into(),
+        provider_version: "v1".into(),
+        voice_id_remote: Some("male-qn-qingse".into()),
+        sample_wav_b64: String::new(),
+        transcript: None,
+        embed_b64: None,
+        embed_dim: None,
+    };
+    let join_handle = std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(p.synth(&voice, "hi"))
+        })
+        .unwrap();
+    let audio = join_handle.join().unwrap().unwrap();
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(&audio.wav_b64)
+        .unwrap();
+    assert_eq!(bytes, b"ID3");
+    handle.join().ok();
+}
+
+#[test]
+fn minimax_factory_routes_voice_by_name_suffix() {
+    use avc::config::Config;
+    use avc::provider::real::make_voice;
+
+    let mut cfg = Config::default();
+    cfg.provider.voice.insert(
+        "yu_minimax".into(),
+        avc::config::ProviderCfg {
+            api_key: Some("sk-cp-test".into()),
+            model: Some("speech-01-turbo".into()),
+            base_url: Some("http://127.0.0.1:1".into()),
+            ..Default::default()
+        },
+    );
+    let result = make_voice(&cfg, "yu_minimax");
+    assert!(
+        result.is_ok(),
+        "_minimax suffix should route voice to MiniMax provider"
+    );
+    // 现有 OpenAI 路由仍 OK
+    cfg.provider
+        .voice
+        .insert("yu".into(), avc::config::ProviderCfg::default());
+    let result_openai = make_voice(&cfg, "yu");
+    assert!(result_openai.is_ok());
+}
