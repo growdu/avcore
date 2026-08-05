@@ -2,6 +2,7 @@
 //!
 //! 详见 docs/api/README.md。
 
+pub mod minimax;
 pub mod mock;
 pub mod probe;
 pub mod real;

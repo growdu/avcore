@@ -5765,3 +5765,132 @@ fn provider_status_reads_db_when_daemon_dead() {
         "文本模式 stdout 应含 llm.fake；stdout={stdout:?}"
     );
 }
+
+// ── MiniMax provider 公共 helper + avatar 测试 ────────────────────
+
+#[test]
+fn minimax_auth_header_includes_bearer() {
+    use avc::provider::minimax::auth_header;
+    let h = auth_header("sk-cp-abc");
+    assert_eq!(h.get("Authorization").unwrap(), "Bearer sk-cp-abc");
+}
+
+#[test]
+fn minimax_decode_hex_audio_succeeds() {
+    use avc::provider::minimax::decode_hex_audio;
+    // "494433" is hex for "ID3"
+    let bytes = decode_hex_audio("494433").unwrap();
+    assert_eq!(bytes, b"ID3");
+}
+
+#[test]
+fn minimax_decode_hex_audio_rejects_invalid() {
+    use avc::provider::minimax::decode_hex_audio;
+    assert!(decode_hex_audio("zz").is_err());
+}
+
+#[test]
+fn minimax_avatar_create_succeeds_with_mock_server() {
+    use avc::config::ProviderCfg;
+    use avc::provider::minimax::MiniMaxCompatAvatarProvider;
+    use avc::provider::AvatarProvider;
+    use avc::provider::AvatarSpec;
+    use base64::Engine;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let handle = std::thread::spawn(move || {
+        // Accept up to 2 connections (image_generation POST + image GET). Loop instead of single accept.
+        for _ in 0..2 {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 8192];
+                let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+                let _ = stream.read(&mut buf);
+                let req = String::from_utf8_lossy(&buf).to_string();
+                let resp = if req.contains("image_generation") {
+                    let body = format!(
+                        r#"{{"data":{{"image_urls":["http://127.0.0.1:{port}/img.png"]}},"base_resp":{{"status_code":0}}}}"#
+                    );
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                } else {
+                    // image GET
+                    let img = b"\x89PNG\r\n\x1a\nfake_png_bytes";
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        img.len()
+                    )
+                };
+                let _ = stream.write_all(resp.as_bytes());
+                if !req.contains("image_generation") {
+                    let img = b"\x89PNG\r\n\x1a\nfake_png_bytes";
+                    let _ = stream.write_all(img);
+                }
+                let _ = stream.flush();
+            } else {
+                break;
+            }
+        }
+    });
+
+    let cfg = ProviderCfg {
+        api_key: Some("sk-cp-test".into()),
+        model: Some("image-01".into()),
+        base_url: Some(format!("http://127.0.0.1:{}", port)),
+        ..Default::default()
+    };
+    let p = MiniMaxCompatAvatarProvider::new("test_minimax_avatar".into(), cfg).unwrap();
+    let join_handle = std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(p.create(&AvatarSpec {
+                prompt: "a red apple".into(),
+                style: None,
+                ref_image_paths: vec![],
+            }))
+        })
+        .unwrap();
+    let avatar = join_handle.join().unwrap().unwrap();
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(&avatar.primary_png_b64)
+        .unwrap();
+    assert!(bytes.starts_with(b"\x89PNG"));
+    handle.join().ok();
+}
+
+#[test]
+fn minimax_factory_routes_avatar_by_name_suffix() {
+    use avc::config::Config;
+    use avc::provider::real::make_avatar;
+
+    let mut cfg = Config::default();
+    cfg.provider.avatar.insert(
+        "yu_minimax".into(),
+        avc::config::ProviderCfg {
+            api_key: Some("sk-cp-test".into()),
+            model: Some("image-01".into()),
+            base_url: Some("http://127.0.0.1:1".into()),
+            ..Default::default()
+        },
+    );
+    let result = make_avatar(&cfg, "yu_minimax");
+    assert!(
+        result.is_ok(),
+        "_minimax suffix should route to MiniMax provider"
+    );
+    // 现有 OpenAI 路由仍 OK
+    cfg.provider
+        .avatar
+        .insert("yu".into(), avc::config::ProviderCfg::default());
+    let result_openai = make_avatar(&cfg, "yu");
+    assert!(result_openai.is_ok());
+}

@@ -719,6 +719,17 @@ impl AvatarProvider for OpenAiCompatAvatarProvider {
 }
 
 pub fn make_avatar(cfg: &Config, name: &str) -> AvcResult<Arc<dyn AvatarProvider>> {
+    if name.ends_with("_minimax") {
+        let pc = cfg
+            .provider
+            .avatar
+            .get(name)
+            .ok_or_else(|| AvcError::NotFound(format!("provider.avatar.{}", name)))?;
+        return Ok(Arc::new(super::minimax::MiniMaxCompatAvatarProvider::new(
+            name.to_string(),
+            pc.clone(),
+        )?));
+    }
     let pc = cfg
         .provider
         .avatar
