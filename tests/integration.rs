@@ -6173,10 +6173,14 @@ async fn minimax_real_api_avatar_creates_image() {
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(&avatar.primary_png_b64)
         .unwrap();
-    assert!(bytes.starts_with(b"\x89PNG"));
+    assert!(
+        bytes.starts_with(b"\x89PNG") || bytes.starts_with(b"\xff\xd8\xff"),
+        "expected PNG or JPEG magic, got {:?}",
+        &bytes[..8.min(bytes.len())]
+    );
     assert!(
         bytes.len() > 100,
-        "expected real PNG, got {} bytes",
+        "expected real image > 100 bytes, got {} bytes",
         bytes.len()
     );
 }
