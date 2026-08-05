@@ -6136,3 +6136,122 @@ fn minimax_factory_routes_video_by_name_suffix() {
     let result_openai = make_video(&cfg, "yu");
     assert!(result_openai.is_ok());
 }
+
+// ---------------------------- T4: Real MiniMax API integration tests (#[ignore]) ----------------------------
+//
+// 以下 3 个测试默认被 cargo test 跳过；只在显式调用 `cargo test -- --ignored` 时跑。
+// 每个测试开头检查 MINIMAX_API_KEY 环境变量，未设置则提前 return (skip)，不失败。
+// 这些测试会消耗真实 token quota (18B per account)；不要在无人值守 CI 里跑。
+
+#[tokio::test]
+#[ignore = "requires MINIMAX_API_KEY env; uses 18B token quota"]
+async fn minimax_real_api_avatar_creates_image() {
+    use avc::config::ProviderCfg;
+    use avc::provider::minimax::MiniMaxCompatAvatarProvider;
+    use avc::provider::AvatarProvider;
+    use avc::provider::AvatarSpec;
+    use base64::Engine;
+
+    let api_key = match std::env::var("MINIMAX_API_KEY") {
+        Ok(k) => k,
+        Err(_) => return, // skip if not set
+    };
+    let cfg = ProviderCfg {
+        api_key: Some(api_key),
+        model: Some("image-01".into()),
+        ..Default::default()
+    };
+    let p = MiniMaxCompatAvatarProvider::new("real_minimax".into(), cfg).unwrap();
+    let avatar = p
+        .create(&AvatarSpec {
+            prompt: "a tiny red apple".into(),
+            style: None,
+            ref_image_paths: vec![],
+        })
+        .await
+        .unwrap();
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(&avatar.primary_png_b64)
+        .unwrap();
+    assert!(bytes.starts_with(b"\x89PNG"));
+    assert!(
+        bytes.len() > 100,
+        "expected real PNG, got {} bytes",
+        bytes.len()
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires MINIMAX_API_KEY env; uses 18B token quota"]
+async fn minimax_real_api_voice_synth_decodes_mp3() {
+    use avc::config::ProviderCfg;
+    use avc::provider::minimax::MiniMaxCompatVoiceProvider;
+    use avc::provider::Voice;
+    use avc::provider::VoiceProvider;
+    use base64::Engine;
+
+    let api_key = match std::env::var("MINIMAX_API_KEY") {
+        Ok(k) => k,
+        Err(_) => return,
+    };
+    let cfg = ProviderCfg {
+        api_key: Some(api_key),
+        model: Some("speech-01-turbo".into()),
+        ..Default::default()
+    };
+    let p = MiniMaxCompatVoiceProvider::new("real_minimax_voice".into(), cfg).unwrap();
+    let voice = Voice {
+        provider: "test".into(),
+        provider_version: "v1".into(),
+        voice_id_remote: Some("male-qn-qingse".into()),
+        sample_wav_b64: String::new(),
+        transcript: None,
+        embed_b64: None,
+        embed_dim: None,
+    };
+    let audio = p.synth(&voice, "你好世界").await.unwrap();
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(&audio.wav_b64)
+        .unwrap();
+    assert!(
+        bytes.len() > 1000,
+        "expected real MP3, got {} bytes",
+        bytes.len()
+    );
+    // MP3 ID3 header
+    assert_eq!(&bytes[..3], b"ID3");
+}
+
+#[tokio::test]
+#[ignore = "requires MINIMAX_API_KEY env; uses 18B token quota; takes ~80-110s"]
+async fn minimax_real_api_video_generates_mp4() {
+    use avc::config::ProviderCfg;
+    use avc::provider::minimax::MiniMaxCompatVideoProvider;
+    use std::time::Duration;
+
+    let api_key = match std::env::var("MINIMAX_API_KEY") {
+        Ok(k) => k,
+        Err(_) => return,
+    };
+    let cfg = ProviderCfg {
+        api_key: Some(api_key),
+        model: Some("video-01".into()),
+        ..Default::default()
+    };
+    let mut p = MiniMaxCompatVideoProvider::new("real_minimax_video".into(), cfg).unwrap();
+    p.poll_interval = Duration::from_secs(5);
+    p.timeout = Duration::from_secs(180);
+
+    let task_id = p.submit("a cat walking slowly", &[], &[]).await.unwrap();
+    let tmp = std::env::temp_dir().join("minimax_real_video_test.mp4");
+    p.fetch(&task_id, &tmp).await.unwrap();
+    let bytes = std::fs::read(&tmp).unwrap();
+    // MP4 magic: "ftyp" at offset 4
+    assert_eq!(&bytes[4..8], b"ftyp");
+    assert!(
+        bytes.len() > 1000,
+        "expected real MP4, got {} bytes",
+        bytes.len()
+    );
+    let _ = std::fs::remove_file(&tmp);
+}
