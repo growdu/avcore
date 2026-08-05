@@ -1400,6 +1400,17 @@ fn run_finetune_vendor_pipeline(
 }
 
 pub fn make_video(cfg: &Config, name: &str) -> AvcResult<Arc<dyn VideoProvider>> {
+    if name.ends_with("_minimax") {
+        let pc = cfg
+            .provider
+            .video
+            .get(name)
+            .ok_or_else(|| AvcError::NotFound(format!("provider.video.{}", name)))?;
+        return Ok(Arc::new(super::minimax::MiniMaxCompatVideoProvider::new(
+            name.to_string(),
+            pc.clone(),
+        )?));
+    }
     let pc = cfg
         .provider
         .video

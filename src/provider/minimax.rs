@@ -16,7 +16,8 @@ use serde::Deserialize;
 use crate::config::ProviderCfg;
 use crate::error::{AvcError, AvcResult};
 use crate::provider::{
-    Audio, Avatar, AvatarProvider, AvatarSpec, FinetuneConfig, VideoProvider, VoiceProvider,
+    Audio, Avatar, AvatarProvider, AvatarSpec, Clip, FinetuneConfig, ScriptSegment, VideoProvider,
+    Voice, VoiceProvider,
 };
 
 const DEFAULT_BASE_URL: &str = "https://api.minimaxi.com";
@@ -278,5 +279,216 @@ impl VoiceProvider for MiniMaxCompatVoiceProvider {
         Err(AvcError::Internal(
             "minimax voice finetune not implemented; use vendor CLI".into(),
         ))
+    }
+}
+
+// ── Video ──────────────────────────────────────────
+
+/// Poll `GET /v1/query/video_generation?task_id=...` until `status` is
+/// `Success` (returns `file_id`) or `Fail` (returns Err), or until `timeout` elapses.
+///
+/// 协议：MiniMax 异步视频任务。轮询间隔 `poll_interval`；超过 `timeout` 视为
+/// ProviderUpstream 错误。
+pub async fn wait_video_done(
+    client: &Client,
+    base_url: &str,
+    auth: &HeaderMap,
+    task_id: &str,
+    poll_interval: Duration,
+    timeout: Duration,
+) -> AvcResult<String> {
+    let url = format!("{}/v1/query/video_generation?task_id={}", base_url, task_id);
+    let started = std::time::Instant::now();
+    loop {
+        let resp = client
+            .get(&url)
+            .headers(auth.clone())
+            .send()
+            .await
+            .map_err(|e| AvcError::ProviderUpstream(e.to_string()))?;
+        if !resp.status().is_success() {
+            return Err(AvcError::ProviderUpstream(format!(
+                "minimax poll HTTP {}",
+                resp.status()
+            )));
+        }
+        let body: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| AvcError::Internal(e.to_string()))?;
+        let status = body.get("status").and_then(|v| v.as_str()).unwrap_or("");
+        let file_id = body.get("file_id").and_then(|v| v.as_str()).unwrap_or("");
+        match status {
+            "Success" if !file_id.is_empty() => return Ok(file_id.to_string()),
+            "Success" => return Err(AvcError::ProviderUpstream("success but no file_id".into())),
+            "Fail" => return Err(AvcError::ProviderUpstream("video task failed".into())),
+            _ => {}
+        }
+        if started.elapsed() > timeout {
+            return Err(AvcError::ProviderUpstream(format!(
+                "video task {} did not complete within {:?}",
+                task_id, timeout
+            )));
+        }
+        tokio::time::sleep(poll_interval).await;
+    }
+}
+
+/// MiniMax 异步视频 Provider。3 段式：
+///   1. submit — `POST /v1/video_generation` 拿 `task_id`
+///   2. poll   — `GET  /v1/query/video_generation?task_id=...` 等到 Success 拿 `file_id`
+///   3. fetch  — `GET  /v1/files/retrieve?file_id=...` 拿 `download_url`（公开 URL），
+///      然后 `GET <download_url>` 下载 mp4 bytes
+///
+/// 默认轮询 5s 一次、5min 超时。`fetch()` 把 bytes 写到 `out`；`render()` 走
+/// 同样 3 段再 base64 包装成 `Clip`。
+pub struct MiniMaxCompatVideoProvider {
+    pub name: String,
+    pub cfg: ProviderCfg,
+    client: Client,
+    base_url: String,
+    pub poll_interval: Duration,
+    pub timeout: Duration,
+}
+
+impl MiniMaxCompatVideoProvider {
+    pub fn new(name: String, cfg: ProviderCfg) -> AvcResult<Self> {
+        let headers = auth_header(cfg.api_key.as_deref().unwrap_or(""));
+        let client = Client::builder()
+            .default_headers(headers)
+            .timeout(Duration::from_secs(60))
+            .build()
+            .map_err(|e| AvcError::Internal(format!("reqwest builder: {}", e)))?;
+        let base_url = cfg
+            .base_url
+            .clone()
+            .unwrap_or_else(|| DEFAULT_BASE_URL.to_string());
+        Ok(Self {
+            name,
+            cfg,
+            client,
+            base_url,
+            poll_interval: Duration::from_secs(5),
+            timeout: Duration::from_secs(300),
+        })
+    }
+
+    /// 步骤 1：submit。`prompt` 走 `model` + `prompt` 两字段；avatar/voice 暂未
+    /// 使用（MiniMax 视频接口当前不支持 reference image/audio）。返回 `task_id`。
+    pub async fn submit(&self, prompt: &str, _avatar: &[u8], _voice: &[u8]) -> AvcResult<String> {
+        let body = serde_json::json!({
+            "model": self.cfg.model.as_deref().unwrap_or("video-01"),
+            "prompt": prompt,
+        });
+        let url = format!("{}/v1/video_generation", self.base_url);
+        let resp = self
+            .client
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| AvcError::ProviderUpstream(e.to_string()))?;
+        #[derive(Deserialize)]
+        struct SubmitResp {
+            task_id: String,
+            #[allow(dead_code)]
+            base_resp: serde_json::Value,
+        }
+        let parsed: SubmitResp = handle_response(resp).await?;
+        Ok(parsed.task_id)
+    }
+
+    /// 步骤 2+3：轮询 + 拉下载 URL + 下载 mp4 bytes 写到 `out`。
+    pub async fn fetch(&self, task_id: &str, out: &std::path::Path) -> AvcResult<()> {
+        let auth = auth_header(self.cfg.api_key.as_deref().unwrap_or(""));
+        let file_id = wait_video_done(
+            &self.client,
+            &self.base_url,
+            &auth,
+            task_id,
+            self.poll_interval,
+            self.timeout,
+        )
+        .await?;
+        let retrieve_url = format!("{}/v1/files/retrieve?file_id={}", self.base_url, file_id);
+        let resp = self
+            .client
+            .get(&retrieve_url)
+            .headers(auth)
+            .send()
+            .await
+            .map_err(|e| AvcError::ProviderUpstream(e.to_string()))?;
+        if !resp.status().is_success() {
+            return Err(AvcError::ProviderUpstream(format!(
+                "minimax retrieve HTTP {}",
+                resp.status()
+            )));
+        }
+        let body: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| AvcError::Internal(e.to_string()))?;
+        let download_url = body
+            .get("file")
+            .and_then(|f| f.get("download_url"))
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| AvcError::ProviderUpstream("no download_url".into()))?
+            .to_string();
+        let bytes = self
+            .client
+            .get(&download_url)
+            .send()
+            .await
+            .map_err(|e| AvcError::ProviderUpstream(e.to_string()))?
+            .bytes()
+            .await
+            .map_err(|e| AvcError::Internal(e.to_string()))?;
+        if let Some(parent) = out.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+        std::fs::write(out, &bytes).map_err(|e| AvcError::Internal(format!("write: {}", e)))?;
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl VideoProvider for MiniMaxCompatVideoProvider {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// 把 scenes 拼成一段 prompt 走 3 段式，输出 mp4 BLOB 包成 Clip。
+    /// 忽略 avatar/voice（MiniMax video API 不消费 reference image/audio）。
+    async fn render(
+        &self,
+        _voice: &Voice,
+        _avatar: &Avatar,
+        scenes: &[ScriptSegment],
+    ) -> AvcResult<Clip> {
+        let total_ms: i64 = scenes.iter().map(|s| s.duration_ms).sum();
+        let prompt = scenes
+            .iter()
+            .map(|s| s.text.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let task_id = self.submit(&prompt, &[], &[]).await?;
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let tmp = std::env::temp_dir().join(format!("avc-minimax-video-{}.mp4", unique));
+        self.fetch(&task_id, &tmp).await?;
+        let bytes = std::fs::read(&tmp).map_err(|e| AvcError::Internal(format!("read: {}", e)))?;
+        let _ = std::fs::remove_file(&tmp);
+        if bytes.is_empty() {
+            return Err(AvcError::ProviderUpstream(
+                "minimax video fetch returned empty".into(),
+            ));
+        }
+        Ok(Clip {
+            mp4_b64: base64::engine::general_purpose::STANDARD.encode(&bytes),
+            mime: "video/mp4".into(),
+            duration_ms: total_ms,
+        })
     }
 }

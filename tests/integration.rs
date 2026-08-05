@@ -5989,3 +5989,150 @@ fn minimax_factory_routes_voice_by_name_suffix() {
     let result_openai = make_voice(&cfg, "yu");
     assert!(result_openai.is_ok());
 }
+
+#[test]
+fn minimax_video_fetch_succeeds_with_mock_server() {
+    use avc::config::ProviderCfg;
+    use avc::provider::minimax::MiniMaxCompatVideoProvider;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::time::Duration;
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let handle = std::thread::spawn(move || {
+        // 3 步式：submit (POST /v1/video_generation) → poll (GET /v1/query/...) →
+        // retrieve (GET /v1/files/...) → final download (GET /v.mp4). poll 第一次
+        // 返 Processing, 第二次返 Success + file_id；retrieve 返 download_url；后续
+        // download 是 4 字节 fake mp4。
+        let mut poll_count = 0u32;
+        for _ in 0..5 {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 8192];
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                let _ = stream.read(&mut buf);
+                let req = String::from_utf8_lossy(&buf).to_string();
+                let (header, body_opt) = if req.contains("video_generation")
+                    && !req.contains("query")
+                {
+                    // submit
+                    let body = r#"{"task_id":"task_xyz","base_resp":{"status_code":0}}"#;
+                    (
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        ),
+                        Some(body.to_string()),
+                    )
+                } else if req.contains("query/video_generation") {
+                    // poll
+                    poll_count += 1;
+                    let body = if poll_count >= 2 {
+                        r#"{"status":"Success","file_id":"file_42","base_resp":{"status_code":0}}"#
+                    } else {
+                        r#"{"status":"Processing","file_id":"","base_resp":{"status_code":0}}"#
+                    };
+                    (
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        ),
+                        Some(body.to_string()),
+                    )
+                } else {
+                    // retrieve OR final download
+                    if req.contains("files/retrieve") {
+                        let body = format!(
+                            r#"{{"file":{{"download_url":"http://127.0.0.1:{port}/v.mp4"}}}}"#
+                        );
+                        (
+                            format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                body.len()
+                            ),
+                            Some(body),
+                        )
+                    } else {
+                        // final download: fake mp4
+                        let body = b"MP4fake";
+                        (
+                            format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: video/mp4\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                body.len()
+                            ),
+                            None,
+                        )
+                    }
+                };
+                let _ = stream.write_all(header.as_bytes());
+                if let Some(b) = body_opt {
+                    let _ = stream.write_all(b.as_bytes());
+                } else {
+                    let _ = stream.write_all(b"MP4fake");
+                }
+                let _ = stream.flush();
+            } else {
+                break;
+            }
+        }
+    });
+
+    let cfg = ProviderCfg {
+        api_key: Some("sk-cp-test".into()),
+        model: Some("video-01".into()),
+        base_url: Some(format!("http://127.0.0.1:{}", port)),
+        ..Default::default()
+    };
+    let mut p = MiniMaxCompatVideoProvider::new("test_minimax_video".into(), cfg).unwrap();
+    // 测试用短轮询
+    p.poll_interval = Duration::from_millis(50);
+    p.timeout = Duration::from_secs(5);
+
+    let join_handle = std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                let task_id = p.submit("a cat walking", &[], &[]).await.unwrap();
+                let tmp = std::env::temp_dir().join("minimax_test_video.mp4");
+                p.fetch(&task_id, &tmp).await.unwrap();
+                let bytes = std::fs::read(&tmp).unwrap();
+                // mock server 返 fake mp4 内容
+                assert_eq!(&bytes, b"MP4fake");
+                let _ = std::fs::remove_file(&tmp);
+            })
+        })
+        .unwrap();
+    join_handle.join().unwrap();
+    handle.join().ok();
+}
+
+#[test]
+fn minimax_factory_routes_video_by_name_suffix() {
+    use avc::config::Config;
+    use avc::provider::real::make_video;
+
+    let mut cfg = Config::default();
+    cfg.provider.video.insert(
+        "yu_minimax".into(),
+        avc::config::ProviderCfg {
+            api_key: Some("sk-cp-test".into()),
+            model: Some("video-01".into()),
+            ..Default::default()
+        },
+    );
+    let result = make_video(&cfg, "yu_minimax");
+    assert!(
+        result.is_ok(),
+        "_minimax suffix should route video to MiniMax"
+    );
+    // 现有 CliVideoProvider 路由仍 OK
+    cfg.provider
+        .video
+        .insert("yu".into(), avc::config::ProviderCfg::default());
+    let result_openai = make_video(&cfg, "yu");
+    assert!(result_openai.is_ok());
+}
